@@ -160,7 +160,7 @@ case class FuConfig (
   // predict info
   def needPdInfo: Boolean = Seq(FuType.jmp, FuType.brh, FuType.csr).contains(fuType)
 
-  def needPc: Boolean = Seq(FuType.jmp, FuType.brh, FuType.ldu).contains(fuType)
+  def needPc: Boolean = Seq(FuType.jmp, FuType.brh, FuType.ldu, FuType.evu).contains(fuType)
 
   def needFPUCtrl: Boolean = {
     import FuType._
@@ -378,6 +378,23 @@ object FuConfig {
     latency = CertainLatency(0),
     needAmuCtrl = true,
     immType = Set(SelImm.IMM_MSETVAL)
+  )
+
+  val EvuCfg: FuConfig = FuConfig (
+    name = "evu",
+    fuType = FuType.evu,
+    fuGen = (p: Parameters, cfg: FuConfig) => Module(new EvuFuncUnit(cfg)(p).suggestName("Evu")),
+    srcData = Seq(
+      Seq(IntData()),
+    ),
+    piped = true,
+    writeIntRf = false,
+    latency = CertainLatency(0),
+    needAmuCtrl = true,
+    immType = Set(SelImm.IMM_EVU),
+    exceptionOut = Seq(illegalInstr, loadAddrMisaligned, storeAddrMisaligned,
+      loadAccessFault, storeAccessFault, loadPageFault, storePageFault,
+      loadGuestPageFault, storeGuestPageFault)
   )
 
   // Todo: split it to simple bitmap exu and complex bku
@@ -971,7 +988,7 @@ object FuConfig {
     FaluCfg, FmacCfg, FcvtCfg, FdivCfg,
     VfaluCfg, VfmaCfg, VfcvtCfg, Vfexp2Cfg, HyldaCfg, HystaCfg,
     MSetMtilexRiWmfCfg, MSetMtilexRmfWmfCfg, McfgCfg,
-    MmaCfg, MarithCfg, MlsCfg,
+    MmaCfg, MarithCfg, MlsCfg, EvuCfg,
   )
 
   def VecArithFuConfigs = Seq(

@@ -37,6 +37,7 @@ import xscache.coupledL2._
 import xscache.coupledL2.prefetch._
 import xscache.common.DirtyField
 import cute.{CuteParamsKey, CuteParams, CuteDebugParams, Cutev3extParams, MatrixIsaParams}
+import xiangshan.evu.EvuParams
 import zhujiang.ZJParameters
 
 object LLCType extends Enumeration {
@@ -74,6 +75,13 @@ class BaseConfig(n: Int) extends Config((site, here, up) => {
   case EnableJtag => true.B
   case DFTOptionsKey => DFTOptions()
 })
+
+/** Enable the Saturn-style external vector client without changing the core RVV. */
+case class WithExternalVector(params: EvuParams = EvuParams(enable = true))
+  extends Config((site, here, up) => {
+    case ExternalVectorKey => params.copy(enableDifftest = site(DebugOptionsKey).EnableDifftest)
+    case XSTileKey => up(XSTileKey).map(_.copy(EnableExternalVector = params.enable))
+  })
 
 // Synthesizable minimal XiangShan
 // * It is still an out-of-order, super-scalaer arch
@@ -574,6 +582,10 @@ class DefaultMatrixConfig(n: Int = 1) extends Config(
         L2NBanks = xp.L2NBanks,
       )
   })
+)
+
+class DefaultExternalVectorMatrixConfig(n: Int = 1) extends Config(
+  WithExternalVector() ++ new DefaultMatrixConfig(n)
 )
 
 class FpgaDiffDefaultMatrixConfig(n: Int = 1) extends Config(

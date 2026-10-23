@@ -41,7 +41,14 @@ private[top] object XSCachedParameters {
       up:    View,
       pname: Field[T]
     ): Option[T] = {
-      throw new Exception("The XSCachedParameters is frozen thus cannot participate in alter/orElse")
+      // A cached parameter set may be used as the lower layer of a local
+      // overlay (for example the EVU Saturn TileKey/VectorParamsKey).  The
+      // old implementation rejected every chain operation, which made a
+      // CoreModule instantiated below XSCachedParameters fail when it looked
+      // up xLen.  Keep the cached value as the first source and continue to
+      // the enclosing chain only when the underlying configuration has no
+      // value for this key.
+      find(pname).orElse(up.lift(pname))
     }
   }
 }

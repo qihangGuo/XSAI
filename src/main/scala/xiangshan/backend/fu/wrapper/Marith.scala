@@ -20,6 +20,8 @@ class Marith(cfg: FuConfig)(implicit p: Parameters) extends PipedFuncUnit(cfg) {
 
   out.res.data := output.asUInt
 
+  out.ctrl.amuCtrl.get.evu := false.B
+
   out.ctrl.amuCtrl.get.op   := AmuCtrlIO.arithOp()
   out.ctrl.amuCtrl.get.data := output.asUInt
   if (env.EnableDifftest) {

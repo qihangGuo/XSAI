@@ -45,12 +45,16 @@ import xscache.chi._
 import cute.MatrixIsaParams
 import xiangshan.backend.datapath.WakeUpConfig
 import xiangshan.mem.prefetch.{PrefetcherParams, SMSParams}
+import xiangshan.evu.EvuParams
 
 import scala.math.{max, min, pow}
 
 case object XSTileKey extends Field[Seq[XSCoreParameters]]
 
 case object XSCoreParamsKey extends Field[XSCoreParameters]
+
+/** Configuration for the optional external Saturn-style vector unit. */
+case object ExternalVectorKey extends Field[EvuParams](EvuParams())
 
 case class XSCoreParameters
 (
@@ -71,6 +75,7 @@ case class XSCoreParameters
   HasHExtension: Boolean = true,
   // Matrix ISA capability set. Keep detailed precision controls here.
   MatrixExtension: MatrixIsaParams = MatrixIsaParams(),
+  EnableExternalVector: Boolean = false,
   HasDiv: Boolean = true,
   HasICache: Boolean = true,
   HasDCache: Boolean = true,
@@ -437,7 +442,7 @@ case class XSCoreParameters
       if (HasMatrixExtension) Seq(
         IssueBlockParams(Seq(
           ExeUnitParams("MSET0", Seq(MSetMtilexRiWmfCfg), Seq(MxWB(port = intSchdMxWbPort, 0)), Seq(Seq(IntRD(0, 2)))),
-          ExeUnitParams("MRELEASE", Seq(MreleaseCfg), Seq(), Seq(Seq(IntRD(2, 2))))
+          ExeUnitParams("MRELEASE", Seq(MreleaseCfg) ++ (if (EnableExternalVector) Seq(EvuCfg) else Nil), Seq(), Seq(Seq(IntRD(2, 2))))
         ), numEntries = IssueQueueSize, numEnq = 2, numComp = IssueQueueCompEntrySize),
       ) else Nil
     ),

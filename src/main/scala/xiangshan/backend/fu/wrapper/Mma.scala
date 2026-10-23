@@ -68,6 +68,8 @@ class Mma(cfg: FuConfig)(implicit p: Parameters) extends PipedFuncUnit(cfg) {
   
   out.res.data := output.asUInt
 
+  out.ctrl.amuCtrl.get.evu := false.B
+
   out.ctrl.amuCtrl.get.op   := AmuCtrlIO.mmaOp()
   out.ctrl.amuCtrl.get.data := output.asUInt
   out.ctrl.exceptionVec.get := 0.U.asTypeOf(out.ctrl.exceptionVec.get)

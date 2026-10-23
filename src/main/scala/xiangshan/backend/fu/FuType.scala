@@ -81,8 +81,9 @@ object FuType extends OHEnumeration {
   val mma   = addType(name = "mma")   // matrix mul (dense/sparse)
   val marith = addType(name = "marith") // arith, mve (for matrix), cvt, logic
   val mrelease = addType(name = "mrelease")
+  val evu = addType(name = "evu")
 
-  val intArithAll = Seq(jmp, brh, i2f, i2v, csr, alu, mul, div, fence, bku)
+  val intArithAll = Seq(jmp, brh, i2f, i2v, csr, alu, mul, div, fence, bku, evu)
   // dq0 includes int's iq0 and iq1
   // dq1 includes int's iq2 and iq3
   def dq0OHTypeSeq(implicit p: Parameters): Seq[Seq[OHType]] = {
@@ -174,7 +175,7 @@ object FuType extends OHEnumeration {
 
   def isVset(fuType: UInt): Bool = FuTypeOrR(fuType, vecVSET)
   def isMsettilex(fuType: UInt): Bool = FuTypeOrR(fuType, matrixMSETtilex)
-  def needAmuCtrl(fuType: UInt): Bool = FuTypeOrR(fuType, matrixArith ++ matrixMem ++ Seq(mrelease))
+  def needAmuCtrl(fuType: UInt): Bool = FuTypeOrR(fuType, matrixArith ++ matrixMem ++ Seq(mrelease, evu))
   def isMcfg(fuType: UInt): Bool = FuTypeOrR(fuType, mcfg)
   def isJump(fuType: UInt): Bool = FuTypeOrR(fuType, jmp)
 
@@ -291,5 +292,6 @@ object FuType extends OHEnumeration {
     vfdiv -> "vfdiv",
     vfcvt -> "vfcvt",
     vfexp2 -> "vfexp2",
+    evu -> "evu",
   )
 }

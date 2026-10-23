@@ -50,6 +50,7 @@ import xiangshan.mem.Bundles._
 import xiangshan.mem.prefetch.{BasePrefecher, L1Prefetcher, SMSParams, SMSPrefetcher}
 import xiangshan.cache._
 import xiangshan.cache.mmu._
+import xiangshan.evu.{EvuAddressCheck, EvuAddressFault, EvuAddressResponse, EvuRangeIO}
 import xscache.coupledL2.{PrefetchCtrlFromCore, PrefetchRecv}
 import utility.mbist.{MbistInterface, MbistPipeline}
 import utility.sram.{SramBroadcastBundle, SramHelper}
@@ -313,6 +314,7 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
   val io = IO(new Bundle {
     val hartId = Input(UInt(hartIdLen.W))
     val redirect = Flipped(ValidIO(new Redirect))
+    val evuRange = OptionWrapper(p(ExternalVectorKey).enable, Flipped(new EvuRangeIO(p(ExternalVectorKey))))
 
     val ooo_to_mem = new ooo_to_mem
     val mem_to_ooo = new mem_to_ooo
@@ -690,10 +692,13 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
   val dtlb_ld = Seq(dtlb_ld_tlb_ld.io)
   val dtlb_st = Seq(dtlb_st_tlb_st.io)
   val dtlb_prefetch = Seq(dtlb_prefetch_tlb_prefetch.io)
+  val dtlb_evu = Option.when(p(ExternalVectorKey).enable) {
+    Module(new TLBNonBlock(1, 1, ldtlbParams)).io
+  }
   /* tlb vec && constant variable */
-  val dtlb = dtlb_ld ++ dtlb_st ++ dtlb_prefetch
+  val dtlb = dtlb_ld ++ dtlb_st ++ dtlb_prefetch ++ dtlb_evu.toSeq
   val (dtlb_ld_idx, dtlb_st_idx, dtlb_pf_idx) = (0, 1, 2)
-  val TlbSubSizeVec = Seq(LduCnt + HyuCnt + MlsCnt + 1, StaCnt, 2) // (load + hyu + mlsu + stream pf, store, sms+l2bop)
+  val TlbSubSizeVec = Seq(LduCnt + HyuCnt + MlsCnt + 1, StaCnt, 2) ++ dtlb_evu.toSeq.map(_ => 1)
   val DTlbSize = TlbSubSizeVec.sum
   val TlbStartVec = TlbSubSizeVec.scanLeft(0)(_ + _).dropRight(1)
   val TlbEndVec = TlbSubSizeVec.scanLeft(0)(_ + _).drop(1)
@@ -718,7 +723,8 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
     require(ldtlbParams.outReplace)
 
     val replace = Module(new TlbReplace(DTlbSize, ldtlbParams))
-    replace.io.apply_sep(dtlb_ld.map(_.replace) ++ dtlb_st.map(_.replace) ++ dtlb_prefetch.map(_.replace), ptwio.resp.bits.data.s1.entry.tag)
+    replace.io.apply_sep(dtlb_ld.map(_.replace) ++ dtlb_st.map(_.replace) ++
+      dtlb_prefetch.map(_.replace) ++ dtlb_evu.toSeq.map(_.replace), ptwio.resp.bits.data.s1.entry.tag)
   } else {
     // TODO: there will be bugs in TlbReplace when outReplace enable, since the order of Hyu is not right.
     if (ldtlbParams.outReplace) {
@@ -736,6 +742,12 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
     if (pftlbParams.outReplace) {
       val replace_pf = Module(new TlbReplace(2, pftlbParams))
       replace_pf.io.apply_sep(dtlb_prefetch.map(_.replace), ptwio.resp.bits.data.s1.entry.tag)
+    }
+    dtlb_evu.foreach { evu =>
+      if (ldtlbParams.outReplace) {
+        val replace_evu = Module(new TlbReplace(1, ldtlbParams))
+        replace_evu.io.apply_sep(Seq(evu.replace), ptwio.resp.bits.data.s1.entry.tag)
+      }
     }
   }
 
@@ -763,7 +775,8 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
     val vector_hit = if (refillBothTlb) Cat(ptw_resp_next.vector).orR
       else if (i < TlbEndVec(dtlb_ld_idx)) Cat(ptw_resp_next.vector.slice(TlbStartVec(dtlb_ld_idx), TlbEndVec(dtlb_ld_idx))).orR
       else if (i < TlbEndVec(dtlb_st_idx)) Cat(ptw_resp_next.vector.slice(TlbStartVec(dtlb_st_idx), TlbEndVec(dtlb_st_idx))).orR
-      else                                 Cat(ptw_resp_next.vector.slice(TlbStartVec(dtlb_pf_idx), TlbEndVec(dtlb_pf_idx))).orR
+      else if (i < TlbEndVec(dtlb_pf_idx))   Cat(ptw_resp_next.vector.slice(TlbStartVec(dtlb_pf_idx), TlbEndVec(dtlb_pf_idx))).orR
+      else                                 ptw_resp_next.vector(i)
     ptwio.req(i).valid := tlb.valid &&
       !(ptw_resp_v && vector_hit &&
         ptw_resp_next.data.hit(tlb.bits.vpn, tlbcsr.satp.asid, tlbcsr.vsatp.asid, tlbcsr.hgatp.vmid,
@@ -776,10 +789,11 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
     dtlb_ld.foreach(_.ptw.resp.valid := ptw_resp_v && Cat(ptw_resp_next.vector.slice(TlbStartVec(dtlb_ld_idx), TlbEndVec(dtlb_ld_idx))).orR)
     dtlb_st.foreach(_.ptw.resp.valid := ptw_resp_v && Cat(ptw_resp_next.vector.slice(TlbStartVec(dtlb_st_idx), TlbEndVec(dtlb_st_idx))).orR)
     dtlb_prefetch.foreach(_.ptw.resp.valid := ptw_resp_v && Cat(ptw_resp_next.vector.slice(TlbStartVec(dtlb_pf_idx), TlbEndVec(dtlb_pf_idx))).orR)
+    dtlb_evu.foreach(_.ptw.resp.valid := ptw_resp_v && ptw_resp_next.vector.last)
   }
-  dtlb_ld.foreach(_.ptw.resp.bits.getGpa := Cat(ptw_resp_next.getGpa.take(LduCnt + HyuCnt + 1)).orR)
-  dtlb_st.foreach(_.ptw.resp.bits.getGpa := Cat(ptw_resp_next.getGpa.slice(LduCnt + HyuCnt + 1, LduCnt + HyuCnt + 1 + StaCnt)).orR)
-  dtlb_prefetch.foreach(_.ptw.resp.bits.getGpa := Cat(ptw_resp_next.getGpa.drop(LduCnt + HyuCnt + 1 + StaCnt)).orR)
+  dtlb.zipWithIndex.foreach { case (tlb, index) =>
+    tlb.ptw.resp.bits.getGpa := Cat(ptw_resp_next.getGpa.slice(TlbStartVec(index), TlbEndVec(index))).orR
+  }
 
   val dtlbRepeater  = PTWNewFilter(ldtlbParams.fenceDelay, ptwio, ptw.io.tlb(1), sfence, tlbcsr, l2tlbParams.dfilterSize)
   val itlbRepeater3 = PTWRepeaterNB(passReady = false, itlbParams.fenceDelay, io.fetch_to_mem.itlb, ptw.io.tlb(0), sfence, tlbcsr)
@@ -790,7 +804,9 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
   val pmp = Module(new PMP())
   pmp.io.distribute_csr <> csrCtrl.distribute_csr
 
-  val pmp_checkers = Seq.fill(DTlbSize)(Module(new PMPChecker(4, leaveHitMux = true)))
+  val pmp_checkers = Seq.tabulate(DTlbSize) { i =>
+    Module(new PMPChecker(if (dtlb_evu.nonEmpty && i == DTlbSize - 1) 6 else 4, leaveHitMux = true))
+  }
   val pmp_check = pmp_checkers.map(_.io)
   for (((p, d), pmpMode) <- pmp_check.zip(dtlb_pmps).zip(dtlb_pmp_modes)) {
     if (HasBitmapCheck) {
@@ -803,6 +819,73 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
       p.apply(pmpMode, tlbcsr.priv.debug, pmp.io.pmp, pmp.io.pma, d)
     }
     require(p.req.bits.size.getWidth == d.bits.size.getWidth)
+  }
+
+  io.evuRange.foreach { range =>
+    val checker = Module(new EvuAddressCheck(p(ExternalVectorKey)))
+    checker.io.range <> range
+    // Drain older scalar stores before EVU can read their input or overwrite it.
+    checker.io.range.req.valid := range.req.valid && io.mem_to_ooo.sbIsEmpty
+    range.req.ready := checker.io.range.req.ready && io.mem_to_ooo.sbIsEmpty
+    checker.io.allowPhysicalLaunch := tlbcsr.satp.mode === 0.U && !tlbcsr.priv.virt &&
+      tlbcsr.priv.imode === CSRConst.ModeM && tlbcsr.priv.dmode === CSRConst.ModeM
+    val tlb = dtlb_evu.get.requestor.head
+    val permission = pmp_check.last.resp
+    val idle :: send :: waitTlb :: waitPmp :: respond :: Nil = Enum(5)
+    val state = RegInit(idle)
+    val address = Reg(UInt(64.W))
+    val firstAddress = RegEnable(range.req.bits.base, range.req.fire)
+    val write = Reg(Bool())
+    val answer = Reg(new EvuAddressResponse)
+    val missed = Reg(Bool())
+    val uncacheable = Reg(Bool())
+    checker.io.lookup.req.ready := state === idle && !range.cancel
+    when(checker.io.lookup.req.fire) {
+      address := checker.io.lookup.req.bits.vaddr
+      write := checker.io.lookup.req.bits.write
+      state := send
+    }
+    tlb.req.valid := state === send && !range.cancel
+    tlb.req.bits := 0.U.asTypeOf(tlb.req.bits)
+    tlb.req.bits.vaddr := address
+    tlb.req.bits.fullva := Mux(address < firstAddress, firstAddress, address)
+    tlb.req.bits.checkfullva := true.B
+    tlb.req.bits.cmd := Mux(write, TlbCmd.write, TlbCmd.read)
+    tlb.req.bits.size := 6.U
+    tlb.req.bits.debug.robIdx := io.ooo_to_mem.lsqio.pendingPtr
+    tlb.req.bits.memidx.is_ld := !write
+    tlb.req.bits.memidx.is_st := write
+    tlb.req_kill := range.cancel
+    tlb.resp.ready := true.B
+    when(tlb.req.fire) { state := waitTlb }
+    when(state === waitTlb && tlb.resp.fire) {
+      val exception = tlb.resp.bits.excp.head
+      val page = Mux(write, exception.pf.st, exception.pf.ld)
+      val guest = Mux(write, exception.gpf.st, exception.gpf.ld)
+      val access = Mux(write, exception.af.st, exception.af.ld)
+      answer.paddr := tlb.resp.bits.paddr.head
+      answer.gpaddr := tlb.resp.bits.gpaddr.head
+      answer.nonLeaf := tlb.resp.bits.isForVSnonLeafPTE
+      answer.fault := Mux(guest, EvuAddressFault.GuestPage,
+        Mux(page, EvuAddressFault.Page, Mux(access, EvuAddressFault.Access, EvuAddressFault.None)))
+      missed := tlb.resp.bits.miss
+      uncacheable := tlb.resp.bits.pbmt.head =/= 0.U
+      state := waitPmp
+    }
+    when(state === waitPmp) {
+      when(missed) {
+        state := send
+      }.otherwise {
+        when(answer.fault === EvuAddressFault.None &&
+          (permission.ld || permission.st || permission.mmio || uncacheable)) {
+          answer.fault := EvuAddressFault.Access
+        }
+        state := respond
+      }
+    }
+    checker.io.lookup.resp.valid := state === respond && !range.cancel
+    checker.io.lookup.resp.bits := answer
+    when(checker.io.lookup.resp.fire || range.cancel) { state := idle }
   }
 
   for (i <- 0 until LduCnt) {
@@ -1804,7 +1887,7 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
   sbuffer.io.force_write <> lsq.io.force_write
   // flush sbuffer
   val cmoFlush = lsq.io.flushSbuffer.valid
-  val fenceFlush = io.ooo_to_mem.flushSb
+  val fenceFlush = io.ooo_to_mem.flushSb || io.evuRange.map(_.req.valid).getOrElse(false.B)
   val atomicsFlush = atomicsUnit.io.flush_sbuffer.valid || vSegmentUnit.io.flush_sbuffer.valid
   val stIsEmpty = sbuffer.io.flush.empty && uncache.io.flush.empty
   io.mem_to_ooo.sbIsEmpty := RegNext(stIsEmpty)

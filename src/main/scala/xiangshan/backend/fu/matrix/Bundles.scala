@@ -5,6 +5,7 @@ import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import xiangshan.XSBundle
 import xiangshan.XSCoreParamsKey
+import xiangshan.ExternalVectorKey
 import xiangshan.backend.decode.isa.bitfield.InstMType
 import utility.ZeroExt
 import _root_.utils.NamedUInt
@@ -179,13 +180,16 @@ object Bundles {
     // 2: Release
     // 3: Arith
     val op = UInt(2.W)
+    // EVU commands share the ROB/AMU retirement path but must not be sent to CUTE.
+    val evu = Bool()
     
     def isMma()     : Bool = op === AmuCtrlIO.mmaOp()
     def isMls()     : Bool = op === AmuCtrlIO.mlsOp()
     def isRelease() : Bool = op === AmuCtrlIO.releaseOp()
     def isArith()   : Bool = op === AmuCtrlIO.arithOp()
     // data: The ctrl signal for op
-    val data = UInt(150.W)
+    val data = UInt((if (p(ExternalVectorKey).enable)
+      math.max(150, (new xiangshan.evu.EvuCoreCommand(p(ExternalVectorKey))).getWidth) else 150).W)
 
     val pc = Option.when(env.EnableDifftest) (UInt(64.W))
     val coreid = Option.when(env.EnableDifftest) (UInt(hartIdLen.W))

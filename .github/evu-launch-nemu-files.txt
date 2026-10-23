@@ -1,0 +1,7 @@
+include/cpu/difftest/evu.h
+src/isa/riscv64/Kconfig
+src/isa/riscv64/instr/ame/mcompute.h
+src/isa/riscv64/instr/ame/mldst_impl.c
+src/isa/riscv64/instr/evu/model.c
+src/isa/riscv64/instr/evu/matrix.c
+src/isa/riscv64/instr/evu/matrix.h

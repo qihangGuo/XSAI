@@ -587,6 +587,7 @@ class MlsUnit(implicit p: Parameters) extends XSModule
   s3_out.bits.uop.exceptionVec(loadAccessFault) := s3_in.uop.exceptionVec(loadAccessFault) && s3_ld_flow
   s3_out.bits.uop.replayInst   := false.B
   s3_out.bits.data             := s3_in.data
+  s3_out.bits.amuCtrl.get.evu := false.B
   s3_out.bits.amuCtrl.get.op   := AmuCtrlIO.mlsOp()
   s3_out.bits.amuCtrl.get.data := amuCtrl.asUInt
   if (env.EnableDifftest) {

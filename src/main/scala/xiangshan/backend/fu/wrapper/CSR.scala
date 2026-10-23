@@ -68,6 +68,15 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
   private val isCSRAcc = CSROpType.isCsrAccess(func)
 
   val csrMod = Module(new NewCSR)
+  csrMod.io.evu <> csrIn.evu
+  private val evuOwnershipChange = isCSRAcc && (
+    addr === "h180".U || addr === "h280".U || addr === "h680".U ||
+    addr === "h300".U || addr === "h100".U ||
+    addr >= "h3a0".U && addr <= "h3ef".U ||
+    addr >= "hbc0".U && addr <= "hbff".U) || isMret || isSret || isMNret
+  private val evuControl = p(ExternalVectorKey).enable.B &&
+    (isCSRAcc && xiangshan.evu.EvuCSRs.needsDrain(addr) || evuOwnershipChange)
+  private val evuReady = !evuControl || csrIn.evu.drained
   val trapInstMod = Module(new TrapInstMod)
   val trapTvalMod = Module(new TrapTvalMod)
   val satpFlushMod = Module(new SatpFlushMod)
@@ -108,10 +117,11 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
     thisRobIdx := robIdxReg
   }
   private val redirectFlush = thisRobIdx.needFlush(io.flush)
+  csrOut.evu.wantDrain := valid && evuControl && !redirectFlush
 
   csrMod.io.in match {
     case in =>
-      in.valid := valid
+      in.valid := valid && evuReady
       in.bits.wen := csrWen
       in.bits.ren := csrRen
       in.bits.op  := CSROpType.getCSROp(func)
@@ -318,7 +328,7 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
   tlb.pmm := csrMod.io.tlb.pmm
 
   /** Since some CSR read instructions are allowed to be pipelined, ready/valid signals should be modified */
-  io.in.ready := csrMod.io.in.ready // Todo: Async read imsic may block CSR
+  io.in.ready := csrMod.io.in.ready && evuReady
   io.out.valid := csrModOutValid
   io.out.bits.ctrl.exceptionVec.get := exceptionVec
   io.out.bits.ctrl.flushPipe.get := flushPipe

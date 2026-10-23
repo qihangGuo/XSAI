@@ -41,6 +41,7 @@ import xiangshan.frontend.FtqPtr
 import xiangshan.mem.{LqPtr, LsqEnqIO, SqPtr, MlsqPtr}
 import xiangshan.backend.ctrlblock.{DebugLSIO, DebugLsInfo, LsTopdownInfo}
 import xiangshan.backend.fu.matrix.Bundles.AmuCtrlIO
+import xiangshan.evu.EvuCompletion
 import xiangshan.backend.fu.vector.Bundles.VType
 import xiangshan.backend.rename.SnapshotGenerator
 import yunsuan.VfaluType
@@ -141,6 +142,10 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
 
     // to AMU
     val amuCtrl = OptionWrapper(HasMatrixExtension, Vec(CommitWidth, DecoupledIO(new AmuCtrlIO)))
+    val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuCompletion(p(ExternalVectorKey)))))
+    val evuBusy = Output(Bool())
+    val evuRetired = Output(Valid(new xiangshan.evu.EvuCoreCommand(p(ExternalVectorKey))))
+    val evuStatus = Output(Valid(new EvuCompletion(p(ExternalVectorKey))))
   })
 
   val exuWBs: Seq[ValidIO[ExuOutput]] = io.exuWriteback.filter(!_.bits.params.hasStdFu).toSeq
@@ -446,7 +451,7 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
 
   // When blockBackward instruction leaves Rob (commit or walk), hasBlockBackward should be set to false.B
   // To reduce registers usage, for hasBlockBackward cases, we allow enqueue after ROB is empty.
-  when(isEmpty) {
+  when(isEmpty && !amuBuffer.map(_.io.evuBusy).getOrElse(false.B)) {
     hasBlockBackward := false.B
   }
   // When any instruction commits, hasNoSpecExec should be set to false.B
@@ -637,7 +642,7 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
   val deqPtrEntryValid = deqPtrEntry.commit_v
   val deqHasFlushed = RegInit(false.B)
   val intrBitSetReg = RegNext(io.csr.intrBitSet)
-  val intrEnable = intrBitSetReg && !hasWaitForward && deqPtrEntry.interrupt_safe && !deqHasFlushed
+  val intrEnable = intrBitSetReg && !hasWaitForward && deqPtrEntry.interrupt_safe && !deqHasFlushed && !io.evuBusy
   val deqNeedFlush = deqPtrEntry.needFlush && deqPtrEntry.commit_v && deqPtrEntry.commit_w
   val deqHitExceptionGenState = exceptionDataRead.valid && exceptionDataRead.bits.robIdx === deqPtr
   val deqNeedFlushAndHitExceptionGenState = deqNeedFlush && deqHitExceptionGenState
@@ -891,11 +896,13 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
 
   }
 
-  // sync fflags/dirty_fs/vxsat to csr
-  io.csr.fflags   := RegNextWithEnable(fflags)
+  // External-vector completions update the independent EVU bank only.
+  io.csr.fflags := RegNextWithEnable(fflags)
+  io.csr.vxsat := RegNextWithEnable(vxsat)
   io.csr.dirty_fs := GatedValidRegNext(dirty_fs)
   io.csr.dirty_vs := GatedValidRegNext(dirty_vs)
-  io.csr.vxsat    := RegNextWithEnable(vxsat)
+  io.evuRetired := amuBuffer.map(_.io.evuRetired).getOrElse(0.U.asTypeOf(io.evuRetired))
+  io.evuStatus := amuBuffer.map(_.io.evuStatus.get).getOrElse(0.U.asTypeOf(io.evuStatus))
 
   io.csr.dirty_ms := GatedValidRegNext(dirty_ms)
 
@@ -1267,7 +1274,15 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
   exceptionGen.io.redirect <> io.redirect
   exceptionGen.io.flush := io.flushOut.valid
 
-  amuBuffer.foreach(_.connectROB(this))
+  amuBuffer.foreach { buffer =>
+    buffer.connectROB(this)
+    io.evuCompletion.foreach { completion =>
+      buffer.io.evuCompletion.get.valid := completion.valid
+      buffer.io.evuCompletion.get.bits := completion.bits
+      completion.ready := buffer.io.evuCompletion.get.ready
+    }
+  }
+  io.evuBusy := amuBuffer.map(_.io.evuBusy).getOrElse(false.B)
 
   val canEnqueueEG = VecInit(io.enq.req.map(req => req.valid && io.enq.canAccept))
   for (i <- 0 until RenameWidth) {

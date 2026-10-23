@@ -37,6 +37,7 @@ import xiangshan.mem._
 import xiangshan.cache.mmu._
 import xiangshan.cache.mmu.TlbRequestIO
 import cute.CutePerfToCoreIO
+import xiangshan.evu.EvuCompletion
 import scala.collection.mutable.ListBuffer
 
 abstract class XSModule(implicit val p: Parameters) extends Module
@@ -119,6 +120,9 @@ class XSCoreImp(outer: XSCoreBase) extends LazyModuleImp(outer)
     val dft = Option.when(hasDFT)(Input(new SramBroadcastBundle))
     val dft_reset = Option.when(hasDFT)(Input(new DFTResetSignals()))
     val amuCtrl = Option.when(HasMatrixExtension)(Decoupled(new AmuCtrlIO))
+    val evuDrain = OptionWrapper(p(ExternalVectorKey).enable, new xiangshan.evu.EvuDrainIO)
+    val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuCompletion(p(ExternalVectorKey)))))
+    val evuFlush = OptionWrapper(p(ExternalVectorKey).enable, Output(Bool()))
     val amuRelease = Option.when(HasMatrixExtension)(Flipped(Decoupled(new AmuReleaseIO2XS)))
     val cutePerf = Option.when(HasMatrixExtension)(Input(new CutePerfToCoreIO))
   })
@@ -143,6 +147,13 @@ class XSCoreImp(outer: XSCoreBase) extends LazyModuleImp(outer)
   frontend.io.fencei <> backend.io.fenceio.fencei
 
   backend.io.fromTop := memBlock.io.mem_to_ooo.topToBackendBypass
+  io.evuDrain.foreach(_ <> backend.io.evuDrain.get)
+  io.evuFlush.foreach(_ := backend.io.evuFlush.get)
+  io.evuCompletion.foreach { completion =>
+    backend.io.evuCompletion.get.valid := completion.valid
+    backend.io.evuCompletion.get.bits := completion.bits
+    completion.ready := backend.io.evuCompletion.get.ready
+  }
 
   require(backend.io.mem.stIn.length == memBlock.io.mem_to_ooo.stIn.length)
   backend.io.mem.stIn.zip(memBlock.io.mem_to_ooo.stIn).foreach { case (sink, source) =>
@@ -192,6 +203,7 @@ class XSCoreImp(outer: XSCoreBase) extends LazyModuleImp(outer)
   backend.io.mem.exceptionAddr.vaddr  := memBlock.io.mem_to_ooo.lsqio.vaddr
   backend.io.mem.exceptionAddr.gpaddr := memBlock.io.mem_to_ooo.lsqio.gpaddr
   backend.io.mem.exceptionAddr.isForVSnonLeafPTE := memBlock.io.mem_to_ooo.lsqio.isForVSnonLeafPTE
+  backend.io.evuRange.foreach(memBlock.io.evuRange.get <> _)
   backend.io.mem.debugLS := memBlock.io.debug_ls
   backend.io.mem.lsTopdownInfo := memBlock.io.mem_to_ooo.lsTopdownInfo
   backend.io.mem.lqCanAccept := memBlock.io.mem_to_ooo.lsqio.lqCanAccept

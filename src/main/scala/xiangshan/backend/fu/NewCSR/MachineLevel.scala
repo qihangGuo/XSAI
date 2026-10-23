@@ -520,7 +520,7 @@ class MstatusBundle extends CSRBundle {
   val MPV  = VirtMode       (39).withReset(0.U)
   val MDT  = CSRRWField     (42).withReset(mdtInit.U)
   val SD   = CSRROField     (63,
-    (_, _) => FS === ContextStatus.Dirty || VS === ContextStatus.Dirty || MS === ContextStatus.Dirty
+    (_, _) => FS === ContextStatus.Dirty || VS === ContextStatus.Dirty || MS === ContextStatus.Dirty || XS === ContextStatus.Dirty
   )
 }
 
@@ -534,6 +534,8 @@ class MstatusModule(implicit override val p: Parameters) extends CSRModule("MSta
   with HasRobCommitBundle
   with HasMachineEnvBundle
 {
+  val evuState = IO(Input(UInt(2.W)))
+  regOut.XS := evuState.asTypeOf(regOut.XS)
   val mstatus = IO(Output(bundle))
   val sstatus = IO(Output(new SstatusBundle))
   val sstatusRdata = IO(Output(UInt(64.W)))

@@ -43,6 +43,7 @@ import xiangshan.backend.datapath._
 import xiangshan.backend.dispatch.CoreDispatchTopDownIO
 import xiangshan.backend.exu.ExuBlock
 import xiangshan.backend.fu.matrix.Bundles.AmuCtrlIO
+import xiangshan.evu.{EvuAddressFault, EvuCompletion, EvuCoreCommand, EvuIsa, EvuRangeIO, EvuRangeResult}
 import xiangshan.backend.fu.vector.Bundles.{VConfig, VType}
 import xiangshan.backend.fu.{FenceIO, FenceToSbuffer, FuConfig, FuType, PerfCounterIO}
 import xiangshan.backend.fu.NewCSR.PFEvent
@@ -685,6 +686,40 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
   csrio.fpu.dirty_fs := ctrlBlock.io.robio.csr.dirty_fs
   csrio.vpu <> WireDefault(0.U.asTypeOf(csrio.vpu)) // Todo
 
+  csrio.evu.busy := ctrlBlock.io.evuBusy
+  csrio.evu.accepted := ctrlBlock.io.evuRetired
+  csrio.evu.completed := ctrlBlock.io.evuStatus
+  csrio.evu.drained := false.B
+  csrio.evu.drainResult := 0.U.asTypeOf(csrio.evu.drainResult)
+  io.evuDrain.foreach { drain =>
+    val certified = RegInit(false.B)
+    val outstanding = RegInit(false.B)
+    val fenceCertificate = RegInit(false.B)
+    drain.request.valid := csrio.evu.wantDrain && !certified && !outstanding && !ctrlBlock.io.evuBusy
+    drain.request.bits := true.B
+    drain.response.ready := outstanding
+    when(drain.request.fire) { outstanding := true.B }
+    when(drain.response.fire) {
+      outstanding := false.B
+      certified := true.B
+    }
+    when(csrio.evu.completed.valid && csrio.evu.completed.bits.opcode === xiangshan.evu.EvuOpcode.Fence) {
+      fenceCertificate := true.B
+    }
+    when(fenceCertificate && !ctrlBlock.io.evuBusy) {
+      certified := true.B
+      fenceCertificate := false.B
+    }
+    when(ctrlBlock.io.evuBusy) { certified := false.B }
+    when(ctrlBlock.io.evuRetired.valid) {
+      certified := false.B
+      fenceCertificate := false.B
+    }
+    csrio.evu.drained := certified && !ctrlBlock.io.evuBusy
+    csrio.evu.drainResult.valid := drain.response.fire
+    csrio.evu.drainResult.bits := drain.response.bits
+  }
+
   val fromIntExuVsetVType = intExuBlock.io.vtype.getOrElse(0.U.asTypeOf((Valid(new VType))))
   val fromVfExuVsetVType = vfExuBlock.io.vtype.getOrElse(0.U.asTypeOf((Valid(new VType))))
   val fromVsetVType = Mux(fromIntExuVsetVType.valid, fromIntExuVsetVType.bits, fromVfExuVsetVType.bits)
@@ -735,9 +770,14 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
 
   csrio.exception := ctrlBlock.io.robio.exception
   csrio.robDeqPtr := ctrlBlock.io.robio.robDeqPtr
-  csrio.memExceptionVAddr := io.mem.exceptionAddr.vaddr
-  csrio.memExceptionGPAddr := io.mem.exceptionAddr.gpaddr
-  csrio.memExceptionIsForVSnonLeafPTE := io.mem.exceptionAddr.isForVSnonLeafPTE
+  val evuCheckedFault = Reg(new EvuRangeResult(p(ExternalVectorKey)))
+  // NewCSR samples tval in the same cycle as the ROB trap notification.
+  val evuTrapSelected = ctrlBlock.io.robio.exception.valid && p(ExternalVectorKey).enable.B &&
+    EvuIsa.isCustom(ctrlBlock.io.robio.exception.bits.instr)
+  csrio.memExceptionVAddr := Mux(evuTrapSelected, evuCheckedFault.vaddr, io.mem.exceptionAddr.vaddr)
+  csrio.memExceptionGPAddr := Mux(evuTrapSelected, evuCheckedFault.gpaddr, io.mem.exceptionAddr.gpaddr)
+  csrio.memExceptionIsForVSnonLeafPTE := Mux(evuTrapSelected,
+    evuCheckedFault.nonLeaf, io.mem.exceptionAddr.isForVSnonLeafPTE)
   csrio.externalInterrupt := RegNext(io.fromTop.externalInterrupt)
   csrio.perf <> io.perf
   csrio.perf.retiredInstr <> ctrlBlock.io.robio.csr.perfinfo.retiredInstr
@@ -809,6 +849,74 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
   wbDataPath.io.flush := ctrlBlock.io.redirect
   wbDataPath.io.fromTop.hartId := io.fromTop.hartId
   wbDataPath.io.fromIntExu <> intExuBlock.io.out
+  io.evuRange.foreach { check =>
+    val lanes = wbDataPath.io.fromIntExu.flatten.zip(intExuBlock.io.out.flatten)
+      .filter(_._2.bits.params.fuConfigs.contains(FuConfig.EvuCfg))
+    require(lanes.size == 1, "EVU preflight requires one scalar command producer")
+    val (sink, source) = lanes.head
+    val payload = source.bits.amuCtrl.get.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey)))
+    val f7 = payload.instr(31, 25)
+    val load = f7 === EvuIsa.load
+    val store = f7 === EvuIsa.store
+    val launch = f7 === EvuIsa.launch
+    val effectiveSew = Mux(csrio.evu.configured, csrio.evu.config.vtype(5, 3), payload.instr(14, 12))
+    val effectiveLength = Mux(csrio.evu.configured,
+      csrio.evu.config.vl << effectiveSew, payload.length)
+    val control = f7 === EvuIsa.setvli || f7 === EvuIsa.setvl || f7 === EvuIsa.setCfg ||
+      f7 === EvuIsa.waitOp || f7 === EvuIsa.fence || launch
+    val decoded = f7.pad(8) // Supported custom funct7 values equal backend opcodes.
+    val illegalConfig = !control && (csrio.evu.config.vill ||
+      !EvuIsa.supportsElementWidth(decoded, effectiveSew))
+    val invalidDescriptor = f7 === EvuIsa.quantToCute && !csrio.evu.descriptors(payload.aux(2, 0))(50)
+    val effectiveLmul = Mux(csrio.evu.configured, csrio.evu.config.vtype(2, 0), 0.U)
+    val invalidGroup = !EvuIsa.supportsRegisterGroups(payload.instr, effectiveLmul)
+    val permissionFault = !csrio.evu.permitted || illegalConfig || invalidDescriptor || invalidGroup
+    val memory = source.bits.amuCtrl.get.evu && (load || store || launch) && !permissionFault
+    val killed = source.bits.robIdx.needFlush(ctrlBlock.io.redirect)
+    val checking = RegInit(false.B)
+    check.req.valid := source.valid && memory && !checking && !ctrlBlock.io.evuBusy && !killed
+    check.req.bits.base := payload.base
+    check.req.bits.length := Mux(launch, payload.length, effectiveLength)
+    check.req.bits.read := load
+    check.req.bits.write := store
+    check.req.bits.alignment := effectiveSew
+    check.req.bits.unbounded := launch
+    check.req.bits.illegal := !launch && (csrio.evu.config.vill ||
+      ((load || store) && effectiveSew > 3.U))
+    check.cancel := ctrlBlock.io.redirect.valid
+    check.resp.ready := source.valid && memory && sink.ready && !killed
+    when(check.req.fire) { checking := true.B }
+    when(check.resp.fire || check.cancel) { checking := false.B }
+    sink.valid := source.valid && (!memory || check.resp.valid) && !killed
+    source.ready := sink.ready && (!memory || check.resp.valid) && !killed
+    val translated = WireInit(payload)
+    translated.pageMap := check.resp.bits.pageMap
+    translated.config := csrio.evu.config
+    translated.descriptor := csrio.evu.descriptors(payload.aux(2, 0))
+    sink.bits.amuCtrl.get.data := translated.asUInt
+    when(permissionFault) {
+      sink.bits.exceptionVec.get(ExceptionNO.illegalInstr) := true.B
+    }
+    when(memory) {
+      sink.bits.amuCtrl.get.data := translated.asUInt
+      val fault = check.resp.bits.fault
+      val write = check.resp.bits.write
+      val exceptions = sink.bits.exceptionVec.get
+      exceptions := 0.U.asTypeOf(exceptions)
+      exceptions(ExceptionNO.illegalInstr) := fault === EvuAddressFault.Illegal
+      exceptions(ExceptionNO.loadAddrMisaligned) := !write && fault === EvuAddressFault.Misaligned
+      exceptions(ExceptionNO.storeAddrMisaligned) := write && fault === EvuAddressFault.Misaligned
+      exceptions(ExceptionNO.loadAccessFault) := !write && fault === EvuAddressFault.Access
+      exceptions(ExceptionNO.storeAccessFault) := write && fault === EvuAddressFault.Access
+      exceptions(ExceptionNO.loadPageFault) := !write && fault === EvuAddressFault.Page
+      exceptions(ExceptionNO.storePageFault) := write && fault === EvuAddressFault.Page
+      exceptions(ExceptionNO.loadGuestPageFault) := !write && fault === EvuAddressFault.GuestPage
+      exceptions(ExceptionNO.storeGuestPageFault) := write && fault === EvuAddressFault.GuestPage
+    }
+    when(check.resp.fire && check.resp.bits.fault =/= EvuAddressFault.None) {
+      evuCheckedFault := check.resp.bits
+    }
+  }
   wbDataPath.io.fromFpExu <> fpExuBlock.io.out
   wbDataPath.io.fromVfExu <> vfExuBlock.io.out
   wbDataPath.io.fromMfExu.foreach(_ <> mfExuBlock.get.io.out)
@@ -1011,6 +1119,15 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
 
   io.toTop.cpuHalted := ctrlBlock.io.toTop.cpuHalt
   io.toAmu.foreach(_ <> ctrlBlock.io.toAmu.get)
+  // EVU commands are sent through AMU only after scalar retirement.  A
+  // subsequent branch redirect is therefore not allowed to cancel them;
+  // reset (or a future explicit accelerator-cancel event) owns EVU flush.
+  io.evuFlush.foreach(_ := false.B)
+  io.evuCompletion.foreach { completion =>
+    ctrlBlock.io.evuCompletion.get.valid := completion.valid
+    ctrlBlock.io.evuCompletion.get.bits := completion.bits
+    completion.ready := ctrlBlock.io.evuCompletion.get.ready
+  }
 
   io.traceCoreInterface <> ctrlBlock.io.traceCoreInterface
 
@@ -1272,6 +1389,10 @@ class BackendIO(implicit p: Parameters, params: BackendParams) extends XSBundle 
 
   val toTop = new BackendToTopBundle
   val toAmu = OptionWrapper(HasMatrixExtension, Vec(CommitWidth, DecoupledIO(new AmuCtrlIO)))
+  val evuDrain = OptionWrapper(p(ExternalVectorKey).enable, new xiangshan.evu.EvuDrainIO)
+  val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuCompletion(p(ExternalVectorKey)))))
+  val evuFlush = OptionWrapper(p(ExternalVectorKey).enable, Output(Bool()))
+  val evuRange = OptionWrapper(p(ExternalVectorKey).enable, new EvuRangeIO(p(ExternalVectorKey)))
 
   val traceCoreInterface = new TraceCoreInterface(hasOffset = true)
   val fenceio = new FenceIO

@@ -31,6 +31,7 @@ import xiangshan.backend.decode.{DecodeStage, FusionDecoder}
 import xiangshan.backend.dispatch.{CoreDispatchTopDownIO}
 import xiangshan.backend.dispatch.NewDispatch
 import xiangshan.backend.fu.matrix.Bundles.AmuCtrlIO
+import xiangshan.evu.EvuCompletion
 import xiangshan.backend.fu.vector.Bundles.{VType, Vl}
 import xiangshan.backend.fu.wrapper.CSRToDecode
 import xiangshan.backend.rename.{Rename, RenameTableWrapper, SnapshotGenerator}
@@ -99,6 +100,9 @@ class CtrlBlockImp(
   private def hasRen: Boolean = true
   private val pcMem = Module(new SyncDataModuleTemplate(new Ftq_RF_Components, FtqSize, numPcMemRead, 1, "BackendPC", hasRen = hasRen))
   private val rob = wrapper.rob.module
+  io.evuBusy := rob.io.evuBusy
+  io.evuRetired := rob.io.evuRetired
+  io.evuStatus := rob.io.evuStatus
   private val memCtrl = Module(new MemCtrl(params))
 
   private val disableFusion = decode.io.csrCtrl.singlestep || !decode.io.csrCtrl.fusion_enable
@@ -781,6 +785,11 @@ class CtrlBlockImp(
 
   io.toTop.cpuHalt := DelayN(rob.io.cpu_halt, 5)
   io.toAmu.foreach(_ <> rob.io.amuCtrl.get)
+  io.evuCompletion.foreach { completion =>
+    rob.io.evuCompletion.get.valid := completion.valid
+    rob.io.evuCompletion.get.bits := completion.bits
+    completion.ready := rob.io.evuCompletion.get.ready
+  }
 
   io.robio.csr.perfinfo.retiredInstr <> RegNext(rob.io.csr.perfinfo.retiredInstr)
   io.robio.exception := rob.io.exception
@@ -878,6 +887,7 @@ class CtrlBlockIO()(implicit p: Parameters, params: BackendParams) extends XSBun
   }
 
   val toAmu = OptionWrapper(HasMatrixExtension, Vec(CommitWidth, Decoupled(new AmuCtrlIO)))
+  val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuCompletion(p(ExternalVectorKey)))))
 
   val frontend = Flipped(new FrontendToCtrlIO())
   val fromCSR = new Bundle{
@@ -956,6 +966,9 @@ class CtrlBlockIO()(implicit p: Parameters, params: BackendParams) extends XSBun
     val wbData = Flipped(MixedVec(params.genWrite2CtrlBundles))
   }
   val redirect = ValidIO(new Redirect)
+  val evuBusy = Output(Bool())
+  val evuRetired = Output(Valid(new xiangshan.evu.EvuCoreCommand(p(ExternalVectorKey))))
+  val evuStatus = Output(Valid(new EvuCompletion(p(ExternalVectorKey))))
   val fromMem = new Bundle {
     val stIn = Vec(params.StaExuCnt, Flipped(ValidIO(new DynInst))) // use storeSetHit, ssid, robIdx
     val violation = Flipped(ValidIO(new Redirect))

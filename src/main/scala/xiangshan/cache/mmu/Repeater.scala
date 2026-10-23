@@ -354,6 +354,10 @@ class PTWNewFilter(Width: Int, Size: Int, FenceDelay: Int)(implicit p: Parameter
   private val LdExuCnt = backendParams.LdExuCnt
   // all store address execute units, including sta and hyu
   private val StaExuCnt = backendParams.StaExuCnt
+  private val scalarWidth = LdExuCnt + 1 + StaCnt + 2
+  private val evuWidth = if (p(ExternalVectorKey).enable) 1 else 0
+  require(Width == scalarWidth + evuWidth,
+    s"PTW request width $Width does not match scalar $scalarWidth and EVU $evuWidth ports")
 
   val io = IO(new PTWFilterIO(Width, hasHint = true))
 
@@ -373,11 +377,15 @@ class PTWNewFilter(Width: Int, Size: Int, FenceDelay: Int)(implicit p: Parameter
     prefetch_entry.io
   })
 
-  val filter = load_filter ++ store_filter ++ prefetch_filter
+  val evu_filter = Option.when(evuWidth != 0) {
+    Module(new PTWFilterEntry(Width = 1, Size = prefetchfiltersize)).io
+  }
+  val filter = load_filter ++ store_filter ++ prefetch_filter ++ evu_filter.toSeq
 
   load_filter.map(_.tlb.req := io.tlb.req.take(LdExuCnt + 1))
   store_filter.map(_.tlb.req := io.tlb.req.drop(LdExuCnt + 1).take(StaCnt))
-  prefetch_filter.map(_.tlb.req := io.tlb.req.drop(LdExuCnt + 1 + StaCnt))
+  prefetch_filter.map(_.tlb.req := io.tlb.req.drop(LdExuCnt + 1 + StaCnt).take(2))
+  evu_filter.foreach(_.tlb.req.head <> io.tlb.req(scalarWidth))
 
   val flush = DelayN(io.sfence.valid || io.csr.satp.changed || io.csr.vsatp.changed || io.csr.hgatp.changed || io.csr.priv.virt_changed, FenceDelay)
   val ptwResp = RegEnable(io.ptw.resp.bits, io.ptw.resp.fire)
@@ -410,6 +418,10 @@ class PTWNewFilter(Width: Int, Size: Int, FenceDelay: Int)(implicit p: Parameter
   io.tlb.resp.bits.getGpa(0) := load_filter(0).getGpa
   io.tlb.resp.bits.getGpa(LdExuCnt + 1) := store_filter(0).getGpa
   io.tlb.resp.bits.getGpa(LdExuCnt + 1 + StaCnt) := prefetch_filter(0).getGpa
+  evu_filter.foreach { evu =>
+    io.tlb.resp.bits.vector(scalarWidth) := evu.refill
+    io.tlb.resp.bits.getGpa(scalarWidth) := evu.getGpa
+  }
 
   val hintIO = io.hint.getOrElse(new TlbHintIO)
   val load_hintIO = load_filter(0).hint.getOrElse(new TlbHintIO)
@@ -431,9 +443,14 @@ class PTWNewFilter(Width: Int, Size: Int, FenceDelay: Int)(implicit p: Parameter
     io.tlb.resp.bits.vector(LdExuCnt + 1 + StaCnt) := true.B
     io.tlb.resp.bits.data.memidx := 0.U.asTypeOf(new MemBlockidxBundle)
   }
+  evu_filter.foreach { evu =>
+    when (evu.refill) {
+      io.tlb.resp.bits.data.memidx := evu.memidx
+    }
+  }
 
-  val ptw_arb = Module(new RRArbiterInit(new PtwReq, 3))
-  for (i <- 0 until 3) {
+  val ptw_arb = Module(new RRArbiterInit(new PtwReq, filter.size))
+  for (i <- filter.indices) {
     ptw_arb.io.in(i).valid := filter(i).ptw.req(0).valid
     ptw_arb.io.in(i).bits.vpn := filter(i).ptw.req(0).bits.vpn
     ptw_arb.io.in(i).bits.s2xlate := filter(i).ptw.req(0).bits.s2xlate

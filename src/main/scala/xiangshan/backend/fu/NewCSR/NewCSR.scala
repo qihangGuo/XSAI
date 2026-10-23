@@ -122,6 +122,7 @@ class NewCSR(implicit val p: Parameters) extends Module
   import CSRConfig._
 
   val io = IO(new Bundle {
+    val evu = new xiangshan.evu.EvuCSRCoreIO(p(ExternalVectorKey))
     val fromTop = Input(new Bundle {
       val hartId = UInt(hartIdLen.W)
       val clintTime = Input(ValidIO(UInt(64.W)))
@@ -336,7 +337,45 @@ class NewCSR(implicit val p: Parameters) extends Module
   dontTouch(gitCommitSHA)
   dontTouch(gitDirty)
 
-  private val wenLegal = permitMod.io.out.hasLegalWen
+  private val evuBank = Option.when(p(ExternalVectorKey).enable)(Module(new EvuCSR(p(ExternalVectorKey))))
+  private val evuPorts = evuBank.map { bank =>
+    // Match the existing ROB -> CSR publication latency and DiffInstrCommit(delay=3).
+    bank.io.accepted := RegNext(RegNext(io.evu.accepted, 0.U.asTypeOf(io.evu.accepted)),
+      0.U.asTypeOf(io.evu.accepted))
+    bank.io.completed := RegNext(io.evu.completed, 0.U.asTypeOf(io.evu.completed))
+    bank.io.drain := io.evu.drainResult
+    bank.io.busy := io.evu.busy
+    io.evu.config := bank.io.config
+    io.evu.configured := bank.io.configured
+    io.evu.descriptors := bank.io.descriptors
+    io.evu.state := bank.io.state
+    io.evu.permitted := !privState.isVirtual && bank.io.state =/= 0.U &&
+      (isModeM || mstateen0.regOut.C.asBool &&
+        (isModeHS && bank.io.supervisorEnable || isModeHU && bank.io.userEnable && sstateen0.regOut.C.asBool))
+    SeqMap.from(xiangshan.evu.EvuCSRs.addresses.zipWithIndex.map { case (a, i) =>
+      val port = Wire(new CSRAddrWriteBundle(new OneFieldBundle))
+      bank.io.write(i).valid := port.wen
+      bank.io.write(i).data := port.wdata
+      a -> (port, bank.io.read(i))
+    })
+  }.getOrElse(SeqMap.empty[Int, (CSRAddrWriteBundle[OneFieldBundle], UInt)])
+  if (!p(ExternalVectorKey).enable) {
+    io.evu.config := 0.U.asTypeOf(io.evu.config)
+    io.evu.configured := false.B
+    io.evu.descriptors := 0.U.asTypeOf(io.evu.descriptors)
+    io.evu.state := 0.U
+    io.evu.permitted := false.B
+  }
+  io.evu.wantDrain := false.B
+  mstatus.evuState := io.evu.state
+  private val evuAddress = xiangshan.evu.EvuCSRs.contains(addr)
+  private val evuCapabilityAccess = addr === xiangshan.evu.EvuCSRs.vlenb.U ||
+    addr === xiangshan.evu.EvuCSRs.capability.U
+  private val evuIllegal = (ren || wen) && evuAddress && (
+    !p(ExternalVectorKey).enable.B || privState.isVirtual ||
+      Mux(addr === xiangshan.evu.EvuCSRs.state.U, !isModeM,
+        !evuCapabilityAccess && !io.evu.permitted))
+  private val wenLegal = permitMod.io.out.hasLegalWen && !evuIllegal
 
   val legalSret  = permitMod.io.out.hasLegalSret
   val legalMret  = permitMod.io.out.hasLegalMret
@@ -356,7 +395,7 @@ class NewCSR(implicit val p: Parameters) extends Module
     customCSRMap ++
     indCSRMap ++
     pmpCSRMap ++
-    pmaCSRMap
+    pmaCSRMap ++ evuPorts
 
   val csrMods: Seq[CSRModule[_]] =
     machineLevelCSRMods ++
@@ -382,7 +421,7 @@ class NewCSR(implicit val p: Parameters) extends Module
     indCSROutMap ++
     customCSROutMap ++
     pmpCSROutMap ++
-    pmaCSROutMap
+    pmaCSROutMap ++ SeqMap.from(evuPorts.map { case (a, (_, data)) => a -> data })
 
   // interrupt
   val nmip = RegInit(new NonMaskableIRPendingBundle, (new NonMaskableIRPendingBundle).init)
@@ -1145,7 +1184,7 @@ class NewCSR(implicit val p: Parameters) extends Module
 
   io.out.valid := (waitIMSICValid || state === s_finish) && !redirectFlush
   io.out.bits.EX_II := DataHoldBypass(Mux1H(Seq(
-    normalCSRValid -> (permitMod.io.out.EX_II || noCSRIllegal),
+    normalCSRValid -> (permitMod.io.out.EX_II || noCSRIllegal || evuIllegal),
     waitIMSICValid -> imsic_EX_II,
   )), false.B, normalCSRValid || waitIMSICValid)
   io.out.bits.EX_VI := DataHoldBypass(Mux1H(Seq(
@@ -1633,6 +1672,21 @@ class NewCSR(implicit val p: Parameters) extends Module
     diffCriticalErrorEvent.coreid := hartId
     diffCriticalErrorEvent.criticalError := io.status.criticalErrorState
 
+    evuBank.foreach { bank =>
+      val drainEvent = DifftestModule(new DiffEvuDrainEvent, delay = 1)
+      drainEvent.coreid := hartId
+      drainEvent.valid := io.evu.drainResult.valid
+      drainEvent.fflags := io.evu.drainResult.bits.fflags
+      drainEvent.exception := io.evu.drainResult.bits.exception
+      drainEvent.cause := io.evu.drainResult.bits.cause
+      drainEvent.pc := io.evu.drainResult.bits.pc
+      drainEvent.tval := io.evu.drainResult.bits.tval
+      drainEvent.tvalValid := io.evu.drainResult.bits.tvalValid
+      val diffEvuCSR = DifftestModule(new DiffEvuCSRState)
+      diffEvuCSR.coreid := hartId
+      diffEvuCSR.valid := true.B
+      diffEvuCSR.value := bank.io.snapshot
+    }
     val diffCSRState = DifftestModule(new DiffCSRState)
     diffCSRState.coreid         := hartId
     diffCSRState.privilegeMode  := privState.PRVM.asUInt

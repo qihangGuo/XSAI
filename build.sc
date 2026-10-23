@@ -212,6 +212,62 @@ object fudian extends HasChisel {
 
 }
 
+// Compile the external-vector prototype independently of XiangShan's full
+// source graph so unrelated CUTE integration dependencies do not block EVU
+// checks during development.
+object evuCheck extends HasChisel with ScalafmtModule {
+  override def millSourcePath = pwd
+  override def scalafmtConfig = T.sources { Seq(PathRef(pwd / ".scalafmt-evu.conf")) }
+
+  override def moduleDeps = super.moduleDeps ++ Seq(rocketchip, yunsuan, XSAICache)
+
+  override def sources = T.sources {
+    os.walk(pwd / "src" / "main" / "scala" / "xiangshan" / "evu")
+      .filter(path => os.isFile(path) && path.ext == "scala")
+      .filterNot(path => Set("IntegerDivide.scala", "SharedFPFMA.scala", "EarlyDecode.scala", "TLInterface.scala", "SGTLInterface.scala").contains(path.last))
+      .map(PathRef(_))
+  }
+
+  object test extends SbtTests with TestModule.ScalaTest with ScalafmtModule {
+    override def scalafmtConfig = T.sources { Seq(PathRef(pwd / ".scalafmt-evu.conf")) }
+    override def moduleDeps = super.moduleDeps ++ Seq(evuCheck)
+
+    override def sources = T.sources {
+      os.walk(pwd / "src" / "test" / "scala" / "evu")
+        .filter(path => os.isFile(path) && path.ext == "scala")
+        .map(PathRef(_))
+    }
+
+    override def ivyDeps = Agg(
+      ivy"edu.berkeley.cs::chiseltest:6.0.0",
+      ivy"org.scalatest::scalatest:3.2.17"
+    )
+  }
+}
+
+// Core MMU unit tests need the compiled core classes, not packaged simulator
+// resources or prebuilt NEMU shared libraries.
+object evuMmuCheck extends HasChisel {
+  override def unmanagedClasspath = T {
+    xiangshan.compileClasspath() ++ Agg(xiangshan.compile().classes)
+  }
+
+  object test extends SbtTests with TestModule.ScalaTest {
+    override def moduleDeps = super.moduleDeps ++ Seq(evuMmuCheck)
+
+    override def sources = T.sources {
+      os.walk(pwd / "src" / "test" / "scala" / "xiangshan" / "evucheck")
+        .filter(path => os.isFile(path) && path.ext == "scala")
+        .map(PathRef(_))
+    }
+
+    override def ivyDeps = Agg(
+      defaultVersions("chiseltest"),
+      ivy"org.scalatest::scalatest:3.2.17"
+    )
+  }
+}
+
 object chiselAIA extends HasChisel {
   override def millSourcePath = pwd / "ChiselAIA"
 
@@ -354,6 +410,16 @@ object xiangshan extends XiangShanModule with HasChisel with ScalafmtModule {
   }
 
   override def forkArgs = forkArgsTask()
+
+  // The EVU owns the Saturn-derived implementation under xiangshan/evu.
+  // These files are legacy Rocket/Chipyard adapters; HBL2 supplies the
+  // memory boundary and the EVU-local backend supplies the functional units.
+  override def sources = T.sources {
+    super.sources().filterNot(ref => Set(
+      "IntegerDivide.scala", "SharedFPFMA.scala", "EarlyDecode.scala",
+      "TLInterface.scala", "SGTLInterface.scala"
+    ).exists(name => ref.path.toString.endsWith("/" + name)))
+  }
 
   override def ivyDeps = super.ivyDeps() ++ Agg(
     defaultVersions("chiseltest"),

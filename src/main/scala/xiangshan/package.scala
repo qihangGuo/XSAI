@@ -1111,6 +1111,7 @@ package object xiangshan {
     def IMM_MSETVAL = "b10001".U
     def IMM_CSRCONST = "b10010".U
     def IMM_MATRIXREG = "b10011".U
+    def IMM_EVU = "b10100".U
 
     def X      = BitPat("b00000")
 
@@ -1136,6 +1137,7 @@ package object xiangshan {
         IMM_MSETVAL.litValue   -> "MSETVAL",
         IMM_CSRCONST.litValue  -> "CSRCONST",
         IMM_MATRIXREG.litValue -> "MATRIXREG",
+        IMM_EVU.litValue       -> "EVU",
       )
       strMap(immType.litValue)
     }
@@ -1159,6 +1161,7 @@ package object xiangshan {
         IMM_MSETVAL.litValue   -> ImmUnion.MSETVAL,
         IMM_CSRCONST.litValue  -> ImmUnion.CSRCONST,
         IMM_MATRIXREG.litValue -> ImmUnion.MATRIXREG,
+        IMM_EVU.litValue       -> ImmUnion.EVU,
       )
       iuMap(immType.litValue)
     }

@@ -28,6 +28,8 @@ class XSCuteTopImpl(wrapper: XSCuteTop) extends LazyModuleImp(wrapper) {
   })
   io.ctrl2top <> cute.io.ctrl2top
   io.perf <> cute.io.perf
+  io.vectorResult <> cute.io.vectorResult
+  io.evuAbWrite <> cute.io.evuAbWrite
   wrapper.cute_tl.module.io.matrix_data_in <> io.matrix_data_in
   wrapper.cute_tl.module.io.mmu <> cute.io.mmu2llc
   io.mmu2llc := DontCare

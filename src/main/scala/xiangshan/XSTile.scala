@@ -18,7 +18,7 @@ package xiangshan
 
 import org.chipsalliance.cde.config.{Config, Field, Parameters}
 import chisel3._
-import chisel3.util.{Valid, ValidIO, log2Up, Arbiter, Decoupled}
+import chisel3.util.{Valid, ValidIO, log2Up, Arbiter, Decoupled, Cat}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.interrupts._
 import freechips.rocketchip.tile.{BusErrorUnit, BusErrorUnitParams, BusErrors}
@@ -34,6 +34,7 @@ import xiangshan.backend.trace.TraceCoreInterface
 import xiangshan.backend.fu.matrix._
 import xiangshan.backend.fu.matrix.Bundles._
 import cute.{CutePerfAsyncCrossing, CutePerfToCoreIO, XSCute}
+import xiangshan.evu.{EvuCompletion, EvuCoreCommand, EvuDispatchRequest, EvuTop, MatrixVectorBridge}
 
 object MatAcc extends Enumeration {
   type MatAcc = Value
@@ -68,6 +69,12 @@ class XSTile()(implicit p: Parameters) extends LazyModule
   }
   private val acceleratorCDC = p(ExternalAcceleratorCDCKey)
   private val useAcceleratorCDC = cuteOpt.nonEmpty && acceleratorCDC.enable
+  val evuOpt = Option.when(p(ExternalVectorKey).enable)(LazyModule(new EvuTop(p(ExternalVectorKey))))
+
+  require(!p(ExternalVectorKey).enable || HasMatrixExtension,
+    "EVU requires the AMU retirement interface provided by the matrix extension")
+  require(coreParams.EnableExternalVector == p(ExternalVectorKey).enable,
+    "Use WithExternalVector to enable both the scalar dispatch path and the EVU")
 
   val enableL2 = coreParams.L2CacheParamsOpt.isDefined
   // =========== Public Ports ============
@@ -109,6 +116,20 @@ class XSTile()(implicit p: Parameters) extends LazyModule
       }
     }
   }.flatten
+
+  val evuTLAsyncCrossing = evuOpt.flatMap { evu =>
+    if (useAcceleratorCDC) {
+      val source = LazyModule(new TLAsyncCrossingSource())
+      val sink = LazyModule(new TLAsyncCrossingSink(acceleratorCDC.tileLink))
+      source.node := evu.visibilityNode
+      sink.node := source.node
+      l2top.inner.misc_l2_pmu := sink.node
+      Some((source, sink))
+    } else {
+      l2top.inner.misc_l2_pmu := evu.visibilityNode
+      None
+    }
+  }
 
   l2top.inner.misc_l2_pmu := l2top.inner.l1i_logger := memBlock.frontendBridge.icache_node
   if (!coreParams.softPTW) {
@@ -289,6 +310,43 @@ class XSTile()(implicit p: Parameters) extends LazyModule
       reset.asAsyncReset
     }
 
+    // A redirect is a one-cycle pulse in the core clock domain.  Do not wire
+    // that pulse directly into the accelerator clock domain: it can be missed
+    // or metastable when the external-vector clock is independent.  Encode it
+    // as a core-domain toggle and synchronize the toggle into the accelerator
+    // domain, where it is decoded back into a one-cycle flush pulse.
+    val evuFlushAccelerator = if (useAcceleratorCDC) {
+      val flushToggle = RegInit(false.B)
+      when (core.module.io.evuFlush.getOrElse(false.B)) {
+        flushToggle := ~flushToggle
+      }
+      val sync0 = withClockAndReset(acceleratorClock, acceleratorReset) {
+        RegNext(flushToggle, false.B)
+      }
+      val sync1 = withClockAndReset(acceleratorClock, acceleratorReset) {
+        RegNext(sync0, false.B)
+      }
+      withClockAndReset(acceleratorClock, acceleratorReset) {
+        val seen = RegInit(false.B)
+        val pulse = sync1 =/= seen
+        when (pulse) { seen := sync1 }
+        pulse
+      }
+    } else {
+      core.module.io.evuFlush.getOrElse(false.B)
+    }
+
+    evuOpt.foreach { evu =>
+      evu.module.clock := acceleratorClock
+      evu.module.reset := acceleratorReset
+      evuTLAsyncCrossing.foreach { case (source, sink) =>
+        source.module.clock := acceleratorClock
+        source.module.reset := acceleratorReset
+        sink.module.clock := clock
+        sink.module.reset := reset
+      }
+    }
+
     cuteOpt.foreach { case cute =>
       l2top.module.io.matrixDataOut512L2 := DontCare
       cute.module.io := DontCare
@@ -303,13 +361,50 @@ class XSTile()(implicit p: Parameters) extends LazyModule
       }
 
       core.module.io.amuCtrl.foreach { amuCtrl =>
+        val matrixCommand = Wire(Decoupled(new AmuCtrlIO))
+        matrixCommand.valid := amuCtrl.valid && !amuCtrl.bits.evu
+        matrixCommand.bits := amuCtrl.bits
+
+        val evuReady = evuOpt.map { evu =>
+          val payload = amuCtrl.bits.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey)))
+          val dispatch = Wire(Decoupled(new EvuDispatchRequest(p(ExternalVectorKey))))
+          dispatch.valid := amuCtrl.valid && amuCtrl.bits.evu
+          dispatch.bits.instr := payload.instr
+          dispatch.bits.base := payload.base
+          dispatch.bits.pageMap := payload.pageMap
+          dispatch.bits.vl := payload.vl
+          dispatch.bits.length := payload.length
+          dispatch.bits.aux := payload.aux
+          dispatch.bits.pc := payload.pc
+          dispatch.bits.config := payload.config
+          dispatch.bits.descriptor := payload.descriptor
+          dispatch.bits.stride := 0.S
+          dispatch.bits.chain := true.B
+          if (useAcceleratorCDC) {
+            val evuCommandCrossing = Module(new AsyncQueue(
+              new EvuDispatchRequest(p(ExternalVectorKey)),
+              acceleratorCDC.command
+            ))
+            evuCommandCrossing.io.enq_clock := clock
+            evuCommandCrossing.io.enq_reset := reset.asBool
+            evuCommandCrossing.io.deq_clock := acceleratorClock
+            evuCommandCrossing.io.deq_reset := acceleratorReset.asBool
+            evuCommandCrossing.io.enq <> dispatch
+            evu.module.io.dispatch <> evuCommandCrossing.io.deq
+          } else {
+            evu.module.io.dispatch <> dispatch
+          }
+          dispatch.ready
+        }.getOrElse(false.B)
+        amuCtrl.ready := Mux(amuCtrl.bits.evu, evuReady, matrixCommand.ready)
+
         if (useAcceleratorCDC) {
           val commandCrossing = Module(new AsyncQueue(new AmuCtrlIO, acceleratorCDC.command))
           commandCrossing.io.enq_clock := clock
           commandCrossing.io.enq_reset := reset.asBool
           commandCrossing.io.deq_clock := acceleratorClock
           commandCrossing.io.deq_reset := acceleratorReset.asBool
-          commandCrossing.io.enq <> amuCtrl
+          commandCrossing.io.enq <> matrixCommand
           val coreCommand = commandCrossing.io.deq.bits
           val cuteCommand = cute.module.io.cute.ctrl2top.amuCtrl.bits
           require(coreCommand.op.getWidth == cuteCommand.op.getWidth)
@@ -323,7 +418,13 @@ class XSTile()(implicit p: Parameters) extends LazyModule
           cuteCommand.coreid.zip(coreCommand.coreid).foreach { case (sink, source) => sink := source }
           commandCrossing.io.deq.ready := cute.module.io.cute.ctrl2top.amuCtrl.ready
         } else {
-          cute.module.io.cute.ctrl2top.amuCtrl <> amuCtrl
+          val cuteCommand = cute.module.io.cute.ctrl2top.amuCtrl
+          cuteCommand.valid := matrixCommand.valid
+          cuteCommand.bits.op := matrixCommand.bits.op
+          cuteCommand.bits.data := matrixCommand.bits.data
+          cuteCommand.bits.pc.zip(matrixCommand.bits.pc).foreach { case (sink, source) => sink := source }
+          cuteCommand.bits.coreid.zip(matrixCommand.bits.coreid).foreach { case (sink, source) => sink := source }
+          matrixCommand.ready := cuteCommand.ready
         }
       }
       core.module.io.amuRelease.foreach { amuRelease =>
@@ -417,6 +518,158 @@ class XSTile()(implicit p: Parameters) extends LazyModule
       cute.module.io.hartId := io.hartId
       cute.module.io.difftestClock.foreach(_ := clock)
       cute.module.io.difftestReset.foreach(_ := reset.asBool)
+    }
+
+    evuOpt.foreach { evu =>
+      evu.module.io.matrixInput.valid := false.B
+      evu.module.io.matrixInput.bits := 0.U.asTypeOf(evu.module.io.matrixInput.bits)
+      evu.module.io.matrixOutput.ready := true.B
+      evu.module.io.cuteWrite.ready := true.B
+    }
+
+    // CUTE emits a completed tile; the bridge slices it into DLEN beats and
+    // only asserts the EVU input when the tile has been accepted.
+    cuteOpt.foreach { cute =>
+      if (evuOpt.isDefined) {
+        val evu = evuOpt.get
+        val tileBits = cute.module.io.cute.vectorResult.bits.getWidth
+        val bridge = withClockAndReset(acceleratorClock, acceleratorReset) {
+          Module(new MatrixVectorBridge(tileBits, p(ExternalVectorKey)))
+        }
+        bridge.io.in.valid := cute.module.io.cute.vectorResult.valid
+        bridge.io.in.bits.data := cute.module.io.cute.vectorResult.bits
+        bridge.io.in.bits.tileId := cute.module.io.cute.vectorResultTileId
+        bridge.io.in.bits.kComplete := cute.module.io.cute.vectorResultKComplete
+        bridge.io.in.bits.taskLast := cute.module.io.cute.vectorResultTaskLast
+        bridge.io.in.bits.scaleTag := evu.module.io.matrixScaleTag
+        bridge.io.in.bits.biasTag := evu.module.io.matrixBiasTag
+        cute.module.io.cute.vectorResult.ready := bridge.io.in.ready
+        evu.module.io.matrixInput <> bridge.io.out
+        evu.module.io.matrixOutput.ready := true.B
+
+        // Quantized EVU output is written directly into the selected CUTE
+        // ABMatrixReg entry. Both units are in this tile's vector/matrix
+        // clock domain; the Decoupled handshake is the ownership boundary.
+        val cuteAbWrite = cute.module.io.cute.evuAbWrite
+        cuteAbWrite.valid := evu.module.io.cuteWrite.valid
+        cuteAbWrite.bits.matrixReg := evu.module.io.cuteWrite.bits.matrixReg(
+          cuteAbWrite.bits.matrixReg.getWidth - 1, 0)
+        cuteAbWrite.bits.bank := evu.module.io.cuteWrite.bits.bank(
+          cuteAbWrite.bits.bank.getWidth - 1, 0)
+        cuteAbWrite.bits.addr := evu.module.io.cuteWrite.bits.entry(
+          cuteAbWrite.bits.addr.getWidth - 1, 0)
+        if (cuteAbWrite.bits.data.getWidth >= p(ExternalVectorKey).dlenBits) {
+          cuteAbWrite.bits.data := Cat(
+            0.U((cuteAbWrite.bits.data.getWidth - p(ExternalVectorKey).dlenBits).W),
+            evu.module.io.cuteWrite.bits.data)
+          cuteAbWrite.bits.byteMask := Cat(
+            0.U((cuteAbWrite.bits.byteMask.getWidth - p(ExternalVectorKey).dlenBits / 8).W),
+            evu.module.io.cuteWrite.bits.byteMask)
+        } else {
+          cuteAbWrite.bits.data := evu.module.io.cuteWrite.bits.data(
+            cuteAbWrite.bits.data.getWidth - 1, 0)
+          cuteAbWrite.bits.byteMask := evu.module.io.cuteWrite.bits.byteMask(
+            cuteAbWrite.bits.byteMask.getWidth - 1, 0)
+        }
+        evu.module.io.cuteWrite.ready := cuteAbWrite.ready
+      } else {
+        cute.module.io.cute.vectorResult.ready := true.B
+      }
+    }
+
+    // Retired xv.* commands use dispatch; the raw command port remains local.
+    // These commands are non-speculative, so a core branch redirect must not
+    // cancel them. Completion/exception reporting still needs a job-state bridge.
+    evuOpt.foreach { evu =>
+      evu.module.io.command.valid := false.B
+      evu.module.io.command.bits := DontCare
+      if (env.EnableDifftest) {
+        require(!useAcceleratorCDC, "EVU difftest currently requires a common core/accelerator clock")
+        val event = difftest.DifftestModule(new difftest.DiffEvuStoreEvent, delay = 3)
+        event.coreid := io.hartId
+        event.valid := evu.module.io.storeTrace.valid
+        event.addr := evu.module.io.storeTrace.bits.addr
+        event.data := evu.module.io.storeTrace.bits.data.asTypeOf(event.data)
+        event.mask := evu.module.io.storeTrace.bits.mask
+        val matrixTrace = evu.module.io.matrixTrace
+        val matrixEvent = difftest.DifftestModule(new difftest.DiffEvuMatrixEvent(p(ExternalVectorKey).dlenBits / 64), delay = 3)
+        matrixEvent.coreid := io.hartId
+        matrixEvent.valid := matrixTrace.valid
+        matrixEvent.row := matrixTrace.bits.row
+        matrixEvent.col := matrixTrace.bits.col
+        matrixEvent.data := matrixTrace.bits.data.asTypeOf(matrixEvent.data)
+        matrixEvent.mask := matrixTrace.bits.mask
+        matrixEvent.fflags := matrixTrace.bits.fflags
+        matrixEvent.last := matrixTrace.bits.last
+        val snapshot = evu.module.io.archSnapshot.get
+        for (reg <- 0 until p(ExternalVectorKey).vectorRegs) {
+          val vrf = difftest.DifftestModule(new difftest.DiffEvuVrfState(p(ExternalVectorKey).vlenBits / 64), delay = 3)
+          vrf.coreid := io.hartId
+          vrf.index := reg.U
+          vrf.valid := snapshot.valid
+          vrf.value := snapshot.bits.vr(reg)
+        }
+
+      }
+      val drain = core.module.io.evuDrain.get
+      if (useAcceleratorCDC) {
+        val rq = Module(new AsyncQueue(Bool(), acceleratorCDC.command))
+        rq.io.enq_clock := clock
+        rq.io.enq_reset := reset.asBool
+        rq.io.deq_clock := acceleratorClock
+        rq.io.deq_reset := acceleratorReset.asBool
+        rq.io.enq <> drain.request
+        evu.module.io.drain.request <> rq.io.deq
+        val rp = Module(new AsyncQueue(new xiangshan.evu.EvuDrainResult, acceleratorCDC.completion))
+        rp.io.enq_clock := acceleratorClock
+        rp.io.enq_reset := acceleratorReset.asBool
+        rp.io.deq_clock := clock
+        rp.io.deq_reset := reset.asBool
+        rp.io.enq <> evu.module.io.drain.response
+        drain.response <> rp.io.deq
+      } else {
+        evu.module.io.drain <> drain
+      }
+      core.module.io.evuCompletion.foreach { completion =>
+        if (useAcceleratorCDC) {
+          val evuCompletionCrossing = Module(new AsyncQueue(
+            new EvuCompletion(p(ExternalVectorKey)),
+            acceleratorCDC.completion
+          ))
+          evuCompletionCrossing.io.enq_clock := acceleratorClock
+          evuCompletionCrossing.io.enq_reset := acceleratorReset.asBool
+          evuCompletionCrossing.io.deq_clock := clock
+          evuCompletionCrossing.io.deq_reset := reset.asBool
+          evuCompletionCrossing.io.enq <> evu.module.io.completion
+          completion <> evuCompletionCrossing.io.deq
+        } else {
+          completion <> evu.module.io.completion
+        }
+      }
+      // xv commands reach the EVU only after architectural retirement. A core
+      // redirect therefore cannot cancel them; reset or an explicit future job
+      // cancellation command owns accelerator-domain flushing.
+      evu.module.io.flush := evuFlushAccelerator
+      // With AME selected there is no CUTE consumer.  Retired AMU entries
+      // are routed directly to the EVU dispatch adapter.
+      if (cuteOpt.isEmpty) {
+        core.module.io.amuCtrl.foreach { amuCtrl =>
+          val payload = amuCtrl.bits.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey)))
+          evu.module.io.dispatch.valid := amuCtrl.valid && amuCtrl.bits.evu
+          evu.module.io.dispatch.bits.instr := payload.instr
+          evu.module.io.dispatch.bits.base := payload.base
+          evu.module.io.dispatch.bits.pageMap := payload.pageMap
+          evu.module.io.dispatch.bits.vl := payload.vl
+          evu.module.io.dispatch.bits.length := payload.length
+          evu.module.io.dispatch.bits.aux := payload.aux
+          evu.module.io.dispatch.bits.pc := payload.pc
+          evu.module.io.dispatch.bits.config := payload.config
+          evu.module.io.dispatch.bits.descriptor := payload.descriptor
+          evu.module.io.dispatch.bits.stride := 0.S
+          evu.module.io.dispatch.bits.chain := true.B
+          amuCtrl.ready := Mux(amuCtrl.bits.evu, evu.module.io.dispatch.ready, false.B)
+        }
+      }
     }
 
     if (HasMatrixExtension && cuteOpt.isEmpty) {

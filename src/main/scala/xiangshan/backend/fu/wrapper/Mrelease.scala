@@ -19,6 +19,7 @@ class Mrelease(cfg: FuConfig)(implicit p: Parameters) extends PipedFuncUnit(cfg)
   output.msyncRd := in.data.imm
 
   out.res.data := 0.U
+  out.ctrl.amuCtrl.get.evu := false.B
   out.ctrl.amuCtrl.get.op   := AmuCtrlIO.releaseOp()
   out.ctrl.amuCtrl.get.data := output.asUInt
   if (env.EnableDifftest) {

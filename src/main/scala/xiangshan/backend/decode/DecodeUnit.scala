@@ -765,6 +765,11 @@ case class Imm_CSRCONST() extends Imm(20){
   }
 }
 
+case class Imm_EVU() extends Imm(18){
+  override def do_toImm32(minBits: UInt): UInt = ZeroExt(minBits, 32)
+  override def minBitsFromInstr(instr: UInt): UInt = Cat(instr(14, 12), instr(24, 20), instr(19, 15), instr(11, 7))
+}
+
 case class Imm_MATRIXREG() extends Imm(9){
   override def do_toImm32(minBits: UInt): UInt = ZeroExt(minBits, 32)
 
@@ -791,9 +796,10 @@ object ImmUnion {
   val MSETVAL = Imm_MSETVAL()
   val CSRCONST = Imm_CSRCONST()
   val MATRIXREG = Imm_MATRIXREG()
+  val EVU = Imm_EVU()
 
   // do not add special type lui32 to this, keep ImmUnion max len being 20.
-  val imms = Seq(I, S, B, U, J, Z, B6, OPIVIS, OPIVIU, VSETVLI, VSETIVLI, VRORVI, MSET, MSETVAL, CSRCONST, MATRIXREG)
+  val imms = Seq(I, S, B, U, J, Z, B6, OPIVIS, OPIVIU, VSETVLI, VSETIVLI, VRORVI, MSET, MSETVAL, CSRCONST, MATRIXREG, EVU)
   val maxLen = imms.maxBy(_.len).len
   val immSelMap = Seq(
     SelImm.IMM_I,
@@ -811,7 +817,8 @@ object ImmUnion {
     SelImm.IMM_MSET,
     SelImm.IMM_MSETVAL,
     SelImm.IMM_CSRCONST,
-    SelImm.IMM_MATRIXREG
+    SelImm.IMM_MATRIXREG,
+    SelImm.IMM_EVU
   ).zip(imms)
   println(s"ImmUnion max len: $maxLen")
 }
@@ -874,6 +881,7 @@ class DecodeUnit(implicit p: Parameters) extends XSModule with DecodeUnitConstan
     HypervisorDecode.table ++
     VecDecoder.table(HasVfexp2) ++
     OptionWrapper(HasMatrixExtension, MatrixDecoder.table(MatrixExtension)).getOrElse(Array()) ++
+    OptionWrapper(p(ExternalVectorKey).enable && HasMatrixExtension, EvuDecoder.table).getOrElse(Array()) ++
     ZicondDecode.table ++
     ZimopDecode.table ++
     ZfaDecode.table ++
