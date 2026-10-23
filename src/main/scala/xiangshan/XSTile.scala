@@ -69,6 +69,8 @@ class XSTile()(implicit p: Parameters) extends LazyModule
   }
   private val acceleratorCDC = p(ExternalAcceleratorCDCKey)
   private val useAcceleratorCDC = cuteOpt.nonEmpty && acceleratorCDC.enable
+  require(!useAcceleratorCDC || cuteOpt.forall(cute => !cute.cuteParams.EnableMatrixPrefetch),
+    "Matrix prefetch notifications require a common core/accelerator clock")
   val evuOpt = Option.when(p(ExternalVectorKey).enable)(LazyModule(new EvuTop(p(ExternalVectorKey))))
 
   require(!p(ExternalVectorKey).enable || HasMatrixExtension,
@@ -303,6 +305,8 @@ class XSTile()(implicit p: Parameters) extends LazyModule
       core.module.reset := l2top.module.reset_core
     }
 
+    l2top.module.io.matrixPrefetch.foreach(_ := 0.U.asTypeOf(new xscache.coupledL2.prefetch.MatrixPrefetchControl))
+
     val acceleratorClock = io.acceleratorClock.getOrElse(clock)
     val acceleratorReset = if (useAcceleratorCDC) {
       withClockAndReset(acceleratorClock, reset) { ResetGen(io.dft_reset) }
@@ -446,6 +450,10 @@ class XSTile()(implicit p: Parameters) extends LazyModule
           cute.module.io.cute.ctrl2top.mrelease.ready := amuRelease.ready
         }
       }
+      for {
+        l2Prefetch <- l2top.module.io.matrixPrefetch
+        cutePrefetch <- cute.module.io.cute.matrixPrefetch
+      } l2Prefetch := cutePrefetch
 
       val matrix_data_out = l2top.module.io.matrixDataOut512L2
       val matrix_data_in = cute.module.io.matrix_data_in

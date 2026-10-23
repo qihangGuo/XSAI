@@ -565,8 +565,8 @@ class XiangShan(object):
         # select a random SPEC checkpoint
         assert(name == "random")
         all_cpt_dir = [
-            "/nfs/home/share/checkpoints_profiles/spec06_gcc16_rv64gcb_260819/checkpoint",
-            "/nfs/home/share/checkpoints_profiles/spec17_rate_gcc16_rv64gcb_260812/checkpoint"
+            "/nfs/home/share/checkpoints_profiles/spec06_gcc16_rva23_novec_260820/checkpoint",
+            "/nfs/home/share/checkpoints_profiles/spec17_rate_gcc16_rva23_novec_260904/checkpoint"
         ]
         missing_cpt_dir = [path for path in all_cpt_dir if not os.path.isdir(path)]
         if missing_cpt_dir:
@@ -640,7 +640,8 @@ class XiangShan(object):
 
 def get_free_cores(n):
     numa_re = re.compile(r'.*numactl +.*-C +([0-9]+)-([0-9]+).*')
-    while True:
+    max_retry = 60
+    for _ in range(max_retry):
         disable_cores = []
         for proc in psutil.process_iter():
             try:
@@ -654,6 +655,8 @@ def get_free_cores(n):
         core_usage = psutil.cpu_percent(interval=1, percpu=True)
         num_window = num_logical_core // n
         for i in range(num_window):
+            if not set(range(i * n, i * n + n)).issubset(os.sched_getaffinity(0)):
+                continue
             if set(disable_cores) & set(range(i * n, i * n + n)):
                 continue
             window_usage = core_usage[i * n : i * n + n]
@@ -661,6 +664,8 @@ def get_free_cores(n):
                 return (((i * n) % num_logical_core) // (num_logical_core // 2), i * n, i * n + n - 1)
         print(f"No free {n} cores found. CPU usage: {core_usage}\n")
         time.sleep(random.uniform(1, 60))
+
+    raise RuntimeError(f"Failed to find {n} free cores after {max_retry} retries")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Python wrapper for XiangShan')
