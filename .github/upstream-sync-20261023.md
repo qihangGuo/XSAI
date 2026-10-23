@@ -30,3 +30,11 @@ No local EMU, Verilog or guest binary was generated; nexus-am is outside scope.
 Backups, original indexes, patches, Git bundles, logs and manifests:
 `/tmp/xsai-evu-upstream-sync-20261023-232704`.
 Validation details: `difftest/.github/upstream-sync-progress.md`.
+
+Delivery is complete in the original working directories. Both main repositories
+and CUTE/Difftest/XSAICache/Utility use the integration branch, with clean source
+status. Original feature branches are unchanged; original uncommitted work is
+also retained in Git stashes and the backup archives. The exact pre-normalization
+index is archived for the one intent-to-add entry. Source compilation and all
+native regressions pass again in the original directories. nexus-am and the other
+XSAI worktree retain their original HEAD and Git status.
