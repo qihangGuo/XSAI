@@ -6,7 +6,6 @@ import chisel3.util._
 class EvuCoreCommand(p: EvuParams) extends Bundle {
   val pc = UInt(64.W)
   val config = new EvuExecutionConfig(p)
-  val descriptor = UInt(51.W)
   val instr  = UInt(32.W)
   val base   = UInt(64.W)
   val vl     = UInt(log2Ceil(p.vlenBits + 1).W)
@@ -26,7 +25,6 @@ class EvuCoreCommand(p: EvuParams) extends Bundle {
 class EvuDispatchRequest(p: EvuParams) extends Bundle {
   val pc = UInt(64.W)
   val config = new EvuExecutionConfig(p)
-  val descriptor = UInt(51.W)
   val instr  = UInt(32.W)
   val base   = UInt(64.W)
   val vl     = UInt(log2Ceil(p.vlenBits + 1).W)
@@ -38,6 +36,31 @@ class EvuDispatchRequest(p: EvuParams) extends Bundle {
 }
 
 object EvuIsa {
+  // New FP32 forms reuse the original arithmetic opcodes internally. aux[6]
+  // selects element zero, aux[5] a VRF scalar source, aux[4] quant scalar scale.
+  val loadE0 = 0x52.U(7.W)
+  val storeE0 = 0x53.U(7.W)
+  val faddE0 = 0x54.U(7.W)
+  val fsubE0 = 0x55.U(7.W)
+  val fmulE0 = 0x56.U(7.W)
+  val fdivE0 = 0x57.U(7.W)
+  val fmaxE0 = 0x58.U(7.W)
+  val exp2E0 = 0x59.U(7.W)
+  val faddScalar = 0x5a.U(7.W)
+  val fsubScalar = 0x5b.U(7.W)
+  val fmulScalar = 0x5c.U(7.W)
+  val fmaxScalar = 0x5d.U(7.W)
+  val fpQuantScalar = 0x5e.U(7.W)
+  def isElementZero(f7: UInt): Bool = f7 >= loadE0 && f7 <= exp2E0
+  def isScalarSource(f7: UInt): Bool = f7 >= faddScalar && f7 <= fmaxScalar
+  def isScalarForm(f7: UInt): Bool = isElementZero(f7) || isScalarSource(f7) || f7 === fpQuantScalar
+  def isLoad(f7: UInt): Bool = f7 === load || f7 === loadE0
+  def isStore(f7: UInt): Bool = f7 === store || f7 === storeE0
+  def canonical(f7: UInt): UInt = MuxLookup(f7, f7)(Seq(
+    loadE0 -> load, storeE0 -> store, faddE0 -> fadd, fsubE0 -> fsub,
+    fmulE0 -> fmul, fdivE0 -> fdiv, fmaxE0 -> fmax, exp2E0 -> exp2,
+    faddScalar -> fadd, fsubScalar -> fsub, fmulScalar -> fmul,
+    fmaxScalar -> fmax, fpQuantScalar -> fpQuantToCute))
   // The external EVU is an inference-oriented vector engine.  Its public
   // command format still has a three-bit SEW field, but only byte/halfword/
   // word elements are implemented.  Keeping this limit in one place makes
@@ -51,14 +74,17 @@ object EvuIsa {
       EvuOpcode.FDiv, EvuOpcode.FMin, EvuOpcode.FMax, EvuOpcode.FReduceSum,
       EvuOpcode.FReduceMin, EvuOpcode.FReduceMax, EvuOpcode.Exp2).map(opcode === _).reduce(_ || _)
     val exp2Width = !fp || sew === 1.U || sew === 2.U
-    sew <= maxSupportedSew.U && (!widening || sew < maxSupportedSew.U) && exp2Width
+    (!isScalarForm(opcode) || sew === 2.U) &&
+      sew <= maxSupportedSew.U && (!widening || sew < maxSupportedSew.U) && exp2Width &&
+      (opcode =/= EvuOpcode.FpQuantToCute || sew === 2.U)
   }
 
   /** Register groups must be checked before the custom command retires. */
   def supportsRegisterGroups(instr: UInt, lmul: UInt): Bool = {
-    val op = instr(31, 25)
+    val rawOp = instr(31, 25)
+    val op = canonical(rawOp)
     val memory = op === load || op === store
-    val control = op === setvli || op === setvl || op === setCfg ||
+    val control = op === setvli || op === setvl ||
       op === launch || op === waitOp || op === fence
     val widening = op === wadd || op === wsub || op === wmul
     val reduction = Seq(reduceSum, reduceMax, reduceMin, reduceAnd, reduceOr,
@@ -70,11 +96,11 @@ object EvuIsa {
     val dest = instr(11, 7)
     val src1 = instr(19, 15)
     val src2 = instr(24, 20)
-    // QuantToCute's current CUTE entry stream covers one physical VRF register.
-    control || Mux(memory, aligned(dest, count),
-      Mux(op === quantToCute, count === 1.U,
+    // FP quantization's CUTE entry stream covers one physical VRF register.
+    (!isScalarForm(rawOp) || lmul === 0.U) && (control || Mux(memory, aligned(dest, count),
+      Mux(op === fpQuantToCute, count === 1.U,
         aligned(dest, destCount) && aligned(src2, count) &&
-          (op === exp2 || aligned(src1, Mux(reduction, 1.U, count)))))
+          (op === exp2 || op === gatherImm || aligned(src1, Mux(reduction, 1.U, count))))))
   }
 
   val custom0 = "b0001011".U(7.W)
@@ -136,9 +162,11 @@ object EvuIsa {
   val gather = 0x47.U(7.W)
   val scatter = 0x48.U(7.W)
   // Retired nonlinear opcodes 0x49..0x4b remain reserved.
-  val quantToCute = 0x4c.U(7.W)
+  val fpQuantToCute = 0x50.U(7.W)
+  // rs1 is an unsigned element index, not a scalar or vector register.
+  val gatherImm = 0x51.U(7.W)
   // Retired SETMASK opcode 0x4d remains reserved.
-  val setCfg = 0x4e.U(7.W)
+  // Retired fixed-point QuantToCute (0x4c) and SETCFG (0x4e) are reserved.
   // Retired VRF QUANT opcode 0x4f remains reserved.
 
   // custom1 (0101011) is reserved by the existing MATRIX_INSTS ISA.
@@ -171,7 +199,8 @@ class EvuDispatchAdapter(p: EvuParams) extends Module {
   buffered.ready := io.out.ready && !io.flush
 
   val instr = buffered.bits.instr
-  val f7    = instr(31, 25)
+  val rawF7 = instr(31, 25)
+  val f7 = EvuIsa.canonical(rawF7)
   // All EVU operations use a custom opcode and funct7 operation selector.
   // funct3 is copied to sew below, matching the RISC-V convention.
   val opcode = MuxLookup(f7, EvuOpcode.Invalid)(Seq(
@@ -222,18 +251,18 @@ class EvuDispatchAdapter(p: EvuParams) extends Module {
     EvuIsa.setvl -> EvuOpcode.SetVl,
     EvuIsa.gather -> EvuOpcode.Gather,
     EvuIsa.scatter -> EvuOpcode.Scatter,
-    EvuIsa.quantToCute -> EvuOpcode.QuantToCute,
-    EvuIsa.setCfg -> EvuOpcode.SetCfg
+    EvuIsa.fpQuantToCute -> EvuOpcode.FpQuantToCute,
+    EvuIsa.gatherImm -> EvuOpcode.GatherImm
   ))
   val supportedSew = EvuIsa.supportsElementWidth(opcode, EvuIsa.sew(instr))
   val controlOp = opcode === EvuOpcode.Launch || opcode === EvuOpcode.Wait || opcode === EvuOpcode.Fence ||
     opcode === EvuOpcode.SetVli || opcode === EvuOpcode.SetVl
-  val legal = EvuIsa.isCustom(instr) && opcode =/= EvuOpcode.Invalid && (supportedSew || controlOp)
+  val legal = EvuIsa.isCustom(instr) && opcode =/= EvuOpcode.Invalid && (supportedSew || controlOp) &&
+    (!EvuIsa.isScalarForm(rawF7) || (p.scalarInstructions.B && EvuIsa.sew(instr) === 2.U))
 
   io.out.bits.opcode := Mux(legal, opcode, EvuOpcode.Invalid)
   io.out.bits.pc := buffered.bits.pc
   io.out.bits.config := buffered.bits.config
-  io.out.bits.descriptor := buffered.bits.descriptor
   io.out.bits.sew    := EvuIsa.sew(instr)
   io.out.bits.vd     := instr(11, 7)(p.regIndexWidth - 1, 0)
   io.out.bits.vs1    := instr(19, 15)(p.regIndexWidth - 1, 0)
@@ -242,7 +271,10 @@ class EvuDispatchAdapter(p: EvuParams) extends Module {
   io.out.bits.base   := buffered.bits.base
   io.out.bits.stride := buffered.bits.stride
   io.out.bits.length := buffered.bits.length
-  io.out.bits.aux    := buffered.bits.aux
+  io.out.bits.aux    := buffered.bits.aux |
+    Mux(EvuIsa.isElementZero(rawF7), 0x40.U, 0.U) |
+    Mux(EvuIsa.isScalarSource(rawF7), 0x20.U, 0.U) |
+    Mux(rawF7 === EvuIsa.fpQuantScalar, 0x10.U, 0.U)
   io.out.bits.write  := legal && opcode === EvuOpcode.Store
   io.out.bits.chain  := buffered.bits.chain
   io.out.bits.jobId  := 0.U

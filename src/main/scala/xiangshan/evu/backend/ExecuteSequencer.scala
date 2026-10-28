@@ -19,6 +19,7 @@ class ExecuteSequencerIO(maxDepth: Int, nFUs: Int)(implicit p: Parameters) exten
   val rvs2 = new VectorReadIO
   val rvd  = new VectorReadIO
   val rvm  = new VectorReadIO
+  val prefetch = Output(Vec(3, Valid(new VectorReadReq)))
   val rvs1_data = Output(UInt(dLen.W))
   val rvs2_data = Output(UInt(dLen.W))
   val rvd_data = Output(UInt(dLen.W))
@@ -224,7 +225,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   } .elsewhen (io.iss.fire) {
     valid := !tail
     head := false.B
-    rvs1Captured := false.B
+    rvs1Captured := inst.scalarVrfSource && rvs1Captured && !io.dis.fire
     rvs2Captured := false.B
     rvdCaptured := false.B
     rvmCaptured := false.B
@@ -250,7 +251,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   val rgatherv_e0_eidx = io.vgu.gather_eidx.bits
   val rgather_eidx = Mux(rgather_ix, uscalar, rgatherv_e0_eidx)
   val rgather_zero = rgather_eidx >= inst.vconfig.vtype.vlMax
-  io.rvs1.req.bits.eg := getEgId(inst.rs1, eidx     , vs1_eew, inst.reads_vs1_mask)
+  io.rvs1.req.bits.eg := getEgId(inst.rs1, Mux(inst.scalarVrfSource, 0.U, eidx), vs1_eew, inst.reads_vs1_mask)
   io.rvs2.req.bits.eg := Mux(rgather || rgatherei16,
     getEgId(inst.rs2, rgather_eidx, vs2_eew, false.B),
     getEgId(inst.rs2, eidx        , vs2_eew, inst.reads_vs2_mask)
@@ -274,14 +275,42 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   io.rvd.req.bits.oldest  := oldest
   io.rvm.req.bits.oldest  := oldest
 
-  when (io.rvs1.req.fire) { rvs1Data := io.rvs1.resp; rvs1Captured := true.B }
-  when (io.rvs2.req.fire) { rvs2Data := io.rvs2.resp; rvs2Captured := true.B }
-  when (io.rvd.req.fire)  { rvdData := io.rvd.resp; rvdCaptured := true.B }
-  when (io.rvm.req.fire)  { rvmData := io.rvm.resp; rvmCaptured := true.B }
-  io.rvs1_data := rvs1Data
-  io.rvs2_data := rvs2Data
-  io.rvd_data := rvdData
-  io.rvm_data := rvmData
+  // A normal micro-op's successor is known before issue. Launch its reads
+  // while consuming the current responses, then retain returning operands in
+  // the collectors if execution backpressures. Do not speculate across
+  // reduction folds, permutations, sub-element steps or a self-aliasing EG.
+  val nextReads = Seq(
+    getEgId(inst.rs1, next_eidx, vs1_eew, inst.reads_vs1_mask),
+    getEgId(inst.rs2, next_eidx, vs2_eew, inst.reads_vs2_mask),
+    getEgId(inst.rd, next_eidx, vs3_eew, false.B))
+  val enabledReads = Seq(renv1 && !inst.scalarVrfSource, renv2, renvd)
+  val prefetchAllowed = io.iss.fire && !tail && !inst.reduction && !uses_perm && !elementwise &&
+    vs1_eew === vd_eew && vs2_eew === vd_eew && vs3_eew === vd_eew &&
+    !inst.reads_vs1_mask && !inst.reads_vs2_mask && !inst.writes_mask
+  for (i <- 0 until 3) {
+    val readMask = UIntToOH(nextReads(i), egsTotal)
+    io.prefetch(i).valid := prefetchAllowed && enabledReads(i) &&
+      !(readMask & io.older_writes).orR && !(readMask & vd_write_oh).orR
+    io.prefetch(i).bits.eg := nextReads(i)
+    io.prefetch(i).bits.oldest := oldest
+  }
+
+  // Legacy VRF ready acknowledges the returning SRAM data. Forward it in
+  // that cycle; retain it only while the current micro-op is stalled.
+  val keepOperands = !io.iss.fire && !io.dis.fire
+  when (io.rvs1.req.fire) {
+    rvs1Data := io.rvs1.resp
+    rvs1Captured := !io.dis.fire && (keepOperands || inst.scalarVrfSource)
+    when(inst.scalarVrfSource && !io.dis.fire) { rvs1_mask := 0.U }
+  }
+  when (io.rvs2.req.fire) { rvs2Data := io.rvs2.resp; rvs2Captured := keepOperands }
+  when (io.rvd.req.fire)  { rvdData := io.rvd.resp; rvdCaptured := keepOperands }
+  when (io.rvm.req.fire)  { rvmData := io.rvm.resp; rvmCaptured := keepOperands }
+  val source1 = Mux(rvs1Captured, rvs1Data, io.rvs1.resp)
+  io.rvs1_data := Mux(inst.scalarVrfSource, Fill(dLen / 32, source1(31, 0)), source1)
+  io.rvs2_data := Mux(rvs2Captured, rvs2Data, io.rvs2.resp)
+  io.rvd_data := Mux(rvdCaptured, rvdData, io.rvd.resp)
+  io.rvm_data := Mux(rvmCaptured, rvmData, io.rvm.resp)
 
   val exu_scheduler = Module(new PipeScheduler(1, maxPipeDepth))
   exu_scheduler.io.reqs(0).request := valid && pipelined
@@ -290,7 +319,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
 
   val wvd_eg = getEgId(inst.rd, Mux(inst.reduction, 0.U, eidx), vd_eew, inst.writes_mask)
   io.pipe_write_req.request := valid && pipelined && exu_scheduler.io.reqs(0).available
-  io.pipe_write_req.bank_sel := (if (vrfBankBits == 0) 1.U else UIntToOH(wvd_eg(vrfBankBits-1,0)))
+  io.pipe_write_req.bank_sel := (if (vrfBankBits == 0) 1.U else UIntToOH(vrfBank(wvd_eg), vParams.vrfBanking))
   io.pipe_write_req.pipe_depth := pipe_stages
   io.pipe_write_req.oldest := oldest
   io.pipe_write_req.fire := io.iss.fire
@@ -309,10 +338,10 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
 
   val iss_valid = (valid &&
     !data_hazard &&
-    !(renv1 && !rvs1Captured) &&
-    !(renv2 && !rvs2Captured) &&
-    !(renvd && !rvdCaptured) &&
-    !(renvm && !rvmCaptured) &&
+    !(renv1 && !(rvs1Captured || io.rvs1.req.fire)) &&
+    !(renv2 && !(rvs2Captured || io.rvs2.req.fire)) &&
+    !(renvd && !(rvdCaptured || io.rvd.req.fire)) &&
+    !(renvm && !(rvmCaptured || io.rvm.req.fire)) &&
     !(read_slide_buffer && !io.vgu.slide_req.ready) &&
     !(read_eidx_buffer && !io.vgu.gather_eidx.valid) &&
     !(pipelined && !io.pipe_write_req.available) &&

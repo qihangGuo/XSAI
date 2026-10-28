@@ -144,6 +144,7 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
     val amuCtrl = OptionWrapper(HasMatrixExtension, Vec(CommitWidth, DecoupledIO(new AmuCtrlIO)))
     val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuCompletion(p(ExternalVectorKey)))))
     val evuBusy = Output(Bool())
+    val evuPreflightBusy = Output(Bool())
     val evuRetired = Output(Valid(new xiangshan.evu.EvuCoreCommand(p(ExternalVectorKey))))
     val evuStatus = Output(Valid(new EvuCompletion(p(ExternalVectorKey))))
   })
@@ -902,7 +903,7 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
   io.csr.dirty_fs := GatedValidRegNext(dirty_fs)
   io.csr.dirty_vs := GatedValidRegNext(dirty_vs)
   io.evuRetired := amuBuffer.map(_.io.evuRetired).getOrElse(0.U.asTypeOf(io.evuRetired))
-  io.evuStatus := amuBuffer.map(_.io.evuStatus.get).getOrElse(0.U.asTypeOf(io.evuStatus))
+  io.evuStatus := amuBuffer.flatMap(_.io.evuStatus).getOrElse(0.U.asTypeOf(io.evuStatus))
 
   io.csr.dirty_ms := GatedValidRegNext(dirty_ms)
 
@@ -1283,6 +1284,7 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
     }
   }
   io.evuBusy := amuBuffer.map(_.io.evuBusy).getOrElse(false.B)
+  io.evuPreflightBusy := amuBuffer.map(_.io.evuPreflightBusy).getOrElse(false.B)
 
   val canEnqueueEG = VecInit(io.enq.req.map(req => req.valid && io.enq.canAccept))
   for (i <- 0 until RenameWidth) {

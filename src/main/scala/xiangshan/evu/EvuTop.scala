@@ -59,6 +59,19 @@ class EvuPerf extends Bundle {
   val completions  = UInt(64.W)
   val chained      = UInt(64.W)
   val matrixBeats  = UInt(64.W)
+  val matrixStoreStalls = UInt(64.W)
+  val matrixStoreMerges = UInt(64.W)
+  val matrixPartialWrites = UInt(64.W)
+  val memoryTagStalls = UInt(64.W)
+  val vrfBankConflicts = UInt(64.W)
+  val vrfWriteBlocksRead = UInt(64.W)
+  val vrfOperandWait = UInt(64.W)
+  val vrfPrefetches = UInt(64.W)
+  val memoryOrderStalls = UInt(64.W)
+  val registerHazardStalls = UInt(64.W)
+  val memoryComputeOverlap = UInt(64.W)
+  val vmuLoadMerges = UInt(64.W)
+  val vmuStoreMerges = UInt(64.W)
 }
 
 /** Architectural job states exported to the scalar/AMU side. */
@@ -92,6 +105,7 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   private val ep              = outer.evuParams
   val io                      = IO(new EvuTopIO(ep))
   private val memoryBusy = Wire(Bool())
+  private val vmuLineBusy = Wire(Bool())
   private val control         = Module(new EvuControlSequencer(ep))
   private val vectorParameters = p.alterMap(Map(
     TileVisibilityNodeKey -> outer.visibilityNode
@@ -133,13 +147,7 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   private val matrixBiasReg = RegInit(0.U(ep.regIndexWidth.W))
   private val matrixStickyError = RegInit(false.B)
   private val matrixStickyFflags = RegInit(0.U(5.W))
-  private val matrixBeatActive = RegInit(false.B)
-  private val matrixBeatWaiting = RegInit(false.B)
-  private val matrixBeatHalf = RegInit(false.B)
-  private val matrixBeatNeedHigh = RegInit(false.B)
-  private val matrixBeatData = Reg(UInt(ep.dlenBits.W))
-  private val matrixBeatAddr = Reg(UInt(64.W))
-  private val matrixBeatLast = RegInit(false.B)
+  private val matrixStores = Module(new EvuMatrixStoreBuffer(ep))
   private val (bus, edge)     = outer.node.out.head
   require(edge.bundle.dataBits == 512, "EVU must face HBL2 through TLWidthWidget(64)")
   require(ep.mlenBytes <= 64, "EVU logical requests must fit in a line packet")
@@ -151,8 +159,12 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   val liveJobs = PopCount(jobValid)
   val hasJobSlot = !jobValid(nextJobId) && liveJobs < ep.commandDepth.U
   val launchCanStart = commandArbiter.io.out.bits.opcode =/= EvuOpcode.Launch || !matrixJobActive
+  val vectorMemoryCommand = commandArbiter.io.out.bits.opcode === EvuOpcode.Load ||
+    commandArbiter.io.out.bits.opcode === EvuOpcode.Store
+  val memoryCanStart = !vectorMemoryCommand || !vmuLineBusy
   val issuedCommand = Wire(Decoupled(new EvuCommand(ep)))
-  issuedCommand.valid := commandArbiter.io.out.valid && !io.flush && hasJobSlot && launchCanStart
+  issuedCommand.valid := commandArbiter.io.out.valid && !io.flush && hasJobSlot && launchCanStart &&
+    !control.io.blockYounger && memoryCanStart
   issuedCommand.bits := commandArbiter.io.out.bits
   issuedCommand.bits.jobId := nextJobId
   issuedCommand.bits.epoch := currentEpoch
@@ -161,8 +173,7 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   val stateVectorOp = !stateControl &&
     commandArbiter.io.out.bits.opcode =/= EvuOpcode.Launch &&
     commandArbiter.io.out.bits.opcode =/= EvuOpcode.Wait &&
-    commandArbiter.io.out.bits.opcode =/= EvuOpcode.Fence &&
-    commandArbiter.io.out.bits.opcode =/= EvuOpcode.SetCfg
+    commandArbiter.io.out.bits.opcode =/= EvuOpcode.Fence
   val snap = issuedCommand.bits.config
   val useSnapshot = snap.valid
   val configured = Mux(useSnapshot, snap.configured, rvvConfigured)
@@ -190,7 +201,7 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
     EvuOpcode.WAdd, EvuOpcode.WSub, EvuOpcode.WMul, EvuOpcode.SatAdd, EvuOpcode.SatSub,
     EvuOpcode.SlideUp, EvuOpcode.SlideDown, EvuOpcode.Gather, EvuOpcode.ReduceAnd, EvuOpcode.ReduceOr,
     EvuOpcode.ReduceXor, EvuOpcode.Load, EvuOpcode.Store,
-    EvuOpcode.Exp2, EvuOpcode.QuantToCute, EvuOpcode.SetCfg,
+    EvuOpcode.Exp2, EvuOpcode.FpQuantToCute, EvuOpcode.GatherImm,
     EvuOpcode.Scatter, EvuOpcode.Invalid
   ).map(issuedCommand.bits.opcode === _).reduce(_ || _)
   val controlRoute = Seq(EvuOpcode.Launch, EvuOpcode.Wait, EvuOpcode.Fence,
@@ -212,7 +223,7 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   // Backend readiness alone is insufficient because a long Saturn
   // operation can hold a completion for many cycles.
   commandArbiter.io.out.ready := issuedCommand.ready && !io.flush &&
-    hasJobSlot && launchCanStart
+    hasJobSlot && launchCanStart && !control.io.blockYounger && memoryCanStart
   val completionArbiter = Module(new Arbiter(new EvuCompletion(ep), 2))
   completionArbiter.io.in(0) <> control.io.completion
   when(control.io.completion.bits.exception) {
@@ -271,12 +282,14 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   control.io.flush := io.flush
   control.io.jobValid := jobValid
   control.io.jobState := jobState
-  control.io.matrixBusy := matrixJobActive || matrixBeatActive || matrixBeatWaiting || vectorBackend.io.busy || memoryBusy
+  control.io.matrixBusy := matrixJobActive || matrixStores.io.busy || vectorBackend.io.busy || memoryBusy
   control.io.matrixException := matrixStickyError
   control.io.matrixFflags := matrixStickyFflags
   io.cuteWrite <> vectorBackend.io.cuteWrite
 
-  val matrixBeatCanAccept = matrixJobActive && !matrixBeatActive
+  matrixStores.io.flush := io.flush
+  matrixStores.io.start := issuedCommand.fire && issuedCommand.bits.opcode === EvuOpcode.Launch
+  val matrixBeatCanAccept = matrixJobActive && matrixStores.io.in.ready && !io.flush
   val matrixSpecialValid = WireDefault(false.B)
   val matrixSpecialReady = WireDefault(false.B)
   val matrixSpecialFflags = WireDefault(0.U(5.W))
@@ -307,6 +320,11 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   val matrixGlobalM = matrixOutputMBlock * matrixTileDim + matrixCol
   val matrixByteOffset = matrixGlobalN * matrixRowBytes + matrixGlobalM * 4.U
   val matrixResultFire = io.matrixOutput.valid && io.matrixOutput.ready
+  matrixStores.io.in.valid := matrixSpecialValid && matrixJobActive && io.matrixOutput.ready && !io.flush
+  matrixStores.io.in.bits.addr := matrixBase + matrixByteOffset
+  matrixStores.io.in.bits.data := matrixSpecialBits.data
+  matrixStores.io.in.bits.mask := FillInterleaved(4, matrixMeta.validLanes)
+  matrixStores.io.in.bits.last := matrixMeta.taskLast
   val matrixResultFflags = matrixSpecialFflags
   io.matrixTrace.valid := matrixResultFire && !io.flush
   io.matrixTrace.bits.row := matrixGlobalN
@@ -316,19 +334,16 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   io.matrixTrace.bits.fflags := matrixResultFflags
   io.matrixTrace.bits.last := matrixMeta.taskLast
   when(matrixResultFire) {
-    matrixBeatActive := true.B
-    matrixBeatHalf := false.B
-    matrixBeatNeedHigh := false.B
-    matrixBeatData := matrixSpecialBits.data
-    matrixBeatAddr := matrixBase + matrixByteOffset
-    matrixBeatNeedHigh := PopCount(matrixMeta.validLanes) > (ep.mlenBits / 32).U
-    matrixBeatLast := matrixMeta.taskLast
     matrixStickyFflags := matrixStickyFflags | matrixResultFflags
-    when(matrixStickyError) {
-      matrixBeatActive := false.B
-      when(matrixMeta.taskLast) { matrixJobActive := false.B }
-    }
   }
+  when(matrixStores.io.fault.valid) {
+    when(!matrixStickyError) {
+      matrixErrorAddress := matrixStores.io.fault.bits.addr
+      matrixCause := matrixStores.io.fault.bits.cause
+    }
+    matrixStickyError := true.B
+  }
+  when(matrixJobActive && matrixStores.io.done && !io.flush) { matrixJobActive := false.B }
   when(issuedCommand.fire) {
     when (stateControl && !useSnapshot) {
       rvvConfigured := true.B
@@ -393,10 +408,6 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
     rvvVill := false.B
     rvvVstart := 0.U
     matrixJobActive := false.B
-    matrixBeatActive := false.B
-    matrixBeatWaiting := false.B
-    matrixBeatHalf := false.B
-    matrixBeatNeedHigh := false.B
     matrixStickyError := false.B
     matrixStickyFflags := 0.U
     activePageMap := 0.U.asTypeOf(activePageMap)
@@ -411,91 +422,51 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   bus.a.bits  := DontCare
   bus.d.ready := false.B
 
-  val matrixMemReq = Wire(Decoupled(new EvuMemoryRequest(ep)))
-  val matrixMemResp = Wire(Decoupled(new EvuMemoryResponse(ep)))
-  matrixMemReq.valid := matrixBeatActive && !matrixBeatWaiting && !io.flush && (!matrixBeatHalf || matrixBeatNeedHigh)
-  matrixMemReq.bits.addr := matrixBeatAddr + Mux(matrixBeatHalf, ep.mlenBytes.U, 0.U)
-  if (ep.mlenBits == ep.dlenBits) {
-    matrixMemReq.bits.data := matrixBeatData
-  } else {
-    matrixMemReq.bits.data := Mux(matrixBeatHalf,
-      matrixBeatData(ep.dlenBits - 1, ep.mlenBits),
-      matrixBeatData(ep.mlenBits - 1, 0))
-  }
-  matrixMemReq.bits.mask := ((BigInt(1) << ep.mlenBytes) - 1).U
-  matrixMemReq.bits.write := true.B
-  matrixMemReq.bits.tag := (ep.maxMemOutstanding - 1).U
-  matrixMemResp.ready := matrixBeatWaiting && !io.flush
-  when(matrixMemReq.fire) { matrixBeatWaiting := true.B }
-  when(matrixMemResp.fire) {
-    matrixBeatWaiting := false.B
-    when(matrixMemResp.bits.error) {
-      when(!matrixStickyError) {
-        matrixErrorAddress := matrixBeatAddr + Mux(matrixBeatHalf, ep.mlenBytes.U, 0.U)
-        matrixCause := matrixMemResp.bits.fault
-      }
-      matrixStickyError := true.B
-      matrixBeatActive := false.B
-      when(matrixBeatLast) { matrixJobActive := false.B }
-    }.elsewhen(!matrixBeatHalf && matrixBeatNeedHigh) {
-      matrixBeatHalf := true.B
-    }.otherwise {
-      matrixBeatActive := false.B
-      matrixBeatHalf := false.B
-      when(matrixBeatLast) { matrixJobActive := false.B }
-    }
-  }
-
-  // Matrix-output and VMU ports keep MLEN; only the HBL2 boundary is 64 bytes.
-  val memoryArbiter = Module(new Arbiter(new EvuLineMemoryRequest(ep), 2))
-  def connectMemoryRequest(index: Int, request: DecoupledIO[EvuMemoryRequest]): Unit = {
-    val target = memoryArbiter.io.in(index)
-    target.valid := request.valid
-    request.ready := target.ready
-    target.bits.addr := request.bits.addr
-    target.bits.data := request.bits.data
-    target.bits.mask := request.bits.mask
-    target.bits.bytes := ep.mlenBytes.U
-    target.bits.write := request.bits.write
-    target.bits.tag := request.bits.tag
-  }
-  connectMemoryRequest(0, matrixMemReq)
-  connectMemoryRequest(1, vectorBackend.io.memory.req)
-  val memReq = memoryArbiter.io.out
+  // The matrix combiner emits whole lines; VMU requests retain MLEN. Both
+  // clients dynamically share all HBL2 sources rather than reserving tag 7.
+  val tagRouter = Module(new EvuMemoryTagRouter(ep))
   val lineAdapter = Module(new EvuHbl2LineAdapter(ep))
+  val vmuLines = Module(new EvuVmuLineCoalescer(ep))
+  vmuLineBusy := vmuLines.io.busy
+  vmuLines.io.flush := io.flush
+  vmuLines.io.start := vectorBackend.io.memoryCommandStart
+  vmuLines.io.end := vectorBackend.io.memoryCommandEnd
+  tagRouter.io.flush := io.flush
+  tagRouter.io.adapterBusy := lineAdapter.io.busy
+  tagRouter.io.clients(0) <> matrixStores.io.memory
+  tagRouter.io.clients(1) <> vmuLines.io.memory
+  val vectorReq = vmuLines.io.client.req
+  vectorReq.valid := vectorBackend.io.memory.req.valid
+  vectorBackend.io.memory.req.ready := vectorReq.ready
+  vectorReq.bits.addr := vectorBackend.io.memory.req.bits.addr
+  vectorReq.bits.data := vectorBackend.io.memory.req.bits.data
+  vectorReq.bits.mask := vectorBackend.io.memory.req.bits.mask
+  vectorReq.bits.bytes := ep.mlenBytes.U
+  vectorReq.bits.write := vectorBackend.io.memory.req.bits.write
+  vectorReq.bits.tag := vectorBackend.io.memory.req.bits.tag
+  val vectorResp = vmuLines.io.client.resp
+  vectorBackend.io.memory.resp.valid := vectorResp.valid
+  vectorBackend.io.memory.resp.bits.data := vectorResp.bits.data
+  vectorBackend.io.memory.resp.bits.error := vectorResp.bits.error
+  vectorBackend.io.memory.resp.bits.fault := vectorResp.bits.fault
+  vectorBackend.io.memory.resp.bits.tag := vectorResp.bits.tag
+  vectorResp.ready := vectorBackend.io.memory.resp.ready
+  val memReq = tagRouter.io.memory.req
+  val memResp = tagRouter.io.memory.resp
+  lineAdapter.io.client <> tagRouter.io.memory
   lineAdapter.io.flush := io.flush
-  // 0 = CUTE matrix output, 1..N-1 = Saturn.
-  val globalTag = Mux(memoryArbiter.io.chosen === 1.U, memReq.bits.tag,
-    (ep.maxMemOutstanding - 1).U)
-  lineAdapter.io.client.req.valid := memReq.valid
-  lineAdapter.io.client.req.bits := memReq.bits
-  lineAdapter.io.client.req.bits.tag := globalTag
-  memReq.ready := lineAdapter.io.client.req.ready
-  val requestOwner = Reg(Vec(ep.maxMemOutstanding, Bool()))
-  val requestClientTag = Reg(Vec(ep.maxMemOutstanding, UInt(ep.memoryTagWidth.W)))
-  when(memReq.fire) {
-    requestOwner(globalTag) := memoryArbiter.io.chosen
-    requestClientTag(globalTag) := memReq.bits.tag
-  }
-  val memResp = lineAdapter.io.client.resp
-  val responseOwner = requestOwner(memResp.bits.tag)
-  def connectMemoryResponse(owner: Int, response: DecoupledIO[EvuMemoryResponse]): Unit = {
-    response.valid := memResp.valid && responseOwner === owner.U
-    response.bits.data := memResp.bits.data
-    response.bits.error := memResp.bits.error
-    response.bits.fault := memResp.bits.fault
-    response.bits.tag := requestClientTag(memResp.bits.tag)
-  }
-  connectMemoryResponse(0, matrixMemResp)
-  connectMemoryResponse(1, vectorBackend.io.memory.resp)
-  memResp.ready := Mux(responseOwner, vectorBackend.io.memory.resp.ready,
-    matrixMemResp.ready)
 
   val physicalReq = lineAdapter.io.memory.req
+  // A cancelled request may still be queued at WidthWidget while a later
+  // command changes activePageMap. Keep translation with its global source
+  // until the corresponding physical transactions have drained.
+  val requestPageMaps = Reg(Vec(ep.maxMemOutstanding, new EvuPageMap(ep)))
+  when(memReq.fire) { requestPageMaps(memReq.bits.tag) := activePageMap }
   val translation = Module(new EvuPageTranslate(ep))
-  translation.io.pageMap := activePageMap
+  translation.io.pageMap := requestPageMaps(physicalReq.bits.tag)
   // CUTE matrix output remains a privileged physical-address producer.
-  translation.io.pageMap.enabled := activePageMap.enabled && requestOwner(physicalReq.bits.tag)
+  tagRouter.io.lookupTag := physicalReq.bits.tag
+  translation.io.pageMap.enabled := requestPageMaps(physicalReq.bits.tag).enabled && tagRouter.io.lookupOwner
   translation.io.vaddr := physicalReq.bits.addr
   val physicalAddress = translation.io.paddr
   val (getLegal, getReq) = edge.Get(physicalReq.bits.tag, physicalAddress, 6.U)
@@ -542,14 +513,14 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   when(bus.d.fire) { tracedStore(bus.d.bits.source) := false.B }
   when(io.flush) { tracedStore.foreach(_ := false.B) }
   lineAdapter.io.memory.resp <> busResponses.io.out
-  memoryBusy := lineAdapter.io.busy
+  memoryBusy := lineAdapter.io.busy || tagRouter.io.busy || vmuLines.io.busy
   when(bus.d.valid) {
     assert(bus.d.bits.source < ep.maxMemOutstanding.U, "EVU HBL2 response source out of range")
   }
 
   io.busy := control.io.busy || vectorBackend.io.busy ||
     dispatchAdapter.io.out.valid || io.dispatch.valid || lineAdapter.io.busy || jobValid.asUInt.orR ||
-    matrixJobActive || matrixBeatActive || matrixBeatWaiting || io.matrixInput.valid ||
+    matrixJobActive || matrixStores.io.busy || tagRouter.io.busy || io.matrixInput.valid ||
     completionQueue.valid
   val drainPending = RegInit(false.B)
   io.drain.request.ready := !drainPending && !io.flush
@@ -587,6 +558,12 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   val perfCompletions = RegInit(0.U(64.W))
   val perfChained = RegInit(0.U(64.W))
   val perfMatrixBeats = RegInit(0.U(64.W))
+  val perfMatrixStoreStalls = RegInit(0.U(64.W))
+  val perfMatrixStoreMerges = RegInit(0.U(64.W))
+  val perfMatrixPartialWrites = RegInit(0.U(64.W))
+  val perfMemoryTagStalls = RegInit(0.U(64.W))
+  val perfVmuLoadMerges = RegInit(0.U(64.W))
+  val perfVmuStoreMerges = RegInit(0.U(64.W))
 
   // Counters intentionally live after all fire/ready signals are defined.
   // They are reset by the same flush used for a benchmark epoch and do not
@@ -600,6 +577,12 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
     perfCompletions := 0.U
     perfChained := 0.U
     perfMatrixBeats := 0.U
+    perfMatrixStoreStalls := 0.U
+    perfMatrixStoreMerges := 0.U
+    perfMatrixPartialWrites := 0.U
+    perfMemoryTagStalls := 0.U
+    perfVmuLoadMerges := 0.U
+    perfVmuStoreMerges := 0.U
   }.otherwise {
     perfCycles := perfCycles + 1.U
     when(io.busy) { perfBusyCycles := perfBusyCycles + 1.U }
@@ -609,6 +592,14 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
     when(io.completion.fire) { perfCompletions := perfCompletions + 1.U }
     when(issuedCommand.fire && issuedCommand.bits.chain) { perfChained := perfChained + 1.U }
     when(io.matrixInput.fire) { perfMatrixBeats := perfMatrixBeats + 1.U }
+    when(matrixSpecialValid && matrixJobActive && !matrixStores.io.in.ready) {
+      perfMatrixStoreStalls := perfMatrixStoreStalls + 1.U
+    }
+    when(matrixStores.io.merge) { perfMatrixStoreMerges := perfMatrixStoreMerges + 1.U }
+    when(matrixStores.io.partialWrite) { perfMatrixPartialWrites := perfMatrixPartialWrites + 1.U }
+    when(tagRouter.io.tagStall) { perfMemoryTagStalls := perfMemoryTagStalls + 1.U }
+    when(vmuLines.io.loadMerge) { perfVmuLoadMerges := perfVmuLoadMerges + 1.U }
+    when(vmuLines.io.storeMerge) { perfVmuStoreMerges := perfVmuStoreMerges + 1.U }
   }
   io.perf.cycles := perfCycles
   io.perf.busyCycles := perfBusyCycles
@@ -618,4 +609,17 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   io.perf.completions := perfCompletions
   io.perf.chained := perfChained
   io.perf.matrixBeats := perfMatrixBeats
+  io.perf.matrixStoreStalls := perfMatrixStoreStalls
+  io.perf.matrixStoreMerges := perfMatrixStoreMerges
+  io.perf.matrixPartialWrites := perfMatrixPartialWrites
+  io.perf.memoryTagStalls := perfMemoryTagStalls
+  io.perf.vrfBankConflicts := vectorBackend.io.vrfPerf.bankConflicts
+  io.perf.vrfWriteBlocksRead := vectorBackend.io.vrfPerf.writeBlocksRead
+  io.perf.vrfOperandWait := vectorBackend.io.vrfPerf.operandWait
+  io.perf.vrfPrefetches := vectorBackend.io.vrfPerf.prefetches
+  io.perf.memoryOrderStalls := vectorBackend.io.memoryOrderStalls
+  io.perf.registerHazardStalls := vectorBackend.io.registerHazardStalls
+  io.perf.memoryComputeOverlap := vectorBackend.io.memoryComputeOverlap
+  io.perf.vmuLoadMerges := perfVmuLoadMerges
+  io.perf.vmuStoreMerges := perfVmuStoreMerges
 }

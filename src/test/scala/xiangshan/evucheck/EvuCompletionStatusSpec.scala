@@ -82,12 +82,10 @@ class EvuCompletionStatusSpec extends AnyFlatSpec with ChiselScalatestTester wit
         (1, true, false, false), // ADD, including conservative empty ALU completion
         (0x45, true, false, false), // SETVLI
         (0x46, true, false, false), // SETVL
-        (0x4f, true, false, false), // QUANT to VRF
         (0x11, false, false, false), // STORE
         (0x19, false, false, false), // WAIT
         (0x1a, false, false, false), // FENCE
-        (0x4e, false, false, false), // SETCFG
-        (0x4c, false, false, false), // QuantToCute
+        (0x50, false, false, false), // packed FP quantization to CUTE
         (0x10, false, false, false), // zero-length LOAD
         (0x10, true, true, false), // failed LOAD
         (0x10, true, false, true) // redirected completion

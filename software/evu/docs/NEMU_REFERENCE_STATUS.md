@@ -15,19 +15,10 @@ on the server; the RISC-V guest has not been compiled or run locally. The user
 has since confirmed that `vector_add_evu_test.c` passes on the server. This
 result covers the ADD workload, not the FP or matrix paths.
 
-EVU completions carry a VS-dirty indication through the ordered AMU status
-path to the scalar CSR block. Successful VRF writes and SETVLI/SETVL dirty
-the shared mstatus/sstatus.VS field; STORE, WAIT/FENCE, descriptor setup and
-QuantToCute do not. Zero-length memory/quantization leaves VS unchanged;
-ordinary empty ALU operations conservatively dirty VS, matching NEMU.
-Exceptions suppress the dirty indication. The AMU pulse bypasses the normal
-ROB status register so the CSR update aligns with the completion event's
-three-cycle Difftest delay. Rebuild EMU to include this connection; an older
-binary can abort on its first LOAD with reference VS=Dirty and DUT VS=Initial.
-The focused completion-status regression passes with the production AMU and
-MstatusModule, including completion backpressure, faults, redirects and the
-NewCSR input-stage delay. The subsequent server ADD pass confirms the
-exercised LOAD/ADD/STORE completion path.
+EVU completions publish status to the independent EVU CSR bank. They do not
+update scalar FCSR, vxsat, FS/VS or core vstart. VRF/configuration changes and
+FP flags dirty EVU ES; mstatus/sstatus.XS reflects that state. See
+[CSR architecture](../../../.github/evu-csr-architecture.md).
 
 Saturn store-data VAT release is an internal scheduling event. Architectural
 Store completion now comes from the VMU after the final ordered write Ack,
@@ -37,23 +28,15 @@ tag reuse, delayed/error final responses and completion backpressure.
 
 Implemented computation includes integer arithmetic/logic/shifts/saturation,
 widening, reductions, slides/gather, FP arithmetic/reductions, FP16/FP32 Exp2,
-and descriptor-based fixed-point QuantToCute. Standalone DEQUANT/REQUANT/QUANT
-are retired: both RTL and NEMU reject funct7=0x09/0x0b/0x4f. Special operations
-have no VRF writeback interface; QuantToCute preserves all EVU registers, while
+and packed FP32 probability quantization to CUTE. Standalone DEQUANT/REQUANT/QUANT
+and fixed-point QuantToCute/SETCFG are retired: both RTL and NEMU reject
+funct7=0x09/0x0b/0x4f/0x4c/0x4e. Special operations
+have no VRF writeback interface; FP quantization preserves all EVU registers, while
 CUTE matrix-stream dequantization retains its separate arithmetic and HBL2
-output path. Opcode coverage alone does not establish
-equivalence for every configuration. In particular, these differences remain
-outside this quantization-path removal:
+output path. Opcode coverage alone does not establish equivalence for every
+configuration. SETVL/SETVLI update the EVU configuration bank without scalar
+rd writeback in both RTL and NEMU; arithmetic SEW follows configured EVU VTYPE.
 
-- After SETVLI/SETVL, `EvuTop.scala` replaces incoming SEW with configured SEW.
-  NEMU `instr/evu/model.c:evu_execute` continues to use instruction funct3 as
-  `job->sew`. An e16 configuration followed by funct3=e8 arithmetic therefore
-  selects different element widths. The standalone ADD test does not configure
-  VTYPE, so this difference does not affect it.
-- NEMU `model.c:execute_setv` schedules a scalar destination write when rd is
-  nonzero. `backend/decode/EvuDecoder.scala` declares all custom EVU instructions
-  with `xWen=false`; rd also participates in the packed VTYPE configuration.
-  These instructions need one agreed scalar writeback contract.
 EVU FReduceSum maps to Saturn's `fredusum`. The reference now matches the
 four-slot unordered tree with FP16/FP32 rounding on every add, replacing the
 serial reference responsible for the softmax log's 1-ULP mismatch. The
@@ -71,28 +54,47 @@ pass. This follow-up did not run EMU or generate RTL or a RISC-V guest.
 This does not substitute for the full-core EMU rerun; see
 [softmax analysis](../../../.github/evu-softmax-difftest.md).
 
-SETCFG descriptors now contain only scale/bias register indices, zero point,
-shift, output clamp width and validity. The current scalar `EvuFuncUnit`
-supplies aux=0 for SETCFG and QuantToCute, as does NEMU, so software cannot yet
-select nonzero shifts or descriptor indices other than zero. RTL SETCFG also
-does not declare a scalar source for its zero point. These encoding limitations
-remain; the retained instruction is not a complete software quantization API.
-RTL still does not check descriptor validity, while NEMU does. NEMU records
-QuantToCute results but does not check or apply CUTE A/B writes; the native
-regression verifies VRF preservation and saturation, not that downstream effect.
+The fixed-point QuantToCute and SETCFG implementation has been removed. The
+old descriptor CSR addresses/checkpoint words remain reserved context slots,
+without an execution consumer. The supported direct quantization operation is
+FP32 probability packing (0x50). It has no mask-register predication; its
+active lane mask is derived from VL. The accepted-write observer validates all
+bytes and completion requires every expected write.
 
-v0 predication remains a separate integration task. This change only limits
-QuantToCute byte enables and saturation flags to the VL byte extent; it does not
-enable masked quantization. Quantization retains its existing 32-bit word
-layout, with command SEW defining the active byte extent, rather than adding
-packed e8/e16 output conversion. CUTE destination matrixReg/bank remain fixed
-at zero; this removal does not add layout conversion or destination selection.
+The compact pipeline update retains separate FP32 roundings and uses small
+operand/output queues and current-chunk scale caches; it adds no VRF ports or
+extra outstanding HBL2 matrix write. See [QUANT_PIPELINE.md](QUANT_PIPELINE.md)
+for the memory budget, cache invalidation and actual throughput limits.
 
-Validation after removing VRF quantization writeback: `evuCheck.test.compile`
-and `xiangshan.test.compile` pass. Seven focused RTL suites (14 tests) pass,
-covering retired encodings, CUTE backpressure/flush, VL byte enables, unchanged
-VRF contents, saturation and matrix-stream dequantization. The rebuilt NEMU
-native computation regression also passes. Rebuild both EMU and the NEMU
-reference on the server; existing ADD, Exp2 and matrix-dequantization guest
-sources do not use the retired instructions and require no changes for this
-removal. No guest C workload or full EMU was compiled or run locally.
+
+## Complete EVU Flash Attention and packed FP quantization
+
+The immediate gather revision adds custom0 funct7=0x51 with an unsigned
+five-bit rs1 index and EVCAP bit 26. `XV_BROADCAST` uses index zero and avoids
+the elementwise vector-index gather path. The corresponding model changes
+are in `NEMU/src/isa/riscv64/instr/evu/{evu-internal.h,model.c,compute.c}`;
+the reference regression adds byte/halfword/word, VL=0/tail, alias and
+out-of-range-index cases. The server's `NEMU_evu` shared library must be
+rebuilt along with the EMU and guest. Local checking of this model revision
+is syntax-only; it has not been executed against a rebuilt shared library.
+The RTL revision passed full-core Scala compilation and 12 focused Treadle
+tests for immediate gather, operand collection, dispatch and synchronous VRF
+behavior. These checks do not replace server difftest or cycle measurements.
+
+The funct7=0x50 FP32-to-packed-INT8 command replaces the retired fixed-point
+interface. It supports direct CUTE AB
+register and row selection, fixed RNE multiply/add, clamp and RTZ conversion.
+`evcap[25]` advertises it for DLEN=256. It needs no additional CSR address.
+
+NEMU checks each accepted CUTE write against its independent SoftFloat results;
+it does not import DUT quantized values into its oracle. Reference AB bytes
+persist across launches so subsequent PV uses independently computed P. FP
+completion requires every write. The native regression checks 34 FP writes,
+wrong/missing/duplicate events and flags, source VRF
+preservation, and full P-before-launch/PV. Full guest kernel semantic checks
+pass for two Q128/KV256/D64 cases against independent FP64 goldens.
+
+See [Flash Attention](FLASH_ATTENTION.md) for accuracy limits, complete data
+path, matched performance methodology and server rebuild/run commands. These
+new changes have Scala compile, memory-only elaboration and native semantic
+coverage; full server RTL/difftest and performance validation remain pending.

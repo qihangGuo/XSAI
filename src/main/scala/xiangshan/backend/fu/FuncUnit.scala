@@ -63,7 +63,8 @@ class FuncUnitDataInput(cfg: FuConfig)(implicit p: Parameters) extends XSBundle 
   val src       = MixedVec(cfg.genSrcDataVec)
   val imm       = UInt(cfg.destDataBits.W)
   val pc        = OptionWrapper(cfg.needPc, UInt(VAddrData().dataWidth.W))
-  val nextPcOffset = OptionWrapper(cfg.needPc, UInt((log2Up(PredictWidth) + 1).W))
+  // EVU needs the instruction PC for fault reporting, but no fall-through offset.
+  val nextPcOffset = OptionWrapper(cfg.isJmp || cfg.isBrh, UInt((log2Up(PredictWidth) + 1).W))
 
   def getSrcVConfig : UInt = src(cfg.vconfigIdx)
   def getSrcMask    : UInt = src(cfg.maskSrcIdx)

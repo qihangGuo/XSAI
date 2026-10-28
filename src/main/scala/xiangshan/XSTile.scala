@@ -381,7 +381,6 @@ class XSTile()(implicit p: Parameters) extends LazyModule
           dispatch.bits.aux := payload.aux
           dispatch.bits.pc := payload.pc
           dispatch.bits.config := payload.config
-          dispatch.bits.descriptor := payload.descriptor
           dispatch.bits.stride := 0.S
           dispatch.bits.chain := true.B
           if (useAcceleratorCDC) {
@@ -580,6 +579,21 @@ class XSTile()(implicit p: Parameters) extends LazyModule
             cuteAbWrite.bits.byteMask.getWidth - 1, 0)
         }
         evu.module.io.cuteWrite.ready := cuteAbWrite.ready
+        if (p(ExternalVectorKey).dlenBits == 256) {
+          require(cuteAbWrite.bits.data.getWidth == 256 &&
+            cuteAbWrite.bits.bank.getWidth == 3 && cuteAbWrite.bits.addr.getWidth == 5,
+            "EVU FP quantization requires CUTE 128x64 with eight banks and 32-byte entries")
+        }
+        if (env.EnableDifftest) {
+          val writeEvent = difftest.DifftestModule(new difftest.DiffEvuCuteWriteEvent, delay = 3)
+          writeEvent.coreid := io.hartId
+          writeEvent.valid := cuteAbWrite.fire
+          writeEvent.matrixReg := cuteAbWrite.bits.matrixReg
+          writeEvent.bank := cuteAbWrite.bits.bank
+          writeEvent.entry := cuteAbWrite.bits.addr
+          writeEvent.data := cuteAbWrite.bits.data.asTypeOf(writeEvent.data)
+          writeEvent.mask := cuteAbWrite.bits.byteMask
+        }
       } else {
         cute.module.io.cute.vectorResult.ready := true.B
       }
@@ -591,6 +605,24 @@ class XSTile()(implicit p: Parameters) extends LazyModule
     evuOpt.foreach { evu =>
       evu.module.io.command.valid := false.B
       evu.module.io.command.bits := DontCare
+      if (!useAcceleratorCDC) {
+        val perf = evu.module.io.perf
+        XSPerfReference("evu_matrix_store_stall_cycles", perf.matrixStoreStalls, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_matrix_store_merges", perf.matrixStoreMerges, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_matrix_partial_writes", perf.matrixPartialWrites, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_memory_tag_stall_cycles", perf.memoryTagStalls, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_memory_requests", perf.memRequests, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_memory_responses", perf.memResponses, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_vrf_bank_conflict_cycles", perf.vrfBankConflicts, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_vrf_write_blocks_read_cycles", perf.vrfWriteBlocksRead, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_vrf_operand_wait_cycles", perf.vrfOperandWait, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_vrf_prefetches", perf.vrfPrefetches, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_memory_order_stall_cycles", perf.memoryOrderStalls, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_register_hazard_stall_cycles", perf.registerHazardStalls, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_memory_compute_overlap_cycles", perf.memoryComputeOverlap, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_vmu_load_merges", perf.vmuLoadMerges, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_vmu_store_merges", perf.vmuStoreMerges, XSPerfLevel.NORMAL)
+      }
       if (env.EnableDifftest) {
         require(!useAcceleratorCDC, "EVU difftest currently requires a common core/accelerator clock")
         val event = difftest.DifftestModule(new difftest.DiffEvuStoreEvent, delay = 3)
@@ -672,7 +704,6 @@ class XSTile()(implicit p: Parameters) extends LazyModule
           evu.module.io.dispatch.bits.aux := payload.aux
           evu.module.io.dispatch.bits.pc := payload.pc
           evu.module.io.dispatch.bits.config := payload.config
-          evu.module.io.dispatch.bits.descriptor := payload.descriptor
           evu.module.io.dispatch.bits.stride := 0.S
           evu.module.io.dispatch.bits.chain := true.B
           amuCtrl.ready := Mux(amuCtrl.bits.evu, evu.module.io.dispatch.ready, false.B)

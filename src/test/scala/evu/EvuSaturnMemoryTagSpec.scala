@@ -13,7 +13,7 @@ import xiangshan.evu._
 
 import scala.collection.mutable
 
-class EvuSaturnMemoryTagHarness(val ep: EvuParams)(implicit p: Parameters) extends LazyModule {
+class EvuSaturnMemoryTagHarness(val ep: EvuParams, val integerOverlapOnly: Boolean = false)(implicit p: Parameters) extends LazyModule {
   val visibility = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1("memory-tag-test")))))
   val sink = TLManagerNode(Seq(TLSlavePortParameters.v1(
     Seq(TLSlaveParameters.v1(address = Seq(AddressSet(0, 0xffff)),
@@ -30,15 +30,30 @@ class EvuSaturnMemoryTagHarnessImp(outer: EvuSaturnMemoryTagHarness)(implicit p:
     val completion = Decoupled(new EvuCompletion(ep))
     val memory = new EvuMemoryIO(ep)
     val vrf = Output(Vec(ep.vectorRegs * ep.vlenBits / ep.dlenBits, UInt(ep.dlenBits.W)))
+    val flush = Input(Bool())
+    val busy = Output(Bool())
+    val overlap = Output(UInt(64.W))
   })
   val backend = Module(new EvuVectorBackend(ep)(p.alterPartial {
     case TileVisibilityNodeKey => outer.visibility
   }))
   backend.io.command <> io.command
+  if (outer.integerOverlapOnly) {
+    // Constrain the dynamic decode so FIRRTL can prune unexercised FP and
+    // quant datapaths from this Treadle test, not from production hardware.
+    backend.io.command.bits.opcode := Mux(io.command.bits.opcode === EvuOpcode.Load, EvuOpcode.Load,
+      Mux(io.command.bits.opcode === EvuOpcode.Store, EvuOpcode.Store, EvuOpcode.Add))
+    backend.io.command.bits.sew := 2.U
+    backend.io.command.bits.vl := (ep.vlenBits / 32).U
+    backend.io.command.bits.aux := 0.U
+    backend.io.command.bits.stride := 0.S
+  }
   io.completion <> backend.io.completion
   io.memory <> backend.io.memory
   io.vrf := backend.io.debugVrf.get
-  backend.io.flush := false.B
+  backend.io.flush := io.flush
+  io.busy := backend.io.busy
+  io.overlap := backend.io.memoryComputeOverlap
   backend.io.vta := false.B
   backend.io.vma := false.B
   backend.io.vlmulSign := false.B
@@ -74,6 +89,7 @@ class EvuSaturnMemoryTagSpec extends AnyFlatSpec with ChiselScalatestTester with
       .withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
         dut.clock.setTimeout(10000)
         dut.io.command.valid.poke(false.B)
+        dut.io.flush.poke(false.B)
         dut.io.completion.ready.poke(false.B)
         dut.io.memory.req.ready.poke(false.B)
         dut.io.memory.resp.valid.poke(false.B)
@@ -95,7 +111,7 @@ class EvuSaturnMemoryTagSpec extends AnyFlatSpec with ChiselScalatestTester with
           // Return each batch backwards while keeping a stalled response stable.
           val eligible = pending.indices.filter(i => pending(i).readyAt <= cycles)
           if (response.isEmpty && eligible.nonEmpty &&
-              (pending.size == ep.maxMemOutstanding - 1 || cycles % 7 == 0)) {
+              (pending.size == ep.maxMemOutstanding || cycles % 7 == 0)) {
             response = Some(pending.remove(eligible.last))
           }
           dut.io.memory.resp.valid.poke(response.nonEmpty.B)
@@ -110,7 +126,7 @@ class EvuSaturnMemoryTagSpec extends AnyFlatSpec with ChiselScalatestTester with
           if (dut.io.memory.req.valid.peek().litToBoolean && dut.io.memory.req.ready.peek().litToBoolean) {
             val req = dut.io.memory.req.bits
             val tag = req.tag.peek().litValue
-            tag should be < BigInt(ep.maxMemOutstanding - 1)
+            tag should be < BigInt(ep.maxMemOutstanding)
             (pending.map(_.tag) ++ response.map(_.tag)) should not contain tag
             val addr = req.addr.peek().litValue
             val write = req.write.peek().litToBoolean

@@ -111,6 +111,7 @@ class VectorMemUnit(sgSize: Option[BigInt] = None)(implicit p: Parameters) exten
 
     val busy = Output(Bool())
     val storeCompleted = Output(Valid(UInt(vParams.vatSz.W)))
+    val requestsDone = Output(Bool())
   })
 
   def ptrIncr(u: UInt, sz: Int): Unit = {
@@ -413,6 +414,7 @@ class VectorMemUnit(sgSize: Option[BigInt] = None)(implicit p: Parameters) exten
   // all beats. Keep the architectural completion tied to the final ordered Ack.
   io.storeCompleted.valid := siq_deq_fire
   io.storeCompleted.bits := siq(siq_deq_ptr).op.vat
+  io.requestsDone := liq_las_fire || (sifq.io.enq.fire && sifq.io.enq.bits.last)
 
   if (vParams.latencyInject) {
     val latency = Wire(UInt(32.W))

@@ -49,7 +49,7 @@ class EvuSynchronousVrfSpec extends AnyFlatSpec with ChiselScalatestTester {
           write.valid.poke(false.B)
         }
         put(3, original)
-        put(11, BigInt(0x222))
+        put(19, BigInt(0x222))
         put(4, BigInt(0x333))
         put(3, fullMask, byteMask)
 
@@ -60,7 +60,7 @@ class EvuSynchronousVrfSpec extends AnyFlatSpec with ChiselScalatestTester {
         dut.clock.step()
         // The same port changes banks; its previous response must still come from bank 3.
         ports(0).req.bits.eg.poke(4.U)
-        ports(1).req.bits.eg.poke(11.U)
+        ports(1).req.bits.eg.poke(19.U)
         ports(1).req.valid.poke(true.B)
         ports(0).resp.valid.expect(true.B)
         ports(0).resp.bits.expect(expected.U)
@@ -108,7 +108,7 @@ class EvuSynchronousVrfSpec extends AnyFlatSpec with ChiselScalatestTester {
 
         dut.clock.step()
         ports(0).req.bits.eg.poke(3.U)
-        ports(2).req.bits.eg.poke(11.U)
+        ports(2).req.bits.eg.poke(19.U)
         ports(3).req.bits.eg.poke(3.U)
         val contenders = Seq(0, 2, 3)
         contenders.foreach(i => ports(i).req.valid.poke(true.B))
@@ -136,6 +136,9 @@ class EvuSynchronousVrfSpec extends AnyFlatSpec with ChiselScalatestTester {
     implicit val p: Parameters = parameters
     test(new RegisterReadCollector).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
       dut.io.client.req.valid.poke(false.B)
+      dut.io.prefetch.valid.poke(false.B)
+      dut.io.prefetch.bits.eg.poke(0.U)
+      dut.io.prefetch.bits.oldest.poke(false.B)
       dut.io.client.req.bits.oldest.poke(false.B)
       dut.io.memory.req.ready.poke(true.B)
       dut.io.memory.resp.valid.poke(false.B)
@@ -149,11 +152,12 @@ class EvuSynchronousVrfSpec extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.memory.resp.valid.poke(true.B)
       dut.io.client.req.bits.eg.poke(4.U)
       dut.io.client.req.ready.expect(false.B)
-      dut.clock.step()
-      dut.io.memory.resp.valid.poke(false.B)
+      // Discard the stale response and launch the changed request together.
       dut.io.memory.req.valid.expect(true.B)
       dut.io.memory.req.bits.eg.expect(4.U)
       dut.clock.step()
+      dut.io.memory.resp.valid.poke(false.B)
+      dut.io.memory.req.valid.expect(false.B)
       dut.io.client.req.valid.poke(false.B)
       dut.io.memory.resp.valid.poke(true.B)
       dut.io.client.req.ready.expect(false.B)

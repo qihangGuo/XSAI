@@ -60,7 +60,7 @@ class EvuVirtualMemorySpec extends AnyFlatSpec with ChiselScalatestTester with M
         val next = if (dut.io.a.valid.peek().litToBoolean && dut.io.a.ready.peek().litToBoolean) {
           val address = dut.io.a.bits.address.peek().litValue
           val tag = dut.io.a.bits.source.peek().litValue
-          tag should be < BigInt(ep.maxMemOutstanding - 1)
+          tag should be < BigInt(ep.maxMemOutstanding)
           val write = dut.io.a.bits.opcode.peek().litValue == TLMessages.PutFullData.litValue
           accesses += ((address, write))
           if (write) memory(address) = dut.io.a.bits.data.peek().litValue

@@ -7,12 +7,12 @@
 
 ## 状态归属
 
-EVU 独立维护配置、VRF、量化 descriptor、浮点异常、饱和标志和 ES。
+EVU 独立维护配置、VRF、浮点异常、饱和标志和 ES。旧 descriptor CSR 保留为上下文兼容槽，已无执行消费者。
 EVU completion 不再写核心 FCSR/fflags、vxsat、FS/VS，也不再通过 vsDirty
 清核心 vstart。标准标量浮点和核内 RVV 原有的共享关系保持。
 
 首版舍入固定 RNE，起点固定零，不新增可写 efrm/evxrm/evstart，也不提供
-元素级故障重启。量化舍入由 descriptor 的算术右移定义。Saturn 的归约拓扑、
+元素级故障重启。FP 概率量化采用分别 RNE 的乘/加和 RTZ 整数转换。Saturn 的归约拓扑、
 Exp2 近似算法保持；CSR 隔离不代替数值精度验证。
 
 地址空间和访问权限仍属于同一 hart：satp/vsatp/hgatp、PMP/PMA、MPRV、
@@ -30,10 +30,10 @@ EVU VRF 上下文 helper 不负责保存 CUTE 上下文。
 | evcfg | 0x8c0 | RW | AVL/VL[31:0]、VTYPE[39:32]、configured[40]、VILL[63] |
 | efflags | 0x8c1 | RW | [4:0] NV、DZ、OF、UF、NX，采用标准 fflags 位序 |
 | evxsat | 0x8c2 | RW | [0] 累计饱和 |
-| eqdesc0..7 | 0x8d0..0x8d7 | RW | 每个 descriptor 51 位 |
+| eqdesc0..7 | 0x8d0..0x8d7 | RW | 每个保留上下文槽 51 位；无执行作用 |
 | mevstate | 0xbc8 | M-mode RW | ES[1:0]、UEnable[2]、SEnable[3]；写 ACK[8] |
 | evlenb | 0xcd0 | RO | 当前为 512 字节，由硬件参数产生 |
-| evcap | 0xcd1 | RO | ABI[7:0]=1、descriptor 数[15:8]=8、SEW 能力[18:16]=7、固定 RNE[24]=1 |
+| evcap | 0xcd1 | RO | ABI[7:0]=1、保留上下文槽数[15:8]=8、SEW 能力[18:16]=7、固定 RNE[24]=1、FP32 packed quant[25]（DLEN=256） |
 | evstatus | 0xcd2 | RO | Busy[0]、ErrorValid[1]、TvalValid[2] |
 | evcause | 0xcd3 | RO | [3:0] 首条未确认异步错误的原因 |
 | evepc | 0xcd4 | RO | 原始出错命令的 64 位 PC |
@@ -51,15 +51,15 @@ SEW[5:3]、VTA[6]、VMA[7]。支持 e8/e16/e32 和 m1/m2/m4/m8、mf2/mf4/mf8；
 
 configured=0 规范化为 legacy 模式（存储 VL=128、VTYPE=e32,m1）；此时各
 指令使用自身的 SEW 和单寄存器最大长度。configured=1 时计算/访存使用
-配置的长度与类型，SETCFG 的输出 SEW 保持由指令定义。
+配置的长度与类型。SETCFG（0x4e）和旧定点 QuantToCute（0x4c）已退役。
 
 保留 SETVL/SETVLI，旧指令的 LMUL 符号/幅度转换为标准 VTYPE 编码。
 它们更新同一份 CSR bank；不产生标量 rd 返回值。软件推荐使用 xv_setvl。
 浮点只支持 e16/e32，宽化只支持 e8→e16、e16→e32，宽化后的寄存器组不能
 超过 8 个寄存器。寄存器组必须对齐且不越界。归约的种子/结果为单寄存器。
 
-QuantToCute 当前的 CUTE 流只覆盖一个物理 VRF 寄存器，因此首版拒绝
-LMUL>1 的 QuantToCute；允许 m1 和分数 LMUL。否则旧分块计数器会回绕。
+FP QuantToCute（0x50）的 CUTE 流只覆盖一个物理 VRF 寄存器，拒绝
+LMUL>1；允许 m1 和分数 LMUL，FP32、VL<=64。
 普通算术和 LOAD/STORE 保留 m2/m4/m8。跨 Saturn、special、矩阵参数读取的
 hazard 掩码已按寄存器组扩展。
 
@@ -74,8 +74,10 @@ hazard 掩码已按寄存器组扩展。
 | 输出 SEW | [49:48]，0/1/2 对应 8/16/32 位饱和界限 |
 | valid | [50] |
 
-非法 output SEW=3 的 CSR 写入规范化为零 descriptor。SETCFG 更新相同布局。
-命令携带完整 descriptor 快照，执行中不跨时钟查询可变 CSR。
+这些地址/存储与原 checkpoint 布局保留，仅用于上下文兼容；没有量化指令读取它们。
+非法 output SEW=3 的 CSR 写入仍规范化为零。旧 SETCFG 与定点数据通路已删除。
+FP 量化改由指令的 FP32 inverse-scale 源和 scalar CUTE target 配置；矩阵反量化
+通过 launch 的两个 scale 寄存器配置。见 [小缓存流水](../software/evu/docs/QUANT_PIPELINE.md)。
 
 ### enable、Dirty 和权限
 

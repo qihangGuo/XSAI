@@ -43,7 +43,7 @@ class EvuRetiredOpcodeSpec extends AnyFlatSpec with ChiselScalatestTester {
         dut.io.a.ready.poke(true.B)
         dut.io.d.valid.poke(false.B)
 
-        for (funct7 <- Seq(0x09, 0x0b, 0x38, 0x4d, 0x4f); sew <- 0 to 2; vl <- Seq(0, 16)) {
+        for (funct7 <- Seq(0x09, 0x0b, 0x38, 0x4c, 0x4d, 0x4e, 0x4f); sew <- 0 to 2; vl <- Seq(0, 16)) {
           dut.io.dispatch.bits.instr.poke(((BigInt(funct7) << 25) | (sew << 12) | (3 << 7) | 0x0b).U)
           dut.io.dispatch.bits.base.poke("hfff0".U)
           dut.io.dispatch.bits.vl.poke(vl.U)

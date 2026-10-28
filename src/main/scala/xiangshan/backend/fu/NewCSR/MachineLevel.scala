@@ -521,7 +521,7 @@ class MstatusBundle extends CSRBundle {
   val MPV  = VirtMode       (39).withReset(0.U)
   val MDT  = CSRRWField     (42).withReset(mdtInit.U)
   val SD   = CSRROField     (63,
-    (_, _) => FS === ContextStatus.Dirty || VS === ContextStatus.Dirty || MS === ContextStatus.Dirty || XS === ContextStatus.Dirty
+    (_, _) => FS === ContextStatus.Dirty || VS === ContextStatus.Dirty || MS === ContextStatus.Dirty || XS === ContextStatusRO.Dirty
   )
 }
 

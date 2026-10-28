@@ -2,9 +2,10 @@
 
 Status: historical, unimplemented hardware-sharing proposal. Register-output
 DEQUANT/REQUANT/QUANT have since been retired (0x09/0x0b/0x4f are illegal).
-Only QuantToCute and CUTE matrix-stream dequantization retain dedicated
-arithmetic, and neither writes the VRF. SETCFG retains fixed-point parameters
-for QuantToCute; its old floating-mode descriptor fields have been removed.
+Fixed-point QuantToCute/SETCFG (0x4c/0x4e) have also been retired. Current
+FP probability quantization (0x50) and matrix-stream dequantization use compact
+elastic pipelines and never write the VRF. See
+[compact pipelines](../software/evu/docs/QUANT_PIPELINE.md).
 The register-output operations and migration steps below describe the earlier
 proposal, not the current ISA. The expansion controller,
 temporary-result routing and execution arbitration described below are not

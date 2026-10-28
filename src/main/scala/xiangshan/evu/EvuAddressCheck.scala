@@ -167,10 +167,11 @@ class EvuMemoryConfig(p: EvuParams) extends Module {
     sew := newSew
     vill := illegal
   }
-  val memory = io.command.instr(31, 25) === EvuIsa.load ||
-    io.command.instr(31, 25) === EvuIsa.store
+  val commandF7 = io.command.instr(31, 25)
+  val memory = EvuIsa.isLoad(commandF7) || EvuIsa.isStore(commandF7)
   io.alignment := Mux(memory, Mux(configured, sew, io.command.instr(14, 12)), 2.U)
-  io.length := Mux(memory && configured, vl << sew, io.command.length)
+  io.length := Mux(EvuIsa.isElementZero(commandF7), Mux(configured && vl === 0.U, 0.U, 4.U),
+    Mux(memory && configured, vl << sew, io.command.length))
   io.illegal := configured && vill
 }
 

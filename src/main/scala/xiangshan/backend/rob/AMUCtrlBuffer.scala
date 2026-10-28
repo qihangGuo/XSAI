@@ -28,6 +28,7 @@ class AmuCtrlBufferIO()(implicit val p: Parameters, val params: BackendParams) e
   val canEnqueue = Output(Bool())
   val canEnqueueForDispatch = Output(Bool())
   val evuBusy = Output(Bool())
+  val evuPreflightBusy = Output(Bool())
   val evuRetired = Output(Valid(new EvuCoreCommand(p(ExternalVectorKey))))
 
   // rob wb
@@ -375,7 +376,9 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
   // EVU completion is consumed only by the oldest AMU entry; later vector commands must not bypass an older memory operation.
   io.evuCompletion.foreach { completion =>
     val headEvuAccepted = amuCtrlEntries(deqPtr.value).evuAccepted
-    completion.ready := headEvuAccepted && !io.redirect.valid
+    // canDeq is registered, so the completed head remains visible until the
+    // following cycle's dequeue. Do not consume the next completion for it.
+    completion.ready := headEvuAccepted && !amuCtrlEntries(deqPtr.value).canDeq && !io.redirect.valid
     when (completion.fire) {
       amuCtrlEntries(deqPtr.value).canDeq := true.B
       amuCtrlEntries(deqPtr.value).evuException := completion.bits.exception
@@ -407,6 +410,17 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
   io.evuBusy := amuCtrlEntries.map(e =>
     e.valid && e.needAMU && e.writebacked && e.amuCtrl.evu && !e.canDeq
   ).reduce(_ || _) || statusDrain.orR
+  // Preflight may walk pages beside older ordinary arithmetic. Keep it behind
+  // every older memory/control command and the status pipeline, not its own
+  // yet-to-write-back entry. Faults still travel through the normal ROB path.
+  io.evuPreflightBusy := amuCtrlEntries.map { e =>
+    val f7 = e.amuCtrl.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey))).instr(31, 25)
+    val serial = xiangshan.evu.EvuIsa.isLoad(f7) || xiangshan.evu.EvuIsa.isStore(f7) ||
+      f7 === xiangshan.evu.EvuIsa.launch || f7 === xiangshan.evu.EvuIsa.waitOp ||
+      f7 === xiangshan.evu.EvuIsa.fence || f7 === xiangshan.evu.EvuIsa.setvli ||
+      f7 === xiangshan.evu.EvuIsa.setvl
+    e.valid && e.needAMU && e.writebacked && e.amuCtrl.evu && !e.canDeq && serial
+  }.reduce(_ || _) || statusDrain.orR
 
   val deqCondSeq = deqEntries.map(x => ~x.canDeq)
   val deqCount = PriorityEncoder(deqCondSeq :+ true.B)

@@ -4,7 +4,7 @@ import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.tile.{CoreModule, FPResult}
-import xiangshan.evu.backend.VectorBackend
+import xiangshan.evu.backend.{VectorBackend, VrfPerf}
 import xiangshan.evu.common._
 import xiangshan.evu.frontend.VectorDispatcher
 import xiangshan.evu.mem.{VectorMemIO, VectorMemUnit}
@@ -29,6 +29,8 @@ class EvuVectorSubsystem(implicit p: Parameters)
     val setVxsat = Output(Bool())
     val setFflags = Output(Valid(UInt(5.W)))
     val busy = Output(Bool())
+    val memoryRequestsDone = Output(Bool())
+    val vrfPerf = Output(new VrfPerf)
     val debugVrf = Option.when(vParams.debugVrf)(Output(Vec(egsTotal, UInt(dLen.W))))
     // The special sequencer is the requester; its VRF requests enter this
     // subsystem and the read responses leave it. Mark the
@@ -46,6 +48,7 @@ class EvuVectorSubsystem(implicit p: Parameters)
 
   dispatcher.io.issue <> io.issue
   io.debugVrf.foreach(_ := backend.io.debugVrf.get)
+  io.vrfPerf := backend.io.vrfPerf
   backend.io.special <> io.special
   backend.io.dis <> dispatcher.io.dis
   vmu.io.enq <> dispatcher.io.mem
@@ -63,6 +66,7 @@ class EvuVectorSubsystem(implicit p: Parameters)
   io.completionFflags(1) := 0.U
 
   backend.io.vmu <> vmu.io.vu
+  io.memoryRequestsDone := vmu.io.requestsDone
   io.dmem <> vmu.io.dmem
 
   // Indexed/scatter-gather translation is deliberately outside the first

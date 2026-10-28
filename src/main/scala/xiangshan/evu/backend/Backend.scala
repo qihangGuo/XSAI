@@ -19,6 +19,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
     val busy = Output(Bool())
     val debugVrf = Option.when(vParams.debugVrf)(Output(Vec(egsTotal, UInt(dLen.W))))
+    val vrfPerf = Output(new VrfPerf)
 
     val index_access = new VectorIndexAccessIO
     val mask_access = new VectorMaskAccessIO
@@ -67,7 +68,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
   val vlissq = Module(new IssueQueue(vParams.vlissqEntries, 1))
   val vsissq = Module(new IssueQueue(vParams.vsissqEntries, 1))
-  val vpissq = Module(new IssueQueue(vParams.vpissqEntries, 2)) // permute/reduction
+  val vpissq = Module(new IssueQueue(vParams.vpissqEntries, vParams.reductionContexts))
   val vxissqs = xissParams.map(q => Module(new IssueQueue(q.depth, q.seqs.size)).suggestName(s"vxissq_${q.name}"))
 
   val vxus = xissParams.map(_.seqs.map(s => Module(new ExecutionUnit(s.fus, s.name)).suggestName(s"vxu${s.name}")))
@@ -76,15 +77,19 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
   val vls = Module(new LoadSequencer)
   val vss = Module(new StoreSequencer)
-  val vps = Module(new SpecialSequencer(all_supported_insns))
+  val reductionSeqs = (0 until vParams.reductionContexts).map { i =>
+    Module(new SpecialSequencer(all_supported_insns, i, vParams.reductionContexts)).suggestName(s"vps$i")
+  }
+  val vps = reductionSeqs.head // Only context zero handles permutations and VMU index/mask streams.
   val vxs = xissParams.map(q => q.seqs.map(s =>
     Module(new ExecuteSequencer(s.insns, maxPipeDepth, s.fus.size)).suggestName(s"vxs${s.name}")
   ))
 
-  val allSeqs = Seq(vls, vss, vps) ++ vxs.flatten
+  val allSeqs = Seq(vls, vss) ++ reductionSeqs ++ vxs.flatten
   val allIssQs = Seq(vlissq, vsissq, vpissq) ++ vxissqs
 
   val flat_vxs = vxs.flatten
+  val pendingWrites = Wire(Vec(vParams.vrfBanking, Valid(new VectorWriteHazard)))
   require(flat_vxs.size == flat_vxus.size)
 
   io.fp_req.valid := false.B
@@ -107,7 +112,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   val issGroups = Seq(
     IssueGroup(vlissq, Seq(vls)),
     IssueGroup(vsissq, Seq(vss)),
-    IssueGroup(vpissq, Seq(vps)),
+    IssueGroup(vpissq, reductionSeqs),
   ) ++ (vxissqs.zip(vxs).map { case (q, seqs) =>
     IssueGroup(q, seqs)
   })
@@ -229,14 +234,18 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       }.foldLeft(0.U)(_|_)
       val older_same_pipe_writes = same_vxu.map(_.io.pipe_hazards.toSeq.map { h =>
         Mux(h.valid && h.bits.vat =/= vat, h.bits.eg_oh, 0.U)
-      }.reduce(_|_)).getOrElse(0.U)
+      }.foldLeft(0.U)(_|_)).getOrElse(0.U)
       val older_pipe_writes = older_other_pipe_writes | older_same_pipe_writes
 
       val older_iter_writes = flat_vxus.map(_.io.iter_hazards.toSeq).flatten.map { h =>
         Mux(h.valid, h.bits.eg_oh, 0.U)
       }.reduce(_|_)
 
-      seq.io.older_writes := older_pipe_writes | older_iter_writes | older_wintents
+      val older_buffered_writes = pendingWrites.map { h =>
+        Mux(h.valid && vatOlder(h.bits.vat, vat), h.bits.eg_oh, 0.U)
+      }.reduce(_ | _)
+
+      seq.io.older_writes := older_pipe_writes | older_iter_writes | older_buffered_writes | older_wintents
       seq.io.older_reads := older_rintents
 
       if (!vParams.enableOOO) {
@@ -271,8 +280,11 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   // ======================================
   // Connect reads to VRF
 
-  val vrf = Module(new RegisterAccess(flat_vxs.size, maxPipeDepth, specialReads = 3))
+  val vrf = Module(new RegisterAccess(flat_vxs.size, maxPipeDepth, specialReads = 3,
+    reductionContexts = vParams.reductionContexts))
+  pendingWrites := vrf.io.pendingWrites
   io.debugVrf.foreach(_ := vrf.io.debug.get)
+  io.vrfPerf := vrf.io.perf
   io.special <> vrf.io.special
 
   vrf.io.vls.rvm.req <> vls.io.rvm
@@ -280,10 +292,13 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   vrf.io.vss.rvm.req <> vss.io.rvm
   vss.io.rvd_resp := vrf.io.vss.rvd.resp
   vss.io.rvm_resp := vrf.io.vss.rvm.resp
-  vrf.io.vps.rvs2.req <> vps.io.rvs2
-  vrf.io.vps.rvm.req <> vps.io.rvm
-  vps.io.acc_init_resp := vrf.io.vps.rvs2.resp
-  vps.io.rvm_resp := vrf.io.vps.rvm.resp
+  for ((seq, i) <- reductionSeqs.zipWithIndex) {
+    vrf.io.vps(i).rvs2.req <> seq.io.rvs2
+    vrf.io.vps(i).rvm.req <> seq.io.rvm
+    seq.io.acc_init_resp := vrf.io.vps(i).rvs2.resp
+    seq.io.rvm_resp := vrf.io.vps(i).rvm.resp
+    if (i != 0) { seq.io.iss.ready := false.B }
+  }
 
   for (i <- 0 until flat_vxs.size) {
     val vxs = flat_vxs(i)
@@ -297,6 +312,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     vxs.io.rvs2.resp := vrf.io.vxs(i).rvs2.resp
     vxs.io.rvd.resp := vrf.io.vxs(i).rvd.resp
     vxs.io.rvm.resp := vrf.io.vxs(i).rvm.resp
+    vrf.io.vxs(i).prefetch := vxs.io.prefetch
 
     val vxs_iss = vxs.io.iss.bits
     val vxu_iss = vxu.io.iss.bits
@@ -338,14 +354,17 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     vxu.io.iss.bits.viewAsSupertype(new ExecuteMicroOp(vxu.nFUs)) := vxs.io.iss.bits
 
     when (vxs_iss.acc) {
-      val acc_data = vps.io.acc_data.bits
+      val owners = reductionSeqs.map(s => s.io.busy && s.io.vat === vxs.io.vat)
+      val acc_data = Mux1H(owners, reductionSeqs.map(_.io.acc_data.bits))
+      val acc_other_data = Mux1H(owners, reductionSeqs.map(_.io.acc_other_data))
+      val acc_init = Mux1H(owners, reductionSeqs.map(_.io.acc_init))
       when (vxs_iss.acc_merge) {
         vxu_iss.wmask := ~(0.U(dLenB.W))
         vxu_iss.rvs1_elem := acc_data
         vxu_iss.rvs1_data := acc_data
         vxu_iss.rvs1_eew := vxs_iss.vd_eew
-        vxu_iss.rvs2_elem := vps.io.acc_other_data
-        vxu_iss.rvs2_data := vps.io.acc_other_data
+        vxu_iss.rvs2_elem := acc_other_data
+        vxu_iss.rvs2_data := acc_other_data
         vxu_iss.rvs2_eew := vxs_iss.vd_eew
       } .elsewhen (vxs_iss.acc_fold) {
         val acc_fold_id = vxs_iss.acc_fold_id
@@ -356,8 +375,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
         val foldMask = VecInit.tabulate(log2Ceil(dLenB))(i =>
           ((BigInt(1) << (dLenB >> (i + 1))) - 1).U(dLenB.W))(acc_fold_id)
         vxu_iss.wmask := Mux(vxs_iss.acc_copy, eewByteMask(vxs_iss.vd_eew), foldMask)
-        vxu_iss.rvs1_elem := Mux(vxs_iss.acc_copy, vps.io.acc_init, folded)
-        vxu_iss.rvs1_data := Mux(vxs_iss.acc_copy, vps.io.acc_init, folded)
+        vxu_iss.rvs1_elem := Mux(vxs_iss.acc_copy, acc_init, folded)
+        vxu_iss.rvs1_data := Mux(vxs_iss.acc_copy, acc_init, folded)
         vxu_iss.rvs1_eew := vxs_iss.vd_eew
         vxu_iss.rvs2_elem := acc_data
         vxu_iss.rvs2_data := acc_data
@@ -389,10 +408,12 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     vrf.io.vxs(i).pipe_write_req <> flat_vxs(i).io.pipe_write_req
     vrf.io.pipe_writes(i) <> flat_vxus(i).io.pipe_write
     vrf.io.iter_writes(i) <> flat_vxus(i).io.iter_write
+    vrf.io.iterOwners(i) := flat_vxus(i).io.iterWriteVat
   }
 
   val load_write = Wire(Decoupled(new VectorWrite(dLen)))
   vrf.io.load_write <> load_write
+  vrf.io.loadOwner := vls.io.iss.bits.vat
 
 
   io.vmu.lresp.ready := vls.io.iss.valid && load_write.ready
@@ -421,6 +442,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   } ++ vxus.flatten.map(_.io.pipe_hazards).flatten.map { h =>
     h.valid && h.bits.eg === index_access_eg
   } ++ vxus.flatten.map(_.io.iter_hazards).flatten.map { h =>
+    h.valid && h.bits.eg === index_access_eg
+  } ++ pendingWrites.map { h =>
     h.valid && h.bits.eg === index_access_eg
   }).orR ||
     vdq.io.peek.map(i => i.valid && !(i.bits.vmu && i.bits.store)).orR
@@ -508,22 +531,26 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   // =================================
   // Connect ReductionSeq to sequencer
 
-  vps.io.acc_data.ready := false.B
-  vps.io.acc_slot := 0.U
-  vps.io.acc_other_slot := 0.U
-  vps.io.acc_merge := false.B
-  vps.io.acc_done := false.B
+  for (seq <- reductionSeqs) {
+    seq.io.acc_data.ready := false.B
+    seq.io.acc_slot := 0.U
+    seq.io.acc_other_slot := 0.U
+    seq.io.acc_merge := false.B
+    seq.io.acc_done := false.B
+  }
   for (vxs <- flat_vxs) {
     vxs.io.acc_valid := false.B
     if (vxs.usesAcc) {
-      when (vxs.io.vat === vps.io.vat && vxs.io.busy) {
-        vps.io.acc_data.ready := vxs.io.acc_ready
-        vps.io.acc_slot := vxs.io.acc_slot
-        vps.io.acc_other_slot := vxs.io.acc_other_slot
-        vps.io.acc_merge := vxs.io.acc_merge
-        vxs.io.acc_valid := vps.io.acc_data.valid
-        when (vxs.io.iss.fire && vxs.io.iss.bits.tail) {
-          vps.io.acc_done := true.B
+      for (seq <- reductionSeqs) {
+        when (vxs.io.vat === seq.io.vat && vxs.io.busy && seq.io.busy) {
+          seq.io.acc_data.ready := vxs.io.acc_ready
+          seq.io.acc_slot := vxs.io.acc_slot
+          seq.io.acc_other_slot := vxs.io.acc_other_slot
+          seq.io.acc_merge := vxs.io.acc_merge
+          vxs.io.acc_valid := seq.io.acc_data.valid
+          when (vxs.io.iss.fire && vxs.io.iss.bits.tail && vxs.io.iss.bits.acc) {
+            seq.io.acc_done := true.B
+          }
         }
       }
     }
@@ -532,12 +559,25 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   // ==============================
   // Connect ReductionSeq to writebacks
 
-  val acc_wbs = flat_vxus.map(_.io.acc_write)
-  assert(PopCount(acc_wbs.map(_.valid)) <= 1.U)
-
-  vps.io.acc_fu_resp.valid := acc_wbs.map(_.valid).orR
-  vps.io.acc_fu_resp.bits := Mux1H(acc_wbs.map(_.valid), acc_wbs.map(_.bits))
-  vps.io.acc_fu_resp_slot := Mux1H(acc_wbs.map(_.valid), flat_vxus.map(_.io.acc_write_slot))
+  val accRouter = Module(new ReductionReturnRouter(vParams.vatSz, log2Ceil(egsTotal), dLen,
+    reductionSeqs.size, flat_vxus.size))
+  for ((xu, i) <- flat_vxus.zipWithIndex) {
+    accRouter.io.returns(i).valid := xu.io.acc_write.valid
+    accRouter.io.returns(i).bits.vat := xu.io.accWriteVat
+    accRouter.io.returns(i).bits.slot := xu.io.acc_write_slot
+    accRouter.io.returns(i).bits.eg := xu.io.acc_write.bits.eg
+    accRouter.io.returns(i).bits.data := xu.io.acc_write.bits.data
+    accRouter.io.returns(i).bits.mask := xu.io.acc_write.bits.mask
+  }
+  for ((seq, i) <- reductionSeqs.zipWithIndex) {
+    accRouter.io.owners(i).valid := seq.io.busy
+    accRouter.io.owners(i).bits := seq.io.vat
+    seq.io.acc_fu_resp.valid := accRouter.io.routed(i).valid
+    seq.io.acc_fu_resp.bits.eg := accRouter.io.routed(i).bits.eg
+    seq.io.acc_fu_resp.bits.data := accRouter.io.routed(i).bits.data
+    seq.io.acc_fu_resp.bits.mask := accRouter.io.routed(i).bits.mask
+    seq.io.acc_fu_resp_slot := accRouter.io.routed(i).bits.slot
+  }
 
   // Clear the age tags
   var r_idx = 0
@@ -548,13 +588,16 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     r_idx += 1
   }
 
-  clearVat(vls.io.iss.fire && vls.io.iss.bits.tail, vls.io.iss.bits.vat)
+  val writeCompletion = Module(new WriteCompletionTracker(vParams.vatSz, flat_vxus.size + 1))
+  writeCompletion.io.tails(0).valid := vls.io.iss.fire && vls.io.iss.bits.tail
+  writeCompletion.io.tails(0).bits := vls.io.iss.bits.vat
+  for ((xu, i) <- flat_vxus.zipWithIndex) { writeCompletion.io.tails(i + 1) := xu.io.completed }
+  writeCompletion.io.pendingWrites := pendingWrites.map { h =>
+    Mux(h.valid, UIntToOH(h.bits.vat, 1 << vParams.vatSz), 0.U)
+  }.reduce(_ | _)
+  clearVat(writeCompletion.io.release.valid, writeCompletion.io.release.bits)
   clearVat(vss.io.iss.fire && vss.io.iss.bits.tail, vss.io.iss.bits.vat)
-  if (vParams.pipelinedVatClear) {
-    flat_vxus.foreach(xu => clearVat(xu.io.completed.valid, xu.io.completed.bits))
-  } else {
-    vxs.flatten.foreach(xs => clearVat(xs.io.iss.fire && xs.io.iss.bits.tail, xs.io.iss.bits.vat))
-  }
+  flat_vxus.foreach(_ => clearVat(false.B, 0.U))
 
   // Accumulate each instruction's active-element flags through its final writeback.
   val fflagsByVat = RegInit(VecInit.fill(1 << vParams.vatSz)(0.U(5.W)))
@@ -589,13 +632,16 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     h.valid && (h.bits.eg < egsPerVReg.U)
   } ++ vxus.flatten.map(_.io.iter_hazards).flatten.map { h =>
     h.valid && (h.bits.eg < egsPerVReg.U)
+  } ++ pendingWrites.map { h =>
+    h.valid && h.bits.eg < egsPerVReg.U
   }).orR
   val vdq_inflight_wv0 = vdq.io.peek.map { h =>
     h.valid && h.bits.may_write_v0
   }.orR
 
   vm_busy := seq_inflight_wv0 || vdq_inflight_wv0
-  io.busy := vdq.io.deq.valid || allSeqs.map(_.io.busy).orR || vxus.flatten.map(_.io.busy).asUInt.orR
+  io.busy := vdq.io.deq.valid || allSeqs.map(_.io.busy).orR || vxus.flatten.map(_.io.busy).asUInt.orR ||
+    pendingWrites.map(_.valid).orR || writeCompletion.io.busy
   io.set_vxsat := vxus.flatten.map(_.io.set_vxsat).asUInt.orR
   io.set_fflags.valid := vxus.flatten.map(_.io.set_fflags.valid).asUInt.orR
   io.set_fflags.bits  := vxus.flatten.map( xu => Mux(xu.io.set_fflags.valid, xu.io.set_fflags.bits, 0.U)).reduce(_|_)

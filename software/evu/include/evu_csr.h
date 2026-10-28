@@ -11,6 +11,8 @@
 #define XV_MEVSTATE 0xbc8
 #define XV_EVLENB 0xcd0
 #define XV_EVCAP 0xcd1
+#define XV_CAP_FPQUANT_CUTE (UINT64_C(1) << 25)
+#define XV_CAP_GATHER_IMM (UINT64_C(1) << 26)
 #define XV_EVSTATUS 0xcd2
 #define XV_EVCAUSE 0xcd3
 #define XV_EVEPC 0xcd4
@@ -38,6 +40,8 @@ static inline uint32_t xv_setvl(uint32_t avl, uint8_t vtype) {
   return (uint32_t)XV_CSR_READ(XV_EVCFG);
 }
 
+/* Legacy context-slot packing only. 0x4c/0x4e are retired; these slots do
+ * not configure FP quantization or matrix dequantization. */
 static inline uint64_t xv_descriptor(unsigned scale, unsigned bias, int32_t zero,
                                       unsigned shift, unsigned output_sew) {
   return (UINT64_C(1) << 50) | ((uint64_t)(output_sew & 3) << 48) |

@@ -23,9 +23,11 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
     val iss = Flipped(Decoupled(new ExecuteMicroOpWithData(nFUs)))
     val iter_hazards = Output(Vec(iter_fus.size, Valid(new PipeHazard(maxPipeDepth))))
     val iter_write = Decoupled(new VectorWrite(dLen))
+    val iterWriteVat = Output(UInt(vParams.vatSz.W))
     val pipe_write = Output(Valid(new VectorWrite(dLen)))
     val acc_write = Output(Valid(new VectorWrite(dLen)))
     val acc_write_slot = Output(UInt(2.W))
+    val accWriteVat = Output(UInt(vParams.vatSz.W))
     val completed = Output(Valid(UInt(vParams.vatSz.W)))
     val scalar_write = Decoupled(new ScalarWrite)
 
@@ -61,9 +63,11 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
   io.pipe_write.bits := DontCare
   io.iter_write.valid := false.B
   io.iter_write.bits := DontCare
+  io.iterWriteVat := 0.U
   io.acc_write.valid := false.B
   io.acc_write.bits := DontCare
   io.acc_write_slot := 0.U
+  io.accWriteVat := 0.U
   io.completed.valid := false.B
   io.completed.bits := DontCare
   io.busy := false.B
@@ -128,6 +132,7 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
       io.acc_write.valid := acc && !tail
       io.acc_write.bits := Mux1H(write_fu_sel, pipe_fus.map(_._1.io.write.bits))
       io.acc_write_slot := Mux1H(write_pipe_sel, pipe_bits.map(_.acc_slot))
+      io.accWriteVat := vat
       io.completed.valid := tail
       io.completed.bits := vat
     }
@@ -159,11 +164,13 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
     io.iter_write.bits.eg   := iter_write_arb.io.out.bits.eg
     io.iter_write.bits.mask := iter_write_arb.io.out.bits.mask
     io.iter_write.bits.data := iter_write_arb.io.out.bits.data
+    io.iterWriteVat := VecInit(iter_fus.map(_._1.io.hazard.bits.vat))(iter_write_arb.io.chosen)
     when (!pipe_write) {
       io.acc_write.valid := iter_write_arb.io.out.valid && acc
       io.acc_write.bits.eg   := Mux1H(iter_write_arb.io.in.map(_.fire), iter_fus.map(_._1.io.write.bits.eg))
       io.acc_write.bits.data := Mux1H(iter_write_arb.io.in.map(_.fire), iter_fus.map(_._1.io.write.bits.data))
       io.acc_write.bits.mask := Mux1H(iter_write_arb.io.in.map(_.fire), iter_fus.map(_._1.io.write.bits.mask))
+      io.accWriteVat := vat
       io.completed.valid := iter_write_arb.io.out.fire && tail
       io.completed.bits := vat
     }

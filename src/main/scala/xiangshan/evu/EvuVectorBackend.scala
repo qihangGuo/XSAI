@@ -22,6 +22,14 @@ object EvuSaturnMemory {
   }
 }
 
+object EvuSaturnGather {
+  def encodeImmediate(cmd: EvuCommand): UInt = Cat(
+    OPIFunct6.rgather.asUInt,
+    Mux(cmd.aux(1), cmd.aux(0), true.B),
+    cmd.vs2, cmd.vs1, VectorConsts.OPIVI, cmd.vd, VectorConsts.opcVector
+  )
+}
+
 class EvuVectorBackendIO(p: EvuParams) extends Bundle {
   val command = Flipped(Decoupled(new EvuCommand(p)))
   val completion = Decoupled(new EvuCompletion(p))
@@ -39,6 +47,12 @@ class EvuVectorBackendIO(p: EvuParams) extends Bundle {
   val matrixInput = Flipped(Decoupled(new MatrixMicroBlock(p)))
   val matrixOutput = Decoupled(new MatrixMicroBlock(p))
   val matrixFflags = Output(UInt(5.W))
+  val vrfPerf = Output(new xiangshan.evu.backend.VrfPerf)
+  val memoryOrderStalls = Output(UInt(64.W))
+  val registerHazardStalls = Output(UInt(64.W))
+  val memoryComputeOverlap = Output(UInt(64.W))
+  val memoryCommandStart = Output(Valid(UInt(log2Ceil(p.commandDepth).W)))
+  val memoryCommandEnd = Output(Bool())
 }
 
 /**
@@ -71,7 +85,9 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     debugVrf = p.enableDifftest,
     enableChaining = true,
     enableOOO = true,
-    pipelinedVatClear = true
+    pipelinedVatClear = true,
+    issStructure = if (p.splitFpIssue) xiangshan.evu.common.VectorIssueStructure.SplitFP else VectorParams.lgvParams.issStructure,
+    reductionContexts = p.reductionContexts
   )
   private implicit val saturnP: Parameters = EvuVectorParameters(
     xsParameters,
@@ -88,7 +104,9 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   }
   private val special = Module(new EvuSpecialSequencer(p))
   io.debugVrf.foreach(_ := saturn.io.debugVrf.get)
+  io.vrfPerf := saturn.io.vrfPerf
   val cmd = io.command.bits
+  val localVl = Mux(cmd.aux(6), Mux(cmd.vl === 0.U || io.vstart =/= 0.U, 0.U, 1.U), cmd.vl)
   private val zeroCompletionPending = RegInit(false.B)
   private val zeroCompletionReg = RegInit(0.U.asTypeOf(new EvuCompletion(p)))
 
@@ -121,11 +139,15 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     EvuOpcode.FReduceMin, EvuOpcode.FReduceMax, EvuOpcode.WAdd, EvuOpcode.WSub,
     EvuOpcode.WMul, EvuOpcode.SatAdd, EvuOpcode.SatSub, EvuOpcode.SlideUp,
     EvuOpcode.SlideDown, EvuOpcode.ReduceAnd, EvuOpcode.ReduceOr, EvuOpcode.ReduceXor,
-    EvuOpcode.Load, EvuOpcode.Store, EvuOpcode.Gather, EvuOpcode.Exp2
+    EvuOpcode.Load, EvuOpcode.Store, EvuOpcode.Gather, EvuOpcode.GatherImm, EvuOpcode.Exp2
   ).map(opcode === _).reduce(_ || _)
 
   val isMemory = cmd.opcode === EvuOpcode.Load || cmd.opcode === EvuOpcode.Store
+  io.memoryCommandStart.valid := io.command.fire && isMemory
+  io.memoryCommandStart.bits := cmd.jobId
+  io.memoryCommandEnd := saturn.io.memoryRequestsDone
   val isExp2 = cmd.opcode === EvuOpcode.Exp2
+  val isGatherImm = cmd.opcode === EvuOpcode.GatherImm
   val supportedWidth = EvuIsa.supportsElementWidth(cmd.opcode, cmd.sew)
   val isOpm = Seq(EvuOpcode.Mul, EvuOpcode.Mac, EvuOpcode.ReduceSum, EvuOpcode.ReduceMax, EvuOpcode.ReduceMin, EvuOpcode.WAdd, EvuOpcode.WSub, EvuOpcode.WMul, EvuOpcode.ReduceAnd, EvuOpcode.ReduceOr, EvuOpcode.ReduceXor).map(cmd.opcode === _).reduce(_ || _)
   val isOpf = Seq(EvuOpcode.FAdd, EvuOpcode.FSub, EvuOpcode.FMul, EvuOpcode.FMacc, EvuOpcode.FDiv, EvuOpcode.FMin, EvuOpcode.FMax, EvuOpcode.FReduceSum, EvuOpcode.FReduceMin, EvuOpcode.FReduceMax, EvuOpcode.Exp2).map(cmd.opcode === _).reduce(_ || _)
@@ -174,7 +196,7 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     EvuOpcode.FReduceMax -> OPFFunct6.fredmax.asUInt,
     EvuOpcode.Exp2 -> OPFFunct6.funary1.asUInt
   ))
-  val arithmeticBits = Cat(
+  val arithmeticBits = Mux(isGatherImm, EvuSaturnGather.encodeImmediate(cmd), Cat(
     Mux(isOpf, opfFunct6, Mux(isOpm, opmFunct6, opiFunct6)),
     // Custom xv commands encode {mask-enable, vm} in aux[1:0].  Existing
     // Saturn-routed commands leave aux[1] clear and therefore remain
@@ -185,17 +207,16 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     Mux(isOpf, VectorConsts.OPFVV, Mux(isOpm, VectorConsts.OPMVV, VectorConsts.OPIVV)),
     cmd.vd,
     VectorConsts.opcVector
-  )
+  ))
   val memoryBits = EvuSaturnMemory.encode(cmd)
 
-  val isSpecialOpcode = Seq(EvuOpcode.QuantToCute,
-    EvuOpcode.SetCfg, EvuOpcode.Scatter,
+  val isSpecialOpcode = Seq(EvuOpcode.FpQuantToCute, EvuOpcode.Scatter,
     EvuOpcode.Invalid).map(cmd.opcode === _).reduce(_ || _)
   // RVV permits VL=0 as a completed no-op. Do not send it into Saturn's
   // sequencer (which quite correctly expects at least one element); emit a
   // normal ordered completion instead.
   val zeroCommand = io.command.valid && !isSpecialOpcode &&
-    isSaturnOpcode(cmd.opcode) && (cmd.vl === 0.U || (isExp2 && io.vstart >= cmd.vl))
+    isSaturnOpcode(cmd.opcode) && (localVl === 0.U || (isExp2 && io.vstart >= localVl))
   // Width errors are completed in order, just like VL=0 no-ops.  They must
   // never enter a sequencer after its 64-bit element datapaths were removed.
   val unsupportedWidthCommand = io.command.valid && !supportedWidth &&
@@ -206,25 +227,18 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   // operations internally; these entries extend that contract to the fused
   // special sequencer and CUTE parameter reads. One entry is kept per EVU job
   // so an early completion cannot clear a later command's reservation.
-  private val allRegMask = ((BigInt(1) << p.vectorRegs) - 1).U(p.vectorRegs.W)
-  private val memoryLive = RegInit(false.B)
-  private val memoryJobId = Reg(UInt(log2Ceil(p.commandDepth).W))
-  private val hazardValid = RegInit(VecInit.fill(p.commandDepth)(false.B))
-  private val hazardRead = Reg(Vec(p.commandDepth, UInt(p.vectorRegs.W)))
-  private val hazardWrite = Reg(Vec(p.commandDepth, UInt(p.vectorRegs.W)))
-  private val matrixHazardCount = RegInit(0.U(2.W))
-  private val matrixHazardHead = RegInit(0.U(1.W))
-  private val matrixHazardTail = RegInit(0.U(1.W))
-  private val matrixHazardRead = Reg(Vec(2, UInt(p.vectorRegs.W)))
-  val busyReadMask = hazardValid.zip(hazardRead).map { case (v, m) => Mux(v, m, 0.U) }.reduce(_ | _)
-  val busyWriteMask = hazardValid.zip(hazardWrite).map { case (v, m) => Mux(v, m, 0.U) }.reduce(_ | _)
+  private val reservations = Module(new EvuCommandScoreboard(p))
+  // Two queued inputs + two arithmetic stages + two output slots. Eight
+  // metadata-only credits keep the pipeline fed without a second data buffer.
+  private val matrixCredits = 8
+  private val matrixHazardCount = RegInit(0.U(log2Ceil(matrixCredits + 1).W))
+  private val matrixHazardHead = RegInit(0.U(log2Ceil(matrixCredits).W))
+  private val matrixHazardTail = RegInit(0.U(log2Ceil(matrixCredits).W))
+  private val matrixHazardRead = RegInit(VecInit.fill(matrixCredits)(0.U(p.vectorRegs.W)))
+  val busyWriteMask = reservations.io.busyWriteMask
   val incomingMatrixMask = UIntToOH(io.matrixInput.bits.scaleTag(4, 0), p.vectorRegs) |
     UIntToOH(io.matrixInput.bits.biasTag(4, 0), p.vectorRegs)
-  val matrixReadMask = Wire(UInt(p.vectorRegs.W))
-  matrixReadMask := 0.U
-  when (matrixHazardCount =/= 0.U) {
-    matrixReadMask := matrixHazardRead(0) | matrixHazardRead(1)
-  }
+  val matrixReadMask = matrixHazardRead.reduce(_ | _)
 
   val commandReadMask = WireDefault(0.U(p.vectorRegs.W))
   val commandWriteMask = WireDefault(0.U(p.vectorRegs.W))
@@ -239,18 +253,17 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     i.U >= reg && i.U < (reg +& count)
   }).asUInt
   when (isSpecialOpcode) {
-    when (cmd.opcode =/= EvuOpcode.SetCfg &&
-      cmd.opcode =/= EvuOpcode.Scatter && cmd.opcode =/= EvuOpcode.Invalid) {
-      // Descriptor scale/bias registers are selected dynamically by aux.
-      // Reserve reads conservatively until the descriptor sources are
-      // available here. QuantToCute never writes the Saturn VRF.
-      commandReadMask := allRegMask
+    when (cmd.opcode === EvuOpcode.FpQuantToCute) {
+      // The FP command reads probabilities in vs2 and inverse scales in rd.
+      commandReadMask := UIntToOH(cmd.vs2, p.vectorRegs) | UIntToOH(cmd.vd, p.vectorRegs)
     }
   }.elsewhen (isSaturnOpcode(cmd.opcode)) {
     commandReadMask := registerGroup(cmd.vs1, Mux(reduction, 1.U, groupRegisters)) |
       registerGroup(cmd.vs2, groupRegisters) |
+      Mux(cmd.opcode === EvuOpcode.Mac || cmd.opcode === EvuOpcode.FMacc,
+        registerGroup(cmd.vd, destinationRegisters), 0.U) |
       Mux(cmd.aux(1) && !cmd.aux(0), UIntToOH(0.U, p.vectorRegs), 0.U)
-    when (isExp2) {
+    when (isExp2 || isGatherImm) {
       commandReadMask := registerGroup(cmd.vs2, groupRegisters) |
         Mux(cmd.aux(1) && !cmd.aux(0), UIntToOH(0.U, p.vectorRegs), 0.U)
     }
@@ -263,16 +276,29 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
       commandWriteMask := registerGroup(cmd.vd, destinationRegisters)
     }
   }
-  val memoryOrderReady = !memoryLive && (!isMemory || !hazardValid.asUInt.orR)
-  val commandHazardFree = memoryOrderReady &&
-    !((commandReadMask & busyWriteMask).orR) &&
-    !((commandWriteMask & (busyReadMask | busyWriteMask)).orR) &&
-    !((commandWriteMask & matrixReadMask).orR)
+  // One memory command at a time owns virtualBase/error state. Independent
+  // arithmetic may run on either side of it, but all cross-command register
+  // RAW/WAR/WAW and matrix scale-read reservations remain conservative.
+  reservations.io.commandValid := io.command.valid
+  reservations.io.readMask := commandReadMask
+  reservations.io.writeMask := commandWriteMask
+  reservations.io.matrixReadMask := matrixReadMask
+  reservations.io.isMemory := isMemory
+  reservations.io.chainable := isSaturnOpcode(cmd.opcode) && !isSpecialOpcode && !immediateCompletion
+  reservations.io.jobId := cmd.jobId
+  reservations.io.accept := io.command.fire
+  reservations.io.release.valid := io.completion.fire
+  reservations.io.release.bits := io.completion.bits.jobId
+  reservations.io.flush := io.flush
+  val commandHazardFree = reservations.io.allowed
+  io.memoryOrderStalls := reservations.io.memoryOrderStalls
+  io.registerHazardStalls := reservations.io.registerHazardStalls
+  io.memoryComputeOverlap := reservations.io.memoryComputeOverlap
 
   // Matrix/CUTE consumes scale and bias through the same VRF. It has no
   // architectural write, but its read reservation must remain until the
   // transformed beat leaves the special sequencer.
-  val matrixInputAllowed = matrixHazardCount < 2.U &&
+  val matrixInputAllowed = matrixHazardCount < matrixCredits.U &&
     !((incomingMatrixMask & busyWriteMask).orR)
 
   special.io.matrix.in.valid := io.matrixInput.valid && matrixInputAllowed && !io.command.valid && !io.flush
@@ -284,15 +310,17 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     !isSpecialOpcode && !immediateCompletion && supportedWidth && commandHazardFree && !io.flush
   special.io.command.valid := io.command.valid && isSpecialOpcode && supportedWidth &&
     commandHazardFree && !io.flush
+  special.io.invalidate := io.command.fire && commandWriteMask.orR
   special.io.command.bits := cmd
   val backendReady = Mux(immediateCompletion, !zeroCompletionPending,
     Mux(isSpecialOpcode, special.io.command.ready && supportedWidth,
       saturn.io.issue.ready && isSaturnOpcode(cmd.opcode) && supportedWidth &&
         cmd.vl =/= 0.U && !io.flush))
-  io.command.ready := backendReady && commandHazardFree
+  io.command.ready := backendReady && commandHazardFree && !io.flush
   saturn.io.issue.bits := 0.U.asTypeOf(saturn.io.issue.bits)
   saturn.io.issue.bits.bits := Mux(isMemory, memoryBits, arithmeticBits)
-  saturn.io.issue.bits.vconfig.vl := cmd.vl
+  saturn.io.issue.bits.vconfig.vl := localVl
+  saturn.io.issue.bits.scalarVrfSource := cmd.aux(5)
   saturn.io.issue.bits.vconfig.vtype.vill := io.vill
   saturn.io.issue.bits.vconfig.vtype.reserved := 0.U
   saturn.io.issue.bits.vconfig.vtype.vma := io.vma
@@ -301,7 +329,7 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   saturn.io.issue.bits.vconfig.vtype.vlmul_sign := io.vlmulSign
   saturn.io.issue.bits.vconfig.vtype.vlmul_mag := io.vlmulMag
   saturn.io.issue.bits.fission_vl.valid := false.B
-  saturn.io.issue.bits.vstart := io.vstart
+  saturn.io.issue.bits.vstart := Mux(cmd.aux(6), 0.U, io.vstart)
   saturn.io.issue.bits.segstart := 0.U
   saturn.io.issue.bits.segend := 0.U
   saturn.io.issue.bits.rs1_data := cmd.base
@@ -324,10 +352,6 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   val vdByVat = Reg(Vec(vatEntries, UInt(p.regIndexWidth.W)))
   val epochByVat = Reg(Vec(vatEntries, UInt(2.W)))
   when(io.command.fire) {
-    when(isMemory) { memoryLive := true.B; memoryJobId := cmd.jobId }
-    hazardValid(cmd.jobId) := true.B
-    hazardRead(cmd.jobId) := commandReadMask
-    hazardWrite(cmd.jobId) := commandWriteMask
     when (immediateCompletion) {
       zeroCompletionReg.pc := cmd.pc
       zeroCompletionReg.tval := 0.U
@@ -401,22 +425,15 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   completionArbiter.io.in(2) <> zeroCompletion
   io.completion <> completionArbiter.io.out
   when (zeroCompletion.fire) { zeroCompletionPending := false.B }
-  when(io.completion.fire) {
-    when(memoryLive && io.completion.bits.jobId === memoryJobId) { memoryLive := false.B }
-    for (i <- 0 until p.commandDepth) {
-      when(hazardValid(i) && i.U === io.completion.bits.jobId) {
-        hazardValid(i) := false.B
-      }
-    }
-  }
   val matrixEnq = io.matrixInput.fire
   val matrixDeq = io.matrixOutput.fire
+  when(matrixDeq) {
+    matrixHazardRead(matrixHazardHead) := 0.U
+    matrixHazardHead := matrixHazardHead + 1.U
+  }
   when(matrixEnq) {
     matrixHazardRead(matrixHazardTail) := incomingMatrixMask
     matrixHazardTail := matrixHazardTail + 1.U
-  }
-  when(matrixDeq) {
-    matrixHazardHead := matrixHazardHead + 1.U
   }
   when(matrixEnq && !matrixDeq) {
     matrixHazardCount := matrixHazardCount + 1.U
@@ -424,12 +441,11 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     matrixHazardCount := matrixHazardCount - 1.U
   }
   when(io.flush) {
-    memoryLive := false.B
     pendingReleases := 0.U
     memoryErrorSticky := false.B
     zeroCompletionPending := false.B
     memoryFaultSticky := EvuFault.None
-    for (i <- 0 until p.commandDepth) { hazardValid(i) := false.B }
+    matrixHazardRead.foreach(_ := 0.U)
     matrixHazardCount := 0.U
     matrixHazardHead := 0.U
     matrixHazardTail := 0.U
@@ -451,10 +467,10 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   // Saturn queue indices can be wider than the external HBL2 source IDs.
   val hblLocalTag = Reg(Vec(p.maxMemOutstanding, chiselTypeOf(saturn.io.dmem.load_req.bits.tag)))
   val hblDrop = RegInit(VecInit.fill(p.maxMemOutstanding)(false.B))
-  private val saturnSlots = p.maxMemOutstanding - 1
+  private val saturnSlots = p.maxMemOutstanding
   require(saturnSlots > 0)
-  // The top-level EVU reserves global ID max-1 for CUTE output. Saturn owns
-  // the remaining low range and uses its local tag directly.
+  // These are client-local IDs; EvuMemoryTagRouter allocates global sources
+  // independently for Saturn and the matrix write-combining buffer.
   val freeMask = ((BigInt(1) << saturnSlots) - 1).U(p.maxMemOutstanding.W) & ~hblInFlight.asUInt
   val hasFreeTag = freeMask.orR
   val freeTag = PriorityEncoder(freeMask)
@@ -480,6 +496,7 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   when(io.memory.req.fire) {
     hblAddress(freeTag) := io.memory.req.bits.addr
     hblInFlight(freeTag) := true.B
+    hblDrop(freeTag) := false.B
     hblIsStore(freeTag) := chooseStore
     hblLocalTag(freeTag) := Mux(chooseStore, saturn.io.dmem.store_req.bits.tag, saturn.io.dmem.load_req.bits.tag)
   }
@@ -500,19 +517,26 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     Mux(responseStore, saturn.io.dmem.store_ack.ready, saturn.io.dmem.load_resp.ready)
   )
   when(io.memory.resp.fire) {
-    when(io.memory.resp.bits.error) {
-      when(!memoryErrorSticky) { memoryErrorAddress := hblAddress(responseTag) }
+    // Cancelled responses still reclaim their tags, but cannot fault a new
+    // memory owner after flush (or resurrect a fault on the flush edge).
+    when(io.memory.resp.bits.error && !responseDrop && !io.flush) {
+      when(!memoryErrorSticky) {
+        memoryErrorAddress := hblAddress(responseTag)
+        memoryFaultSticky := io.memory.resp.bits.fault
+      }
       memoryErrorSticky := true.B
-      memoryFaultSticky := io.memory.resp.bits.fault
     }
     hblInFlight(responseTag) := false.B
     hblDrop(responseTag) := false.B
   }
   when(io.flush) {
     for (tag <- 0 until p.maxMemOutstanding) {
-      when(hblInFlight(tag)) { hblDrop(tag) := true.B }
+      when(hblInFlight(tag) && !(io.memory.resp.fire && responseTag === tag.U)) {
+        hblDrop(tag) := true.B
+      }
     }
   }
 
-  io.busy := saturn.io.busy || special.io.busy || hblInFlight.asUInt.orR || pendingReleases.orR
+  io.busy := saturn.io.busy || special.io.busy || hblInFlight.asUInt.orR ||
+    pendingReleases.orR || zeroCompletionPending || reservations.io.busy
 }

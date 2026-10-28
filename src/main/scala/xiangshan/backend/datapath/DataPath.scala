@@ -305,6 +305,8 @@ class DataPathImp(override val wrapper: DataPath)(implicit p: Parameters, params
 
   val pcReadFtqPtrFormIQ = (fromIntIQ ++ fromMemIQ).flatten.filter(x => x.bits.exuParams.needPc)
   assert(pcReadFtqPtrFormIQ.size == pcReadFtqPtr.size, s"pcReadFtqPtrFormIQ.size ${pcReadFtqPtrFormIQ.size} not equal pcReadFtqPtr.size ${pcReadFtqPtr.size}")
+  require(pcReadFtqPtrFormIQ.map(_.bits.exuParams).toSeq == params.allExuParams.filter(_.needPc),
+    "DataPath PC requests must follow CtrlBlock's execution-unit order")
   pcReadValid.zip(pcReadFtqPtrFormIQ.map(_.valid)).map(x => x._1 := x._2)
   pcReadFtqPtr.zip(pcReadFtqPtrFormIQ.map(_.bits.common.ftqIdx.get)).map(x => x._1 := x._2)
   pcReadFtqOffset.zip(pcReadFtqPtrFormIQ.map(_.bits.common.ftqOffset.get)).map(x => x._1 := x._2)
@@ -827,12 +829,12 @@ class DataPathImp(override val wrapper: DataPath)(implicit p: Parameters, params
         if (readRfMap.nonEmpty)
           sinkData.src(k) := Mux1H(readRfMap)
       }
-      if (sinkData.params.hasJmpFu || sinkData.params.hasLoadFu) {
+      if (sinkData.params.needPc) {
         val index = pcReadFtqPtrFormIQ.map(_.bits.exuParams).indexOf(sinkData.params)
         sinkData.pc.get := pcRdata(index)
       }
       if (sinkData.params.needTarget) {
-        val index = pcReadFtqPtrFormIQ.map(_.bits.exuParams).indexOf(sinkData.params)
+        val index = params.allRealExuParams.filter(_.needTarget).indexOf(sinkData.params)
         sinkData.predictInfo.get.target := targetPCRdata(index)
       }
     }

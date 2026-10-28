@@ -111,7 +111,7 @@ class EvuSaturnExp2Spec extends AnyFlatSpec with ChiselScalatestTester with Matc
           }
           if (dut.io.completion.valid.peek().litToBoolean && dut.io.completion.ready.peek().litToBoolean) {
             val c = dut.io.completion.bits
-            if (!c.exception.peek().litToBoolean && c.opcode.peek().litValue != EvuOpcode.SetCfg.litValue)
+            if (!c.exception.peek().litToBoolean)
               c.dirtyVs.expect(true.B)
             completed(c.jobId.peek().litValue.toInt) =
               (c.fflags.peek().litValue.toInt, c.exception.peek().litToBoolean, c.cause.peek().litValue.toInt)
@@ -207,8 +207,8 @@ class EvuSaturnExp2Spec extends AnyFlatSpec with ChiselScalatestTester with Matc
           load(1, inputs.updated(0, overflow).updated(1, snan), sew)
           dut.io.completion.ready.poke(false.B)
           send(EvuOpcode.Exp2, 2, sew, count)
-          // An independent special command may complete while Exp2 is in flight.
-          send(EvuOpcode.SetCfg, 0, 2, 0, job = 1)
+          // An illegal special command may complete while Exp2 is in flight.
+          send(EvuOpcode.Invalid, 0, 2, 0, job = 1)
           var waited = 0
           while (!dut.io.completion.valid.peek().litToBoolean && waited < 500) { tick(); waited += 1 }
           dut.io.completion.valid.expect(true.B)
@@ -221,7 +221,7 @@ class EvuSaturnExp2Spec extends AnyFlatSpec with ChiselScalatestTester with Matc
           }
           dut.io.completion.ready.poke(true.B)
           waitFor(flags = 21)
-          waitFor(job = 1)
+          waitFor(job = 1, illegal = true)
           val inf = if (sew == 1) BigInt(0x7c00) else BigInt("7f800000", 16)
           val qnan = if (sew == 1) BigInt(0x7e00) else BigInt("7fc00000", 16)
           expectReg(2, results.updated(0, inf).updated(1, qnan), sew)
@@ -234,7 +234,7 @@ class EvuSaturnExp2Spec extends AnyFlatSpec with ChiselScalatestTester with Matc
           send(EvuOpcode.Exp2, 2, sew, count)
           send(EvuOpcode.FAdd, 3, sew, count, job = 1, source1 = 1)
           waitFor()
-          waitFor(job = 1)
+          waitFor(job = 1, illegal = true)
           expectReg(2, results, sew)
           val doubledHalves = Seq(0xc600, 0xc400, 0xc000, 0, 0x4000, 0x4400, 0x4600, 0x4800)
           expectReg(3, (0 until count).map(i =>

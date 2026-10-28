@@ -347,7 +347,6 @@ class NewCSR(implicit val p: Parameters) extends Module
     bank.io.busy := io.evu.busy
     io.evu.config := bank.io.config
     io.evu.configured := bank.io.configured
-    io.evu.descriptors := bank.io.descriptors
     io.evu.state := bank.io.state
     io.evu.permitted := !privState.isVirtual && bank.io.state =/= 0.U &&
       (isModeM || mstateen0.regOut.C.asBool &&
@@ -362,7 +361,6 @@ class NewCSR(implicit val p: Parameters) extends Module
   if (!p(ExternalVectorKey).enable) {
     io.evu.config := 0.U.asTypeOf(io.evu.config)
     io.evu.configured := false.B
-    io.evu.descriptors := 0.U.asTypeOf(io.evu.descriptors)
     io.evu.state := 0.U
     io.evu.permitted := false.B
   }

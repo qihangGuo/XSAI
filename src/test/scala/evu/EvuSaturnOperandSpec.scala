@@ -3,7 +3,7 @@ package evu
 import chisel3._
 import chisel3.util._
 import chiseltest._
-import chiseltest.simulator.{TreadleBackendAnnotation, VerilatorBackendAnnotation}
+import chiseltest.simulator.TreadleBackendAnnotation
 import org.chipsalliance.cde.config.Parameters
 import org.scalatest.flatspec.AnyFlatSpec
 import freechips.rocketchip.tile.{CoreModule, TileVisibilityNodeKey}
@@ -14,9 +14,11 @@ import xiangshan.evu.backend.{ExecuteSequencer, RegisterFile, SpecialSequencer}
 import xiangshan.evu.common._
 import xiangshan.evu.exu._
 
-class EvuSaturnOperandHarness(special: Boolean)(implicit p: Parameters) extends CoreModule()(p) with HasVectorParams {
+class EvuSaturnOperandHarness(special: Boolean, pipelinedReads: Boolean = false)(implicit p: Parameters) extends CoreModule()(p) with HasVectorParams {
   val io = IO(new Bundle {
     val dispatch = Input(Bool())
+    val dispatchReady = Output(Bool())
+    val vl = Input(UInt((1 + log2Ceil(maxVLMax)).W))
     val olderWrites = Input(UInt(egsTotal.W))
     val ready = Input(Vec(4, Bool()))
     val resp = Input(Vec(4, UInt(dLen.W)))
@@ -25,21 +27,28 @@ class EvuSaturnOperandHarness(special: Boolean)(implicit p: Parameters) extends 
     val data = Output(Vec(4, UInt(dLen.W)))
     val issue = Output(Bool())
     val issueReady = Input(Bool())
+    val prefetch = Output(Vec(3, Valid(new VectorReadReq)))
+    val issueIndex = Output(UInt(log2Ceil(maxVLMax).W))
+    val writeBank = Output(UInt(vParams.vrfBanking.W))
   })
   val inst = WireInit(0.U.asTypeOf(new BackendIssueInst))
-  inst.vconfig.vl := 8.U
+  inst.vconfig.vl := io.vl
   inst.vconfig.vtype.vsew := 2.U
   inst.renv2 := true.B
   inst.renvm := true.B
   io.req := VecInit.fill(4)(false.B)
   io.eg := VecInit.fill(4)(0.U(log2Ceil(egsTotal).W))
   io.data := VecInit.fill(4)(0.U(dLen.W))
+  io.prefetch := 0.U.asTypeOf(io.prefetch)
+  io.issueIndex := 0.U
+  io.writeBank := 0.U
   if (special) {
     val seq = Module(new SpecialSequencer(IntegerPipeFactory.insns ++ PermuteUnitFactory.insns))
     // Masked indexed load: index vector v8 and mask v0 both select bank 0.
     inst.bits := ((BigInt(8) << 20) | (BigInt(6) << 12) | 7).U(32.W)
     inst.mop := 1.U
     seq.io.dis.valid := io.dispatch
+    io.dispatchReady := seq.io.dis.ready
     seq.io.dis.bits := inst
     seq.io.dis_stall := false.B
     seq.io.older_writes := io.olderWrites
@@ -68,11 +77,16 @@ class EvuSaturnOperandHarness(special: Boolean)(implicit p: Parameters) extends 
   } else {
     val insns = VXSequencerParams("mul", Seq(IntegerMultiplyFactory(3, true))).insns
     val seq = Module(new ExecuteSequencer(insns, 3, 1))
-    inst.bits := (OPMFunct6.macc.asUInt << 26) | (4.U << 15) | (8.U << 20) |
-      (12.U << 7) | (VectorConsts.OPMVV << 12) | VectorConsts.opcVector
+    val regs = if (pipelinedReads) Seq(1, 2, 3) else Seq(4, 8, 12)
+    inst.bits := (OPMFunct6.macc.asUInt << 26) | ((if (pipelinedReads) 1.U else 0.U) << 25) |
+      (regs(0).U << 15) | (regs(1).U << 20) |
+      (regs(2).U << 7) | (VectorConsts.OPMVV << 12) | VectorConsts.opcVector
+    inst.renvm := (!pipelinedReads).B
     inst.renv1 := true.B
     inst.renvd := true.B
+    inst.wvd := pipelinedReads.B
     seq.io.dis.valid := io.dispatch
+    io.dispatchReady := seq.io.dis.ready
     seq.io.dis.bits := inst
     seq.io.dis_stall := false.B
     seq.io.older_writes := io.olderWrites
@@ -94,10 +108,14 @@ class EvuSaturnOperandHarness(special: Boolean)(implicit p: Parameters) extends 
     }
     io.data := VecInit(seq.io.rvs1_data, seq.io.rvs2_data, seq.io.rvd_data, seq.io.rvm_data)
     io.issue := seq.io.iss.valid
+    io.prefetch := seq.io.prefetch
+    io.issueIndex := seq.io.iss.bits.eidx
+    io.writeBank := seq.io.pipe_write_req.bank_sel
   }
 }
 
-class EvuSaturnOperandShell(val special: Boolean, val withVrf: Boolean = false)(implicit p: Parameters) extends LazyModule {
+class EvuSaturnOperandShell(val special: Boolean, val withVrf: Boolean = false,
+    val pipelinedReads: Boolean = false)(implicit p: Parameters) extends LazyModule {
   val client = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1("operand-test")))))
   val sink = TLManagerNode(Seq(TLSlavePortParameters.v1(Seq(TLSlaveParameters.v1(
     address = Seq(AddressSet(0, 0xffffffffL)), supportsGet = TransferSizes(1, 64))), beatBytes = 64)))
@@ -106,7 +124,7 @@ class EvuSaturnOperandShell(val special: Boolean, val withVrf: Boolean = false)(
 }
 
 class EvuSaturnOperandShellImp(outer: EvuSaturnOperandShell)(implicit p: Parameters) extends LazyModuleImp(outer) {
-  val harness = Module(new EvuSaturnOperandHarness(outer.special)(p.alterPartial {
+  val harness = Module(new EvuSaturnOperandHarness(outer.special, outer.pipelinedReads)(p.alterPartial {
     case TileVisibilityNodeKey => outer.client
   }))
   val io = IO(chiselTypeOf(harness.io))
@@ -114,10 +132,13 @@ class EvuSaturnOperandShellImp(outer: EvuSaturnOperandShell)(implicit p: Paramet
   val vrfInitialized = IO(Output(Bool()))
   vrfInitialized := true.B
   if (outer.withVrf) {
-    val vrf = Module(new RegisterFile(Seq(4), Seq(1), 1, 1, 4, "vrf_saturn_operands"))
+    val suffix = if (outer.pipelinedReads) "vrf_saturn_prefetch" else "vrf_saturn_operands"
+    val vrf = Module(new RegisterFile(Seq(4), Seq(1), 1, 1, 4, suffix,
+      Seq((0, 0), (0, 1), (0, 2))))
     val initialized = RegInit(false.B)
-    val initIndex = RegInit(0.U(2.W))
-    val eg = VecInit(8.U(6.W), 16.U(6.W), 24.U(6.W), 0.U(6.W))(initIndex)
+    val initIndex = RegInit(0.U(3.W))
+    val addresses = if (outer.pipelinedReads) Seq(2, 3, 4, 5, 6, 7, 0) else Seq(8, 9, 16, 17, 24, 25, 0)
+    val eg = VecInit(addresses.map(_.U(6.W)))(initIndex)
     vrfInitialized := initialized
     vrf.io.pipe_writes(0).valid := !initialized
     vrf.io.pipe_writes(0).bits.eg := eg
@@ -125,7 +146,7 @@ class EvuSaturnOperandShellImp(outer: EvuSaturnOperandShell)(implicit p: Paramet
     vrf.io.pipe_writes(0).bits.mask := ~0.U(256.W)
     when (!initialized) {
       initIndex := initIndex + 1.U
-      when (initIndex === 3.U) { initialized := true.B }
+      when (initIndex === 6.U) { initialized := true.B }
     }
     vrf.io.ll_writes(0).valid := false.B
     vrf.io.ll_writes(0).bits := 0.U.asTypeOf(vrf.io.ll_writes(0).bits)
@@ -136,6 +157,7 @@ class EvuSaturnOperandShellImp(outer: EvuSaturnOperandShell)(implicit p: Paramet
     vrf.io.pipe_write_reqs(0).oldest := false.B
     vrf.io.mask_read(0)(0).req.valid := false.B
     vrf.io.mask_read(0)(0).req.bits := 0.U.asTypeOf(vrf.io.mask_read(0)(0).req.bits)
+    vrf.io.prefetch := harness.io.prefetch
     for (i <- 0 until 4) {
       val read = vrf.io.read(0)(i)
       read.req.valid := harness.io.req(i) && initialized
@@ -157,6 +179,75 @@ class EvuSaturnOperandShellImp(outer: EvuSaturnOperandShell)(implicit p: Paramet
 
 class EvuSaturnOperandSpec extends AnyFlatSpec with ChiselScalatestTester {
   behavior of "Saturn operand collectors"
+  it should "prefetch real VRF operands across chunks without bypassing older writes" in {
+    implicit val p: Parameters = EvuVectorParameters(Parameters.empty.alterPartial {
+      case freechips.rocketchip.tile.XLen => 64
+      case freechips.rocketchip.tile.MaxHartIdBits => 1
+      case freechips.rocketchip.rocket.PgLevels => 3
+    }, 512, 256, 128, VectorParams.lgvParams)
+    test(LazyModule(new EvuSaturnOperandShell(false, withVrf = true, pipelinedReads = true)).module)
+      .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+        dut.io.dispatch.poke(false.B)
+        dut.io.vl.poke(16.U)
+        dut.io.olderWrites.poke(0.U)
+        dut.io.issueReady.poke(true.B)
+        dut.io.ready.foreach(_.poke(false.B))
+        dut.io.resp.foreach(_.poke(0.U))
+        dut.clock.step(8)
+        dut.vrfInitialized.expect(true.B)
+        def dispatch(): Unit = {
+          dut.io.dispatch.poke(true.B)
+          dut.io.dispatchReady.expect(true.B)
+          dut.clock.step()
+          dut.io.dispatch.poke(false.B)
+        }
+        def awaitIssue(): Unit = {
+          var n = 0
+          while (!dut.io.issue.peek().litToBoolean && n < 20) { dut.clock.step(); n += 1 }
+          dut.io.issue.expect(true.B)
+        }
+        def check(group: Int): Unit = {
+          dut.io.issueIndex.expect((group * 8).U)
+          for (i <- 0 until 3) dut.io.data(i).expect((0x102 + 2 * i + group).U)
+          val eg = 6 + group
+          val bank = (eg & 7) ^ ((eg >> 1) & 7)
+          dut.io.writeBank.expect((1 << bank).U)
+        }
+        dispatch()
+        awaitIssue()
+        check(0)
+        dut.io.prefetch.foreach(_.valid.expect(true.B))
+        dut.clock.step()
+        // Successor requests launch on the current issue edge. The synchronous
+        // response can feed the very next issue, or be captured during a stall.
+        dut.io.issue.expect(true.B)
+        check(1)
+        dut.io.issueReady.poke(false.B)
+        dut.clock.step(3)
+        dut.io.issue.expect(true.B)
+        check(1)
+        dut.io.issueReady.poke(true.B)
+        dut.clock.step()
+        dut.io.issue.expect(false.B)
+
+        dispatch()
+        awaitIssue()
+        // Only the next v1 chunk is pending from an older writer. It must not
+        // be speculatively cached, while independent successor operands may be.
+        dut.io.olderWrites.poke((BigInt(1) << 3).U)
+        dut.io.prefetch(0).valid.expect(false.B)
+        dut.clock.step()
+        dut.io.issue.expect(false.B)
+        dut.io.req.foreach(_.expect(false.B))
+        dut.clock.step(2)
+        dut.io.olderWrites.poke(0.U)
+        awaitIssue()
+        check(1)
+        dut.clock.step()
+        dut.io.issue.expect(false.B)
+      }
+  }
+
   it should "collect same-bank operands from the synchronous physical VRF before issue" in {
     implicit val p: Parameters = EvuVectorParameters(Parameters.empty.alterPartial {
       case freechips.rocketchip.tile.XLen => 64
@@ -164,20 +255,20 @@ class EvuSaturnOperandSpec extends AnyFlatSpec with ChiselScalatestTester {
       case freechips.rocketchip.rocket.PgLevels => 3
     }, 512, 256, 128, VectorParams.lgvParams)
     test(LazyModule(new EvuSaturnOperandShell(false, withVrf = true)).module)
-      .withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
+      .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
         dut.io.dispatch.poke(false.B)
+        dut.io.vl.poke(8.U)
         dut.io.olderWrites.poke(0.U)
         dut.io.issueReady.poke(false.B)
         dut.io.ready.foreach(_.poke(false.B))
         dut.io.resp.foreach(_.poke(0.U))
-        dut.clock.step(4)
+        dut.clock.step(8)
         dut.vrfInitialized.expect(true.B)
         dut.io.dispatch.poke(true.B)
         dut.clock.step()
         dut.io.dispatch.poke(false.B)
         dut.io.issue.expect(false.B)
         dut.clock.step()
-        dut.io.issue.expect(false.B)
         var cycles = 0
         while (!dut.io.issue.peek().litToBoolean && cycles < 16) {
           dut.clock.step()
@@ -186,9 +277,11 @@ class EvuSaturnOperandSpec extends AnyFlatSpec with ChiselScalatestTester {
         dut.io.issue.expect(true.B)
         for ((value, i) <- Seq(0x108, 0x110, 0x118, 0x100).zipWithIndex) {
           dut.io.data(i).expect(value.U)
-          dut.io.req(i).expect(false.B)
         }
-        dut.clock.step(3)
+        // The final response can issue before it has been captured.
+        dut.clock.step()
+        dut.io.req.foreach(_.expect(false.B))
+        dut.clock.step(2)
         dut.io.issue.expect(true.B)
         dut.io.issueReady.poke(true.B)
         dut.clock.step()
@@ -206,6 +299,7 @@ class EvuSaturnOperandSpec extends AnyFlatSpec with ChiselScalatestTester {
         VectorParams.lgvParams)
       test(LazyModule(new EvuSaturnOperandShell(special)).module).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
         dut.io.dispatch.poke(false.B)
+        dut.io.vl.poke(8.U)
         dut.io.olderWrites.poke(((BigInt(1) << 64)-1).U)
         dut.io.issueReady.poke(false.B)
         dut.io.ready.foreach(_.poke(true.B))
@@ -238,6 +332,68 @@ class EvuSaturnOperandSpec extends AnyFlatSpec with ChiselScalatestTester {
         dut.clock.step()
         dut.io.issue.expect(false.B)
       }
+    }
+  }
+
+  it should "issue on the final operand response and clear captures across groups and dispatches" in {
+    implicit val p: Parameters = EvuVectorParameters(Parameters.empty.alterPartial {
+      case freechips.rocketchip.tile.XLen => 64
+      case freechips.rocketchip.tile.MaxHartIdBits => 1
+      case freechips.rocketchip.rocket.PgLevels => 3
+    }, 512, 256, 128, VectorParams.lgvParams)
+    test(LazyModule(new EvuSaturnOperandShell(false)).module).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      dut.io.dispatch.poke(false.B)
+      dut.io.vl.poke(16.U)
+      dut.io.olderWrites.poke(0.U)
+      dut.io.issueReady.poke(true.B)
+      dut.io.ready.foreach(_.poke(false.B))
+      dut.io.resp.foreach(_.poke(0.U))
+      dut.io.dispatch.poke(true.B)
+      dut.clock.step()
+      dut.io.dispatch.poke(false.B)
+      dut.io.req.foreach(_.expect(true.B))
+      dut.io.issue.expect(false.B)
+      dut.io.ready(2).poke(true.B)
+      dut.io.resp(2).poke(0x202.U)
+      dut.io.issue.expect(false.B)
+      dut.clock.step()
+      dut.io.ready(2).poke(false.B)
+      dut.io.req(2).expect(false.B)
+      for (port <- Seq(0, 1, 3)) {
+        dut.io.ready(port).poke(true.B)
+        dut.io.resp(port).poke((0x200 + port).U)
+      }
+      dut.io.issue.expect(true.B)
+      for (port <- 0 until 4) dut.io.data(port).expect((0x200 + port).U)
+      dut.clock.step()
+      dut.io.ready.foreach(_.poke(false.B))
+      dut.io.issue.expect(false.B)
+      dut.io.req.foreach(_.expect(true.B))
+      for (port <- 0 until 4) {
+        dut.io.ready(port).poke(true.B)
+        dut.io.resp(port).poke((0x300 + port).U)
+      }
+      dut.io.issue.expect(true.B)
+      // Replace the instruction on the same edge as its final group issues.
+      dut.io.dispatch.poke(true.B)
+      dut.io.dispatchReady.expect(true.B)
+      dut.clock.step()
+      dut.io.dispatch.poke(false.B)
+      dut.io.ready.foreach(_.poke(false.B))
+      dut.io.issue.expect(false.B)
+      dut.io.req.foreach(_.expect(true.B))
+      for (group <- 0 until 2) {
+        for (port <- 0 until 4) {
+          dut.io.ready(port).poke(true.B)
+          dut.io.resp(port).poke((0x400 + 0x100 * group + port).U)
+        }
+        dut.io.issue.expect(true.B)
+        for (port <- 0 until 4) dut.io.data(port).expect((0x400 + 0x100 * group + port).U)
+        dut.clock.step()
+        dut.io.ready.foreach(_.poke(false.B))
+        dut.io.issue.expect(false.B)
+      }
+      dut.io.req.foreach(_.expect(false.B))
     }
   }
 }

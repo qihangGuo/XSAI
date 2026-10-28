@@ -12,7 +12,7 @@ object EvuHbl2ElaborationCheck {
       case freechips.rocketchip.tile.MaxHartIdBits => 1
       case freechips.rocketchip.rocket.PgLevels => 3
     }
-    val ep = EvuParams(enable = true, vlenBits = 512)
+    val ep = EvuParams(enable = true, vlenBits = args.lift(1).map(_.toInt).getOrElse(512))
     val target = args.headOption.getOrElse("adapter")
     val chirrtl = target match {
       case "adapter" => circt.stage.ChiselStage.emitCHIRRTL(new EvuHbl2LineAdapter(ep))

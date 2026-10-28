@@ -23,7 +23,14 @@ case class EvuParams(
     loadResponseDepth:  Int = 32,
     maxMemOutstanding:  Int = 8,
     commandDepth:       Int = 8,
-    completionDepth:    Int = 8
+    completionDepth:    Int = 8,
+    matrixStoreEntries: Int = 16,
+    matrixStoreQueueDepth: Int = 8,
+    egChaining: Boolean = true,
+    vmuLineCoalescing: Boolean = true,
+    splitFpIssue: Boolean = true,
+    reductionContexts: Int = 2,
+    scalarInstructions: Boolean = true
 ) {
   require(vlenBits > 0 && vlenBits   % 8 == 0)
   require(dlenBits > 0 && dlenBits   % 8 == 0 && vlenBits > dlenBits && vlenBits % dlenBits == 0)
@@ -39,10 +46,11 @@ case class EvuParams(
   require(executeIssueDepth > 0 && specialIssueDepth > 0)
   require(loadInflightDepth >= maxMemOutstanding)
   require(loadResponseDepth >= maxMemOutstanding)
-  // The top-level HBL2 adapter reserves the highest source ID for CUTE output.
-  // Saturn receives all remaining IDs through an explicit remap.
+  // Matrix and Saturn local tags are remapped onto a shared HBL2 source pool.
   require(maxMemOutstanding >= 8 && (maxMemOutstanding & (maxMemOutstanding - 1)) == 0)
+  require(matrixStoreEntries >= 2 && matrixStoreQueueDepth > 0)
   require(commandDepth > 0 && completionDepth > 0)
+  require(reductionContexts >= 1 && reductionContexts <= 4)
 
   val vrfBankCount: Int = vrfBanks
   val vlenBytes:     Int = vlenBits / 8
@@ -76,7 +84,6 @@ object EvuFault {
 class EvuCommand(p: EvuParams) extends Bundle {
   val pc = UInt(64.W)
   val config = new EvuExecutionConfig(p)
-  val descriptor = UInt(51.W)
   val opcode = UInt(8.W)
   val sew    = UInt(3.W)
   val vd     = UInt(p.regIndexWidth.W)
@@ -119,14 +126,4 @@ class EvuCuteWrite(p: EvuParams) extends Bundle {
   val entry = UInt(16.W)
   val data = UInt(p.dlenBits.W)
   val byteMask = UInt((p.dlenBits / 8).W)
-}
-
-/** Fixed-point parameters for quantizing VRF data into CUTE. */
-class EvuDescriptor(p: EvuParams) extends Bundle {
-  val scaleReg = UInt(p.regIndexWidth.W)
-  val biasReg = UInt(p.regIndexWidth.W)
-  val zero = SInt(32.W)
-  val shift = UInt(6.W)
-  val outputSew = UInt(2.W)
-  val valid = Bool()
 }

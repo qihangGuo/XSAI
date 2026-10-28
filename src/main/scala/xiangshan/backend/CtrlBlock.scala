@@ -71,13 +71,16 @@ class CtrlBlockImp(
   with HasPerfEvents
   with HasCriticalErrors
 {
+  // Keep the PC ports in the same execution-unit order as DataPath's requests.
+  // EVU needs a PC without being a branch or a scalar load unit.
+  private val pcReadExuParams = params.allExuParams.filter(_.needPc)
+  private val targetReadExuParams = params.allRealExuParams.filter(_.needTarget)
   val pcMemRdIndexes = new NamedIndexes(Seq(
     "redirect"  -> 1,
     "memPred"   -> 1,
     "robFlush"  -> 1,
-    "bjuPc"     -> params.BrhCnt,
-    "bjuTarget" -> params.BrhCnt,
-    "load"      -> params.LduCnt,
+    "exuPc"     -> params.numPcMemReadPort,
+    "bjuTarget" -> params.numTargetReadPort,
     "hybrid"    -> params.HyuCnt,
     "store"     -> (if(EnableStorePrefetchSMS) params.StaCnt else 0),
     "trace"     -> TraceGroupNum
@@ -102,6 +105,7 @@ class CtrlBlockImp(
   private val pcMem = Module(new SyncDataModuleTemplate(new FtqPcMemEntry, FtqSize, numPcMemRead, 1, "BackendPC", hasRen = hasRen))
   private val rob = wrapper.rob.module
   io.evuBusy := rob.io.evuBusy
+  io.evuPreflightBusy := rob.io.evuPreflightBusy
   io.evuRetired := rob.io.evuRetired
   io.evuStatus := rob.io.evuStatus
   private val memCtrl = Module(new MemCtrl(params))
@@ -230,10 +234,9 @@ class CtrlBlockImp(
   pcMem.io.raddr(pcMemRdIndexes("memPred").head) := memViolation.bits.stFtqIdx.value
   redirectGen.io.memPredPcRead.data := pcMem.io.rdata(pcMemRdIndexes("memPred").head).startAddr + (RegEnable(memViolation.bits.stFtqOffset, memViolation.valid) << instOffsetBits)
 
-  for ((pcMemIdx, i) <- pcMemRdIndexes("bjuPc").zipWithIndex) {
+  for ((pcMemIdx, i) <- pcMemRdIndexes("exuPc").zipWithIndex) {
     val ren = io.toDataPath.pcToDataPathIO.fromDataPathValid(i)
     val raddr = io.toDataPath.pcToDataPathIO.fromDataPathFtqPtr(i).value
-    val roffset = io.toDataPath.pcToDataPathIO.fromDataPathFtqOffset(i)
     pcMem.io.ren.get(pcMemIdx) := ren
     pcMem.io.raddr(pcMemIdx) := raddr
     io.toDataPath.pcToDataPathIO.toDataPathPC(i) := pcMem.io.rdata(pcMemIdx).startAddr
@@ -244,24 +247,15 @@ class CtrlBlockImp(
   val newestPtr = RegEnable(io.frontend.fromFtq.newest_entry_ptr, io.frontend.fromFtq.newest_entry_en)
   val newestTargetNext = RegEnable(newestTarget, newestEn)
   for ((pcMemIdx, i) <- pcMemRdIndexes("bjuTarget").zipWithIndex) {
-    val ren = io.toDataPath.pcToDataPathIO.fromDataPathValid(i)
-    val baseAddr = io.toDataPath.pcToDataPathIO.fromDataPathFtqPtr(i).value
-    val raddr = io.toDataPath.pcToDataPathIO.fromDataPathFtqPtr(i).value + 1.U
+    val pcReadIdx = pcReadExuParams.indexOf(targetReadExuParams(i))
+    require(pcReadIdx >= 0, s"${targetReadExuParams(i).name} needs a PC read port for its target")
+    val ren = io.toDataPath.pcToDataPathIO.fromDataPathValid(pcReadIdx)
+    val baseAddr = io.toDataPath.pcToDataPathIO.fromDataPathFtqPtr(pcReadIdx).value
+    val raddr = baseAddr + 1.U
     pcMem.io.ren.get(pcMemIdx) := ren
     pcMem.io.raddr(pcMemIdx) := raddr
     val needNewest = RegNext(baseAddr === newestPtr.value)
     io.toDataPath.pcToDataPathIO.toDataPathTargetPC(i) := Mux(needNewest, newestTargetNext, pcMem.io.rdata(pcMemIdx).startAddr)
-  }
-
-  val baseIdx = params.BrhCnt
-  for ((pcMemIdx, i) <- pcMemRdIndexes("load").zipWithIndex) {
-    // load read pcMem (s0) -> get rdata (s1) -> reg next in Memblock (s2) -> reg next in Memblock (s3) -> consumed by pf (s3)
-    val ren = io.toDataPath.pcToDataPathIO.fromDataPathValid(baseIdx+i)
-    val raddr = io.toDataPath.pcToDataPathIO.fromDataPathFtqPtr(baseIdx+i).value
-    val roffset = io.toDataPath.pcToDataPathIO.fromDataPathFtqOffset(baseIdx+i)
-    pcMem.io.ren.get(pcMemIdx) := ren
-    pcMem.io.raddr(pcMemIdx) := raddr
-    io.toDataPath.pcToDataPathIO.toDataPathPC(baseIdx+i) := pcMem.io.rdata(pcMemIdx).startAddr
   }
 
   for ((pcMemIdx, i) <- pcMemRdIndexes("hybrid").zipWithIndex) {
@@ -968,6 +962,7 @@ class CtrlBlockIO()(implicit p: Parameters, params: BackendParams) extends XSBun
   }
   val redirect = ValidIO(new Redirect)
   val evuBusy = Output(Bool())
+  val evuPreflightBusy = Output(Bool())
   val evuRetired = Output(Valid(new xiangshan.evu.EvuCoreCommand(p(ExternalVectorKey))))
   val evuStatus = Output(Valid(new EvuCompletion(p(ExternalVectorKey))))
   val fromMem = new Bundle {

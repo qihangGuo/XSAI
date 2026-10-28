@@ -2,6 +2,7 @@ package xiangshan.backend.fu.NewCSR
 
 import chisel3._
 import chisel3.util._
+import utility.ZeroExt
 import xiangshan.evu._
 
 /** Authoritative EVU context. Execution-side copies are immutable command snapshots. */
@@ -18,7 +19,6 @@ class EvuCSR(p: EvuParams) extends Module {
     val busy = Input(Bool())
     val config = Output(new EvuExecutionConfig(p))
     val configured = Output(Bool())
-    val descriptors = Output(Vec(EvuCSRs.descriptorCount, UInt(51.W)))
     val state = Output(UInt(2.W))
     val userEnable = Output(Bool())
     val supervisorEnable = Output(Bool())
@@ -65,11 +65,6 @@ class EvuCSR(p: EvuParams) extends Module {
       val lmul = Mux(cmd.aux(2), (8.U(4.W) - mag)(2, 0), Cat(0.U(1.W), mag))
       val sew = Mux(f7 === EvuIsa.setvli, cmd.aux(5, 3), cmd.instr(14, 12))
       configure(cmd.base, Cat(cmd.aux(7, 6), sew, lmul), true.B, cmd.aux(2) && mag === 0.U)
-    }.elsewhen(f7 === EvuIsa.setCfg) {
-      val idx = cmd.instr(9, 7)
-      descriptors(idx) := Cat(1.U(1.W), cmd.instr(13, 12), cmd.aux(5, 0),
-        cmd.base(31, 0), cmd.instr(24, 20), cmd.instr(19, 15))
-      dirty()
     }.elsewhen(f7 =/= EvuIsa.store && f7 =/= EvuIsa.waitOp && f7 =/= EvuIsa.fence) {
       // Conservative dirty tracking also covers operations that later fail.
       dirty()
@@ -127,7 +122,7 @@ class EvuCSR(p: EvuParams) extends Module {
   io.read := VecInit(EvuCSRs.addresses.map {
     case EvuCSRs.cfg => cfg
     case EvuCSRs.fflags => flags.pad(64)
-    case EvuCSRs.vxsat => sat.asUInt.pad(64)
+    case EvuCSRs.vxsat => ZeroExt(sat, 64)
     case EvuCSRs.state => Cat(0.U(60.W), supervisorEnable, userEnable, state)
     case EvuCSRs.vlenb => p.vlenBytes.U(64.W)
     case EvuCSRs.capability => EvuCSRs.capabilityValue(p).U(64.W)
@@ -143,13 +138,12 @@ class EvuCSR(p: EvuParams) extends Module {
   io.config.vtype := vtype
   io.config.vill := vill
   io.configured := configured
-  io.descriptors := descriptors
   io.state := state
   io.userEnable := userEnable
   io.supervisorEnable := supervisorEnable
   io.snapshot := VecInit(Seq(vl.pad(64), Cat(vill, 0.U(55.W), vtype),
-    0.U(64.W), p.vlenBytes.U(64.W), configured.asUInt.pad(64),
-    flags.pad(64), sat.asUInt.pad(64), Cat(0.U(60.W), supervisorEnable, userEnable, state),
+    0.U(64.W), p.vlenBytes.U(64.W), ZeroExt(configured, 64),
+    flags.pad(64), ZeroExt(sat, 64), Cat(0.U(60.W), supervisorEnable, userEnable, state),
     status & ~1.U(64.W), errorCause.pad(64), errorPC, Mux(errorTvalValid, errorTval, 0.U)) ++
     descriptors.map(_.pad(64)) :+ cfg)
 }

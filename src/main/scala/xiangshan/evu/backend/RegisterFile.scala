@@ -19,22 +19,40 @@ class RegisterReadCollector(implicit p: Parameters) extends CoreModule()(p) with
   val io = IO(new Bundle {
     val client = Flipped(new VectorReadIO)
     val memory = new SramReadIO
+    val prefetch = Input(Valid(new VectorReadReq))
+    val prefetched = Output(Bool())
   })
 
   val pending = RegInit(false.B)
   val requestedEg = Reg(UInt(log2Ceil(egsTotal).W))
-  io.memory.req.valid := io.client.req.valid && !pending && !reset.asBool
-  io.memory.req.bits := io.client.req.bits
-  io.client.req.ready := pending && io.memory.resp.valid &&
-    io.client.req.valid && io.client.req.bits.eg === requestedEg && !reset.asBool
-  io.client.resp := io.memory.resp.bits
+  val speculative = RegInit(false.B)
+  val buffered = RegInit(false.B)
+  val data = Reg(UInt(dLen.W))
+  val matches = io.client.req.bits.eg === requestedEg
+  val available = pending && (buffered || io.memory.resp.valid)
+  io.client.req.ready := available && matches && io.client.req.valid && !reset.asBool
+  io.client.resp := Mux(buffered, data, io.memory.resp.bits)
+  val discard = available && !io.client.req.fire &&
+    ((!speculative && !io.client.req.valid) || (io.client.req.valid && !matches))
+  val canIssue = !pending || io.client.req.fire || discard
+  io.memory.req.valid := canIssue &&
+    (io.prefetch.valid || (io.client.req.valid && !io.client.req.fire)) && !reset.asBool
+  io.memory.req.bits := Mux(io.prefetch.valid, io.prefetch.bits, io.client.req.bits)
+  io.prefetched := io.memory.req.fire && io.prefetch.valid
 
+  when (io.memory.resp.valid && pending && !buffered) {
+    data := io.memory.resp.bits
+    buffered := speculative && !discard && !io.client.req.fire
+  }
+  when (io.client.req.fire || discard) {
+    pending := false.B
+    buffered := false.B
+  }
   when (io.memory.req.fire) {
     pending := true.B
     requestedEg := io.memory.req.bits.eg
-  } .elsewhen (io.memory.resp.valid) {
-    // A withdrawn or changed request discards its old response before retrying.
-    pending := false.B
+    speculative := io.prefetch.valid
+    buffered := false.B
   }
 }
 
@@ -82,7 +100,8 @@ class RegisterReadXbar(n: Int, banks: Int)(implicit p: Parameters) extends CoreM
   val bankOffset = log2Ceil(banks)
 
   for (i <- 0 until n) {
-    val bank_sel = if (bankOffset == 0) true.B else UIntToOH(io.in(i).req.bits.eg(bankOffset-1,0))
+    require(banks == vParams.vrfBanking)
+    val bank_sel = if (bankOffset == 0) 1.U else UIntToOH(vrfBank(io.in(i).req.bits.eg), banks)
     for (j <- 0 until banks) {
       arbs(j).io.in(i).valid := io.in(i).req.valid && bank_sel(j)
       arbs(j).io.in(i).bits.eg := io.in(i).req.bits.eg >> bankOffset
@@ -102,7 +121,9 @@ class RegisterFileIO(
     maskReads: Seq[Int],
     pipeWrites: Int,
     llWrites: Int,
-    maxDepth: Int
+    maxDepth: Int,
+    prefetchPorts: Int = 0,
+    trackWrites: Boolean = false
 )(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams {
   val read = MixedVec(reads.map(rc => Vec(rc, Flipped(new VectorReadIO))))
   val mask_read = MixedVec(maskReads.map(rc => Vec(rc, Flipped(new VectorReadIO))))
@@ -110,30 +131,60 @@ class RegisterFileIO(
 
   val pipe_writes = Vec(pipeWrites, Input(Valid(new VectorWrite(dLen))))
   val ll_writes = Vec(llWrites, Flipped(Decoupled(new VectorWrite(dLen))))
+  val llOwners = Option.when(trackWrites)(Input(Vec(llWrites, Valid(UInt(vParams.vatSz.W)))))
+  val pendingWrites = Option.when(trackWrites)(Output(Vec(vParams.vrfBanking, Valid(new VectorWriteHazard))))
+  val writeCommits = Option.when(trackWrites)(Output(Vec(vParams.vrfBanking, Valid(new VectorWriteHazard))))
   val debug = Option.when(vParams.debugVrf)(Output(Vec(egsTotal, UInt(dLen.W))))
+  val prefetch = Input(Vec(prefetchPorts, Valid(new VectorReadReq)))
+  val perf = Output(new VrfPerf)
+}
+
+class VrfPerf extends Bundle {
+  val bankConflicts = UInt(64.W)
+  val writeBlocksRead = UInt(64.W)
+  val operandWait = UInt(64.W)
+  val prefetches = UInt(64.W)
 }
 
 class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrites: Int, maxDepth: Int,
-                   sramSuffix: String = "evu_vrf")(implicit p: Parameters) extends CoreModule()(p) with HasVectorParams {
+                   sramSuffix: String = "evu_vrf", prefetchPorts: Seq[(Int, Int)] = Seq.empty,
+                   trackWrites: Boolean = false)
+                  (implicit p: Parameters) extends CoreModule()(p) with HasVectorParams {
 
-  val io = IO(new RegisterFileIO(reads, maskReads, pipeWrites, llWrites, maxDepth))
-  val vrf = Module(new AraRegisterFile(reads, maskReads, pipeWrites, llWrites, maxDepth, sramSuffix))
+  val io = IO(new RegisterFileIO(reads, maskReads, pipeWrites, llWrites, maxDepth, prefetchPorts.size, trackWrites))
+  val vrf = Module(new AraRegisterFile(reads, maskReads, pipeWrites, llWrites, maxDepth, sramSuffix, trackWrites))
   io.pipe_write_reqs <> vrf.io.pipe_write_reqs
   io.pipe_writes <> vrf.io.pipe_writes
   io.ll_writes <> vrf.io.ll_writes
+  io.llOwners.foreach(vrf.io.llOwners.get := _)
+  io.pendingWrites.foreach(_ := vrf.io.pendingWrites.get)
+  io.writeCommits.foreach(_ := vrf.io.writeCommits.get)
   io.debug.foreach(_ := vrf.io.debug.get)
+  val collectors = scala.collection.mutable.ArrayBuffer.empty[RegisterReadCollector]
 
-  private def collect(client: VectorReadIO, memory: SramReadIO): Unit = {
+  private def collect(client: VectorReadIO, memory: SramReadIO, prefetchIndex: Int = -1): Unit = {
     val collector = Module(new RegisterReadCollector)
+    collectors += collector
     collector.io.client <> client
     collector.io.memory <> memory
+    collector.io.prefetch := 0.U.asTypeOf(collector.io.prefetch)
+    if (prefetchIndex >= 0) { collector.io.prefetch := io.prefetch(prefetchIndex) }
   }
-  for ((clients, ports) <- io.read.zip(vrf.io.read); (client, port) <- clients.zip(ports)) {
-    collect(client, port)
+  for (group <- reads.indices; port <- 0 until reads(group)) {
+    collect(io.read(group)(port), vrf.io.read(group)(port), prefetchPorts.indexOf((group, port)))
   }
   for ((clients, ports) <- io.mask_read.zip(vrf.io.mask_read); (client, port) <- clients.zip(ports)) {
     collect(client, port)
   }
+  io.perf := vrf.io.perf
+  val operandWait = RegInit(0.U(64.W))
+  val prefetches = RegInit(0.U(64.W))
+  when (collectors.map(c => c.io.client.req.valid && !c.io.client.req.ready).reduce(_ || _)) {
+    operandWait := operandWait + 1.U
+  }
+  prefetches := prefetches + PopCount(VecInit(collectors.map(_.io.prefetched).toSeq))
+  io.perf.operandWait := operandWait
+  io.perf.prefetches := prefetches
 }
 
 class SramRegisterFileIO(
@@ -141,14 +192,19 @@ class SramRegisterFileIO(
     maskReads: Seq[Int],
     pipeWrites: Int,
     llWrites: Int,
-    maxDepth: Int
+    maxDepth: Int,
+    trackWrites: Boolean = false
 )(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams {
   val read = MixedVec(reads.map(rc => Vec(rc, Flipped(new SramReadIO))))
   val mask_read = MixedVec(maskReads.map(rc => Vec(rc, Flipped(new SramReadIO))))
   val pipe_write_reqs = Vec(pipeWrites, Flipped(new VectorPipeWriteReqIO(maxDepth)))
   val pipe_writes = Vec(pipeWrites, Input(Valid(new VectorWrite(dLen))))
   val ll_writes = Vec(llWrites, Flipped(Decoupled(new VectorWrite(dLen))))
+  val llOwners = Option.when(trackWrites)(Input(Vec(llWrites, Valid(UInt(vParams.vatSz.W)))))
+  val pendingWrites = Option.when(trackWrites)(Output(Vec(vParams.vrfBanking, Valid(new VectorWriteHazard))))
+  val writeCommits = Option.when(trackWrites)(Output(Vec(vParams.vrfBanking, Valid(new VectorWriteHazard))))
   val debug = Option.when(vParams.debugVrf)(Output(Vec(egsTotal, UInt(dLen.W))))
+  val perf = Output(new VrfPerf)
 }
 
 // Each element group spans 64-bit lanes with eight banks per lane.
@@ -158,7 +214,8 @@ class AraRegisterFile(
     pipeWrites: Int,
     llWrites: Int,
     maxDepth: Int,
-    sramSuffix: String = "evu_vrf"
+    sramSuffix: String = "evu_vrf",
+    trackWrites: Boolean = false
 )(implicit p: Parameters) extends CoreModule()(p) with HasVectorParams {
 
   private val sliceBits = 64
@@ -174,7 +231,7 @@ class AraRegisterFile(
   require(vParams.vrfBanking == banksPerLane,
     "Ara-style EVU VRF requires the logical reservation width to match its eight physical banks")
 
-  val io = IO(new SramRegisterFileIO(reads, maskReads, pipeWrites, llWrites, maxDepth))
+  val io = IO(new SramRegisterFileIO(reads, maskReads, pipeWrites, llWrites, maxDepth, trackWrites))
 
   private val storage = Seq.tabulate(laneCount, banksPerLane) { (lane, bank) =>
     Module(new SRAMTemplate(UInt(8.W), rowsPerBank, way = sliceBytes,
@@ -186,7 +243,7 @@ class AraRegisterFile(
     RegInit(VecInit.fill(egsTotal)(0.U(dLen.W)))
   }
 
-  private def bankOf(eg: UInt): UInt = eg(bankBits - 1, 0)
+  private def bankOf(eg: UInt): UInt = vrfBank(eg)
   private def rowOf(eg: UInt): UInt = (eg >> bankBits)(rowBits - 1, 0)
 
   private val readXbars = reads.map { rc => Module(new RegisterReadXbar(rc, banksPerLane)) }
@@ -203,6 +260,8 @@ class AraRegisterFile(
   private val allXbars = readXbars.map(_.io.out) ++ maskXbars.map(_.io.out)
   private val requesterCount = allXbars.size
   require(requesterCount > 0, "Ara-style EVU VRF requires at least one read requester")
+  val bankConflict = WireInit(VecInit.fill(banksPerLane)(false.B))
+  val writeBlock = WireInit(VecInit.fill(banksPerLane)(false.B))
 
   // Scheduled pipe writes have no ready; they must take priority.
   private val pipeMatches = Seq.tabulate(banksPerLane) { bank =>
@@ -219,6 +278,9 @@ class AraRegisterFile(
   // Stage LL writes to break the load-mask-read/write-ready combinational loop.
   private val llPending = Reg(Vec(banksPerLane, new VectorWrite(dLen)))
   private val llPendingValid = RegInit(VecInit.fill(banksPerLane)(false.B))
+  private val llOwners = Option.when(trackWrites) {
+    RegInit(VecInit.fill(banksPerLane)(0.U.asTypeOf(Valid(UInt(vParams.vatSz.W)))))
+  }
   private val llReadyByBank = Seq.tabulate(banksPerLane) { _ =>
     Wire(Vec(llWrites, Bool()))
   }
@@ -234,6 +296,7 @@ class AraRegisterFile(
     when (llArbiters(bank).io.out.fire) {
       llPending(bank) := llArbiters(bank).io.out.bits
       llPendingValid(bank) := true.B
+      llOwners.foreach(_(bank) := io.llOwners.get(llArbiters(bank).io.chosen))
     } .elsewhen (llPendingValid(bank) && !pipeValid(bank)) {
       llPendingValid(bank) := false.B
     }
@@ -300,6 +363,24 @@ class AraRegisterFile(
     val hasPipeWrite = pipeValid(bank)
     val hasLlWrite = llPendingValid(bank) && !hasPipeWrite
     val hasWrite = hasPipeWrite || hasLlWrite
+    io.pendingWrites.foreach { pending =>
+      pending(bank).valid := llPendingValid(bank) && llOwners.get(bank).valid && !reset.asBool
+      pending(bank).bits.eg := llPending(bank).eg
+      pending(bank).bits.vat := llOwners.get(bank).bits
+      pending(bank).bits.mask := llPending(bank).mask
+    }
+    io.writeCommits.foreach { committed =>
+      committed(bank) := io.pendingWrites.get(bank)
+      committed(bank).valid := hasLlWrite && llOwners.get(bank).valid && !reset.asBool
+    }
+    val logicalReads = io.read.flatMap(_.toSeq) ++ io.mask_read.flatMap(_.toSeq)
+    val contenders = logicalReads.map(r => r.req.valid && bankOf(r.req.bits.eg) === bank.U)
+    val differentRows = logicalReads.indices.map { i =>
+      (0 until i).map(j => contenders(i) && contenders(j) &&
+        rowOf(logicalReads(i).req.bits.eg) =/= rowOf(logicalReads(j).req.bits.eg)).foldLeft(false.B)(_ || _)
+    }.reduce(_ || _)
+    bankConflict(bank) := differentRows && !hasWrite
+    writeBlock(bank) := contenders.reduce(_ || _) && hasWrite
     val writeEg = Mux(hasPipeWrite, pipeEg(bank), llPending(bank).eg)
     // A bank accepts a read or a write per cycle; writes block all reads.
     readArb.io.out.ready := !hasWrite && !reset.asBool
@@ -337,6 +418,7 @@ class AraRegisterFile(
         byteMask((lane + 1) * sliceBytes - 1, lane * sliceBytes))
       assert(!sram.io.r.req.valid || sram.io.r.req.ready)
       assert(!sram.io.w.req.valid || sram.io.w.req.ready)
+      assert(!(sram.io.r.req.valid && sram.io.w.req.valid), "EVU VRF bank must remain 1RW")
     }
 
     debugShadow.foreach { shadow =>
@@ -351,4 +433,12 @@ class AraRegisterFile(
   io.debug.foreach { snapshot =>
     snapshot.zip(debugShadow.get).foreach { case (out, value) => out := value }
   }
+  val conflicts = RegInit(0.U(64.W))
+  val blocked = RegInit(0.U(64.W))
+  when (bankConflict.asUInt.orR) { conflicts := conflicts + 1.U }
+  when (writeBlock.asUInt.orR) { blocked := blocked + 1.U }
+  io.perf.bankConflicts := conflicts
+  io.perf.writeBlocksRead := blocked
+  io.perf.operandWait := 0.U
+  io.perf.prefetches := 0.U
 }

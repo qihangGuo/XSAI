@@ -12,10 +12,11 @@
 - `Exp2` 进入 Saturn FP issue queue，通过独立的六级 `VFExp2FU` 执行，
   复用普通读寄存器、元素组推进、mask 和写回机制。支持 IEEE FP16/FP32，
   不启用 BF16；e8/e64 请求按非法指令完成。现有 xv.exp2 软件编码不变。
-- `QuantToCute` 输入量化及 CUTE 结果流反量化由 `EvuSpecialSequencer`
-  管理，保留各自的 `EvuQuant` 实例，通过只读特化端口读取 Saturn VRF。
-  原 `VRF -> 独立量化 -> VRF` 路径及其写回端口已删除；DEQUANT、REQUANT、
-  QUANT 编码 `0x09/0x0b/0x4f` 保留为非法指令，SETCFG 仅配置定点 QuantToCute。
+- FP32 `FpQuantToCute`（0x50）由 `EvuSpecialSequencer` 管理，使用两组
+  操作数缓存和三级弹性 `EvuFpQuant`，直接写 CUTE，不回写 VRF。
+  CUTE 结果流反量化采用当前 A/B scale chunk 缓存、两级算术流水和两个输出槽。
+  旧定点 QuantToCute/SETCFG（0x4c/0x4e）及通用 `EvuQuant` 已删除；
+  原 VRF DEQUANT/REQUANT/QUANT（0x09/0x0b/0x4f）继续按非法指令处理。
 - `Launch`、`Wait`、`Fence`、`SetVli` 和 `SetVl` 由
   `EvuControlSequencer` 串行管理；它不再执行普通向量算术或访存。
 - CUTE matrix beat 统一经过 `MatrixVectorBridge -> EvuSpecialSequencer ->

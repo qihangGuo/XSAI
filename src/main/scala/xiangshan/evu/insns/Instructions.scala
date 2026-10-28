@@ -217,7 +217,7 @@ object FSLIDE1UP   extends OPFInstruction    { val props = Seq(F6(OPFFunct6.fsli
 object FSLIDE1DOWN extends OPFInstruction    { val props = Seq(F6(OPFFunct6.fslide1down), UsesGatherUnit.Y, ReadsVS2.N, Slide.Y) }
 
 object RGATHER_VX  extends VectorInstruction    { val props = Seq(F6(OPIFunct6.rgather)    , F3(VectorConsts.OPIVX)) }
-object RGATHER_VI  extends VectorInstruction    { val props = Seq(F6(OPIFunct6.rgather)    , F3(VectorConsts.OPIVI)) }
+object RGATHER_VI  extends VectorInstruction    { val props = Seq(F6(OPIFunct6.rgather)    , F3(VectorConsts.OPIVI), ZextImm5.Y) }
 object RGATHER_VV  extends VectorInstruction    { val props = Seq(F6(OPIFunct6.rgather)    , F3(VectorConsts.OPIVV), UsesGatherUnit.Y, Elementwise.Y) }
 object RGATHEREI16 extends VectorInstruction    { val props = Seq(F6(OPIFunct6.rgatherei16), F3(VectorConsts.OPIVV), UsesGatherUnit.Y, Elementwise.Y) }
 object COMPRESS    extends OPMInstruction       { val props = Seq(F6(OPMFunct6.compress)   , ReadsVS1AsMask.Y, Elementwise.Y) }

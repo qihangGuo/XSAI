@@ -40,6 +40,49 @@
 #define XV_FREDUCE_MAX(vd, vs1, vs2, sew) XV_BINARY(0x44, vd, vs1, vs2, sew)
 /* vd[i] = vs2[vs1[i]], with integer element indices in vs1. */
 #define XV_GATHER(vd, vs1, vs2, sew) XV_BINARY(0x47, vd, vs1, vs2, sew)
+/* Unsigned five-bit index. Index zero broadcasts vs2[0] one DLEN group at a time. */
+#define XV_GATHER_IMM(vd, index, vs2, sew) XV_BINARY(0x51, vd, index, vs2, sew)
+#define XV_BROADCAST(vd, vs2, sew) XV_GATHER_IMM(vd, 0, vs2, sew)
+
+/* FP32 m1 forms leave global VL unchanged. E0 writes only element zero;
+ * scalar-source forms use vs1[0] for every active vs2 element. */
+#define XV_LOAD_E0(vd, base) do { \
+  uintptr_t xv_base_ = (uintptr_t)(base); \
+  __asm__ volatile (".insn r 0x0b, 2, 0x52, " XV_XREG(vd) ", %0, x0" \
+                    :: "r"(xv_base_) : "memory"); \
+} while (0)
+#define XV_STORE_E0(vs, base) do { \
+  uintptr_t xv_base_ = (uintptr_t)(base); \
+  __asm__ volatile (".insn r 0x0b, 2, 0x53, " XV_XREG(vs) ", %0, x0" \
+                    :: "r"(xv_base_) : "memory"); \
+} while (0)
+#define XV_FADD_E0(vd, vs1, vs2) XV_BINARY(0x54, vd, vs1, vs2, 2)
+#define XV_FSUB_E0(vd, vs1, vs2) XV_BINARY(0x55, vd, vs1, vs2, 2)
+#define XV_FMUL_E0(vd, vs1, vs2) XV_BINARY(0x56, vd, vs1, vs2, 2)
+#define XV_FDIV_E0(vd, vs1, vs2) XV_BINARY(0x57, vd, vs1, vs2, 2)
+#define XV_FMAX_E0(vd, vs1, vs2) XV_BINARY(0x58, vd, vs1, vs2, 2)
+#define XV_EXP2_E0(vd, vs) XV_BINARY(0x59, vd, 0, vs, 2)
+#define XV_FADD_SCALAR(vd, vs1, vs2) XV_BINARY(0x5a, vd, vs1, vs2, 2)
+#define XV_FSUB_SCALAR(vd, vs1, vs2) XV_BINARY(0x5b, vd, vs1, vs2, 2)
+#define XV_FMUL_SCALAR(vd, vs1, vs2) XV_BINARY(0x5c, vd, vs1, vs2, 2)
+#define XV_FMAX_SCALAR(vd, vs1, vs2) XV_BINARY(0x5d, vd, vs1, vs2, 2)
+#define XV_FPQUANT_SCALAR_TO_CUTE(target, inverse_scale_vr, source_vr) do { \
+  uintptr_t xv_target_ = (uintptr_t)(target); \
+  __asm__ volatile (".insn r 0x0b, 2, 0x5e, " XV_XREG(inverse_scale_vr) ", %0, " \
+                    XV_XREG(source_vr) :: "r"(xv_target_) : "memory"); \
+} while (0)
+
+/* FP32 probabilities -> packed INT8 -> CUTE AB tile. ABI: funct7=0x50,
+ * rd names an EVU inverse-scale register, rs2 the FP32 source, scalar rs1
+ * holds (row << 2) | matrixReg. Requires e32,m1, VL<=64, row<128.
+ * Multiplication and +0.5 round separately to FP32 RNE, then clamp [0,127]
+ * and convert RTZ. Every byte reaches CUTE before this command completes.
+ */
+#define XV_FPQUANT_TO_CUTE(target, inverse_scale_vr, source_vr) do { \
+  uintptr_t xv_target_ = (uintptr_t)(target); \
+  __asm__ volatile (".insn r 0x0b, 2, 0x50, " XV_XREG(inverse_scale_vr) ", %0, " \
+                    XV_XREG(source_vr) :: "r"(xv_target_) : "memory"); \
+} while (0)
 
 /*
  * Launch encoding:

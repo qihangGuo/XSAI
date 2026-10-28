@@ -8,6 +8,7 @@ object EvuCSRs {
   val cfg = 0x8c0
   val fflags = 0x8c1
   val vxsat = 0x8c2
+  // Reserved context slots retained for CSR/checkpoint ABI compatibility.
   val descriptorBase = 0x8d0
   val state = 0xbc8
   val vlenb = 0xcd0
@@ -29,7 +30,8 @@ object EvuCSRs {
 
   def capabilityValue(p: EvuParams): BigInt =
     BigInt(1) | (BigInt(descriptorCount) << 8) | (BigInt(7) << 16) |
-      (BigInt(1) << 24) // ABI 1, eight descriptors, E8/E16/E32, fixed RNE
+      (BigInt(1) << 24) | (BigInt(if (p.dlenBits == 256) 1 else 0) << 25) |
+      (BigInt(1) << 26) // fixed RNE, packed FP32 quantization to CUTE, immediate gather
 }
 
 class EvuExecutionConfig(p: EvuParams) extends Bundle {
@@ -65,7 +67,6 @@ class EvuCSRCoreIO(p: EvuParams) extends Bundle {
   val drainResult = Input(Valid(new EvuDrainResult))
   val config = Output(new EvuExecutionConfig(p))
   val configured = Output(Bool())
-  val descriptors = Output(Vec(EvuCSRs.descriptorCount, UInt(51.W)))
   val permitted = Output(Bool())
   val state = Output(UInt(2.W))
 }

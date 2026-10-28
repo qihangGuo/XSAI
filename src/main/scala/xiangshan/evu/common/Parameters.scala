@@ -172,6 +172,21 @@ sealed trait VectorIssueStructure {
 object VectorIssueStructure {
   import VXFunctionalUnitGroups._
 
+  /** Split issue state without duplicating any of the floating-point units. */
+  case object SplitFP extends VectorIssueStructure {
+    def generate(params: VectorParams) = Seq(
+      VXIssuePathParams("int", params.vxissqEntries,
+        Seq(VXSequencerParams("int", integerFUs(params.useIterativeIMul) ++
+          (if (params.useIterativeIMul) Nil else integerMAC(params.imaPipeDepth, params.useSegmentedIMul))))),
+      VXIssuePathParams("fp_fma", params.vxissqEntries,
+        Seq(VXSequencerParams("fp_fma", fpFMA(params.fmaPipeDepth, params.useSegmentedFPFMA)))),
+      VXIssuePathParams("fp_cmp", params.vxissqEntries, Seq(VXSequencerParams("fp_cmp", Seq(FPCmpFactory)))),
+      VXIssuePathParams("fp_exp", params.vxissqEntries, Seq(VXSequencerParams("fp_exp", Seq(VFExp2Factory)))),
+      VXIssuePathParams("fp_div", params.vxissqEntries, Seq(VXSequencerParams("fp_div", Seq(FPDivSqrtFactory)))),
+      VXIssuePathParams("fp_conv", params.vxissqEntries, Seq(VXSequencerParams("fp_conv", Seq(FPConvFactory))))
+    )
+  }
+
   case object Unified extends VectorIssueStructure {
     def generate(params: VectorParams) = {
       val fp_int_path = VXIssuePathParams(
@@ -349,6 +364,7 @@ case class VectorParams(
 
   vrfBanking: Int = 8,
   debugVrf: Boolean = false,
+  reductionContexts: Int = 1,
 
   issStructure: VectorIssueStructure = VectorIssueStructure.Unified,
 
@@ -381,6 +397,14 @@ trait HasVectorParams extends HasVectorConsts { this: HasCoreParameters =>
   def egsPerVReg = vLen / dLen
   def egsTotal = (vLen / dLen) * 32
   def vrfBankBits = log2Ceil(vParams.vrfBanking)
+  // XOR only changes the bank coordinate. The original high EG bits remain
+  // the SRAM row, so (row, bank) is a bijection and capacity is unchanged.
+  def vrfBank(eg: UInt): UInt = {
+    if (vrfBankBits == 0) 0.U else if (egsPerVReg == 1) eg(vrfBankBits - 1, 0) else {
+      val reg = eg >> log2Ceil(egsPerVReg)
+      eg(vrfBankBits - 1, 0) ^ reg.pad(vrfBankBits)(vrfBankBits - 1, 0)
+    }
+  }
   def lsiqIdBits = log2Ceil(vParams.vliqEntries.max(vParams.vsiqEntries))
   val debugIdSz = 16
   def nRelease = vParams.issStructure.generate(vParams).map(_.seqs.size).reduce(_+_) + 2 // load/stores

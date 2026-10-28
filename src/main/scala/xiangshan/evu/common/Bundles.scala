@@ -57,6 +57,7 @@ class VectorIssueInst(implicit p: Parameters) extends CoreBundle()(p) with HasVe
   val fast_sg = Bool()
   val debug_id = UInt(debugIdSz.W)
   val mop = UInt(2.W) // stored separately from bits since dispatch may need to set this
+  val scalarVrfSource = Bool()
 
   def opcode = bits(6,0)
   def store = opcode(5)
@@ -124,9 +125,14 @@ class VectorPipeWriteReqIO(maxPipeDepth: Int)(implicit p: Parameters) extends Co
 
 class VectorWrite(writeBits: Int)(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams {
   val eg = UInt(log2Ceil(32 * vLen / writeBits).W)
-  def bankId = if (vrfBankBits == 0) 0.U else eg(vrfBankBits-1,0)
+  def bankId = vrfBank(eg)
   val data = UInt(writeBits.W)
   val mask = UInt(writeBits.W)
+}
+
+/** A buffered write remains a dependency until its physical 1RW bank commits it. */
+class VectorWriteHazard(implicit p: Parameters) extends PipeHazard(0) {
+  val mask = UInt(dLen.W)
 }
 
 class ScalarWrite extends Bundle {

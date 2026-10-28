@@ -13,7 +13,7 @@ import scala.collection.mutable
 class EvuQuantTailSpec extends AnyFlatSpec with ChiselScalatestTester with Matchers {
   behavior of "Quantization from Saturn's VRF into CUTE"
 
-  it should "preserve the VRF, mask CUTE tail bytes and exclude inactive lanes from saturation" in {
+  it should "preserve the VRF, mask CUTE tail bytes and exclude inactive lanes from IEEE flags" in {
     implicit val p: Parameters = Parameters.empty.alterPartial {
       case freechips.rocketchip.tile.XLen => 64
       case freechips.rocketchip.tile.MaxHartIdBits => 1
@@ -42,6 +42,7 @@ class EvuQuantTailSpec extends AnyFlatSpec with ChiselScalatestTester with Match
             bits | ((value & ((BigInt(1) << width) - 1)) << (i * width))
           }
         def words(values: Seq[Int]): BigInt = pack(values.map(BigInt(_)), 32)
+        def fp(value: Float): Int = java.lang.Float.floatToRawIntBits(value)
         def tick(): Unit = {
           dut.io.memory.resp.valid.poke(responses.nonEmpty.B)
           responses.headOption.foreach { case (tag, data) =>
@@ -72,11 +73,11 @@ class EvuQuantTailSpec extends AnyFlatSpec with ChiselScalatestTester with Match
           c.opcode.poke(opcode)
           c.vd.poke(vd.U)
           c.vs1.poke(2.U)
-          c.vs2.poke((if (opcode.litValue == EvuOpcode.SetCfg.litValue) 3 else 1).U)
+          c.vs2.poke(1.U)
           c.sew.poke(sew.U)
           c.vl.poke(vl.U)
           c.base.poke(0x1000.U)
-          if (opcode.litValue == EvuOpcode.SetCfg.litValue) c.base.poke(0.U)
+          if (opcode.litValue == EvuOpcode.FpQuantToCute.litValue) c.base.poke(0.U)
           c.stride.poke(0.S)
           c.length.poke(ep.vlenBytes.U)
           c.aux.poke(aux.U)
@@ -93,15 +94,15 @@ class EvuQuantTailSpec extends AnyFlatSpec with ChiselScalatestTester with Match
           tick()
           dut.io.command.valid.poke(false.B)
         }
-        def finish(sat: Boolean = false): Unit = {
+        def finish(flags: Int = 0): Unit = {
           await(dut.io.completion.valid)
           val opcode = dut.io.command.bits.opcode.peek().litValue
           val dirtyVs = dut.io.command.bits.vl.peek().litValue != 0 &&
-            opcode != EvuOpcode.SetCfg.litValue && opcode != EvuOpcode.QuantToCute.litValue
+            opcode != EvuOpcode.FpQuantToCute.litValue
           for (_ <- 0 until 3) {
             dut.io.completion.bits.exception.expect(false.B)
-            dut.io.completion.bits.fflags.expect(0.U)
-            dut.io.completion.bits.vxsat.expect(sat.B)
+            dut.io.completion.bits.fflags.expect(flags.U)
+            dut.io.completion.bits.vxsat.expect(false.B)
             dut.io.completion.bits.dirtyVs.expect(dirtyVs.B)
             tick()
           }
@@ -121,49 +122,45 @@ class EvuQuantTailSpec extends AnyFlatSpec with ChiselScalatestTester with Match
               .expect(((data >> (ep.dlenBits * chunk)) & mask).U)
           }
         }
-        val inputs = (0 until ep.vlenBytes / 4).map(i => i - 7)
+        val inputs = (0 until ep.vlenBytes / 4).map(i => (i - 7).toFloat)
+        val inputWords = words(inputs.map(fp))
+        val scales = words(Seq.fill(inputs.size)(fp(2f)))
         val sentinel = pack((0 until ep.vlenBytes).map(i => BigInt(0x80 + i)), 8)
-        load(1, words(inputs))
-        load(2, words(Seq.fill(inputs.size)(2)))
-        load(3, words(Seq.fill(inputs.size)(1)))
-        send(EvuOpcode.SetCfg, 2, 0, vd = 0)
-        finish()
-        val converted = words(inputs.map(_ * 2 + 1))
+        load(1, inputWords)
+        load(2, scales)
         load(4, sentinel)
-        for (sew <- 0 to 2;
-             bytes <- Seq(0, 1, 2, 3, 4, 30, 31, 32, 33, 34, 35, 36, 60, 62, 63, 64,
-               ep.vlenBytes - 1, ep.vlenBytes)
-               if bytes % (1 << sew) == 0) {
+        val converted = inputs.map(x => BigInt(math.max(0, math.min(127, (x * 2f + 0.5f).toInt))))
+        for (vl <- Seq(0, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32)) {
           cuteWrites.clear()
-          send(EvuOpcode.QuantToCute, sew, bytes >> sew)
-          finish()
-          withClue(s"sew=$sew bytes=$bytes: ") {
-            cuteWrites.size shouldBe ((bytes + ep.dlenBytes - 1) / ep.dlenBytes)
+          send(EvuOpcode.FpQuantToCute, 2, vl, vd = 2)
+          // RTZ loses 0.5 for every active positive probability.
+          finish(flags = (if (vl > 7) 1 else 0))
+          withClue(s"vl=$vl: ") {
+            cuteWrites.size shouldBe ((vl + 7) / 8)
             for (((entry, data, mask), index) <- cuteWrites.zipWithIndex) {
-              val activeBytes = math.min(ep.dlenBytes, bytes - ep.dlenBytes * index)
-              val activeBits = (BigInt(1) << (activeBytes * 8)) - 1
-              entry shouldBe BigInt(index)
-              mask shouldBe ((BigInt(1) << activeBytes) - 1)
-              (data & activeBits) shouldBe ((converted >> (ep.dlenBits * index)) & activeBits)
+              val n = math.min(8, vl - index * 8)
+              val offset = (index % 4) * 8
+              entry shouldBe BigInt(index / 4)
+              mask shouldBe (((BigInt(1) << n) - 1) << offset)
+              data shouldBe (pack(converted.slice(index * 8, index * 8 + n), 8) << (offset * 8))
             }
             expectReg(4, sentinel)
-            expectReg(1, words(inputs))
-            expectReg(2, words(Seq.fill(inputs.size)(2)))
-            expectReg(3, words(Seq.fill(inputs.size)(1)))
+            expectReg(1, inputWords)
+            expectReg(2, scales)
           }
         }
-
-        // Only the first nine words are live; the remaining words would saturate.
-        load(1, words(Seq.fill(9)(1) ++ Seq.fill(inputs.size - 9)(1000)))
-        send(EvuOpcode.SetCfg, 0, 0, vd = 0)
+        // A signaling NaN in an inactive lane must not set NV. Moving it
+        // into the first group must survive completion of the final group.
+        load(1, words(Seq.fill(9)(fp(0.25f)) ++ Seq.fill(inputs.size - 9)(0x7f800001)))
+        send(EvuOpcode.FpQuantToCute, 2, 9, vd = 2)
         finish()
-        send(EvuOpcode.QuantToCute, 2, 9)
-        finish(sat = false)
-        load(1, words(Seq(1000) ++ Seq.fill(inputs.size - 1)(1)))
-        send(EvuOpcode.QuantToCute, 2, 0)
-        finish(sat = false)
-        send(EvuOpcode.QuantToCute, 2, 9)
-        finish(sat = true) // Saturation in the first chunk must survive the last chunk.
+        send(EvuOpcode.FpQuantToCute, 2, 10, vd = 2)
+        finish(flags = 16)
+        load(1, words(Seq(0x7f800001) ++ Seq.fill(inputs.size - 1)(fp(0.25f))))
+        send(EvuOpcode.FpQuantToCute, 2, 0, vd = 2)
+        finish()
+        send(EvuOpcode.FpQuantToCute, 2, 9, vd = 2)
+        finish(flags = 16)
         expectReg(4, sentinel)
       }
   }

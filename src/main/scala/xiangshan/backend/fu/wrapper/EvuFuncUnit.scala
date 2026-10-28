@@ -25,7 +25,9 @@ class EvuFuncUnit(cfg: FuConfig)(implicit p: Parameters) extends PipedFuncUnit(c
   payload.instr := Cat(in.ctrl.fuOpType(6, 0), imm(14, 10), imm(9, 5),
     imm(17, 15), imm(4, 0), EvuIsa.custom0)
   payload.base := in.data.src(0)
-  payload.pc := utility.SignExt(in.data.pc.get, 64)
+  // The PC memory supplies the fetch-block base; ftqOffset is in halfwords.
+  val instructionPc = in.data.pc.get + (in.ctrl.ftqOffset.get << instOffsetBits)
+  payload.pc := utility.SignExt(instructionPc, 64)
   payload.pageMap := 0.U.asTypeOf(payload.pageMap)
   payload.vl := MuxLookup(imm(17, 15), (ep.vlenBits / 8).U)(Seq(
     0.U -> (ep.vlenBits / 8).U,

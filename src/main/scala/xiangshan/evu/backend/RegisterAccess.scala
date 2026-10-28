@@ -7,7 +7,7 @@ import freechips.rocketchip.tile.{CoreModule}
 import freechips.rocketchip.util._
 import xiangshan.evu.common._
 
-class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0)(implicit p: Parameters)
+class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0, reductionContexts: Int = 1)(implicit p: Parameters)
     extends CoreModule()(p) with HasVectorParams {
   val io = IO(new Bundle {
     val vls = new Bundle {
@@ -23,11 +23,12 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0)(impli
       val rvd = Flipped(new VectorReadIO)
       val rvm = Flipped(new VectorReadIO)
       val pipe_write_req = Flipped(new VectorPipeWriteReqIO(maxExuDepth))
+      val prefetch = Input(Vec(3, Valid(new VectorReadReq)))
     })
-    val vps = new Bundle {
+    val vps = Vec(reductionContexts, new Bundle {
       val rvs2 = Flipped(new VectorReadIO)
       val rvm = Flipped(new VectorReadIO)
-    }
+    })
 
     val frontend = new Bundle {
       val rindex = Flipped(new VectorReadIO)
@@ -37,7 +38,11 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0)(impli
     val pipe_writes = Vec(exSeqs, Input(Valid(new VectorWrite(dLen))))
     val iter_writes = Vec(exSeqs, Flipped(Decoupled(new VectorWrite(dLen))))
     val load_write = Flipped(Decoupled(new VectorWrite(dLen)))
+    val loadOwner = Input(UInt(vParams.vatSz.W))
+    val iterOwners = Input(Vec(exSeqs, UInt(vParams.vatSz.W)))
+    val pendingWrites = Output(Vec(vParams.vrfBanking, Valid(new VectorWriteHazard)))
     val debug = Option.when(vParams.debugVrf)(Output(Vec(egsTotal, UInt(dLen.W))))
+    val perf = Output(new VrfPerf)
     val special = new Bundle {
       val read = Vec(specialReads, Flipped(new VectorReadIO))
     }
@@ -52,14 +57,30 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0)(impli
   // Mask read arbitrates between <- [vxs], vls, vss, vps, frontend-mask
 
   val vrf = Module(new RegisterFile(
-    reads = Seq(1 + exSeqs, 1 + exSeqs, 1 + exSeqs) ++ (if (specialReads > 0) Seq(specialReads) else Seq.empty),
-    maskReads = Seq(4 + exSeqs),
+    reads = Seq(reductionContexts + exSeqs, 1 + exSeqs, 1 + exSeqs) ++ (if (specialReads > 0) Seq(specialReads) else Seq.empty),
+    maskReads = Seq(3 + reductionContexts + exSeqs),
     pipeWrites = exSeqs,
     llWrites = exSeqs + 2, // load + reset
-    maxExuDepth
+    maxExuDepth,
+    prefetchPorts = (0 until exSeqs).flatMap(i => (0 until 3).map(group => (group, i))),
+    trackWrites = true
   ))
-
   val resetting = RegInit(true.B)
+  io.perf := vrf.io.perf
+  io.pendingWrites := vrf.io.pendingWrites.get
+  vrf.io.llOwners.get(0).valid := false.B
+  vrf.io.llOwners.get(0).bits := 0.U
+  vrf.io.llOwners.get(1).valid := true.B
+  vrf.io.llOwners.get(1).bits := io.loadOwner
+  for (i <- 0 until exSeqs) {
+    vrf.io.llOwners.get(2 + i).valid := true.B
+    vrf.io.llOwners.get(2 + i).bits := io.iterOwners(i)
+  }
+  for (i <- 0 until exSeqs; port <- 0 until 3) {
+    vrf.io.prefetch(i * 3 + port) := io.vxs(i).prefetch(port)
+    when (resetting) { vrf.io.prefetch(i * 3 + port).valid := false.B }
+  }
+
   io.debug.foreach(_ := vrf.io.debug.get)
   val reset_ctr = RegInit(0.U(log2Ceil(egsTotal).W))
 
@@ -93,7 +114,10 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0)(impli
     vrf.io.mask_read(0)(i) <> io.vxs(i).rvm
   }
 
-  vrf.io.read(0)(exSeqs) <> io.vps.rvs2
+  for (i <- 0 until reductionContexts) {
+    vrf.io.read(0)(exSeqs + i) <> io.vps(i).rvs2
+    vrf.io.mask_read(0)(exSeqs + 2 + i) <> io.vps(i).rvm
+  }
   vrf.io.read(1)(exSeqs) <> io.frontend.rindex
   vrf.io.read(2)(exSeqs) <> io.vss.rvd
 
@@ -105,8 +129,7 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0)(impli
 
   vrf.io.mask_read(0)(exSeqs)   <> io.vls.rvm
   vrf.io.mask_read(0)(exSeqs+1) <> io.vss.rvm
-  vrf.io.mask_read(0)(exSeqs+2) <> io.vps.rvm
-  vrf.io.mask_read(0)(exSeqs+3) <> io.frontend.rmask
+  vrf.io.mask_read(0)(exSeqs+2+reductionContexts) <> io.frontend.rmask
 
   when (resetting) {
     vrf.io.read.foreach(_.foreach(_.req.valid := false.B))
@@ -118,8 +141,8 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0)(impli
     io.vxs.foreach(_.rvs2.req.ready := false.B)
     io.vxs.foreach(_.rvd.req.ready := false.B)
     io.vxs.foreach(_.rvm.req.ready := false.B)
-    io.vps.rvs2.req.ready := false.B
-    io.vps.rvm.req.ready := false.B
+    io.vps.foreach(_.rvs2.req.ready := false.B)
+    io.vps.foreach(_.rvm.req.ready := false.B)
     io.frontend.rindex.req.ready := false.B
     io.frontend.rmask.req.ready := false.B
     io.special.read.foreach(_.req.ready := false.B)

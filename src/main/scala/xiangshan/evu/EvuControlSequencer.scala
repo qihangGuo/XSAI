@@ -54,8 +54,9 @@ object EvuOpcode {
   val SetVl   = 0x46.U(8.W)
   val Gather  = 0x47.U(8.W)
   val Scatter = 0x48.U(8.W)
-  val QuantToCute = 0x4c.U(8.W)
-  val SetCfg = 0x4e.U(8.W)
+  val FpQuantToCute = 0x50.U(8.W)
+  val GatherImm = 0x51.U(8.W)
+  // Retired fixed-point QuantToCute (0x4c) and SETCFG (0x4e) are reserved.
   // Retired VRF quantization opcode 0x4f remains reserved.
 }
 
@@ -85,6 +86,7 @@ class EvuControlSequencerIO(p: EvuParams) extends Bundle {
   val completion = Decoupled(new EvuCompletion(p))
   val flush      = Input(Bool())
   val busy       = Output(Bool())
+  val blockYounger = Output(Bool())
   val jobValid   = Input(Vec(p.commandDepth, Bool()))
   val jobState   = Input(Vec(p.commandDepth, UInt(3.W)))
   val matrixBusy = Input(Bool())
@@ -119,6 +121,9 @@ class EvuControlSequencer(p: EvuParams) extends Module {
   private val fenceResult = cmdReg.opcode === EvuOpcode.Fence
 
   io.command.ready := !active && !io.flush
+  // Unlike busy, this is registered-state-only: Top may use it to gate the
+  // shared input without forming a command.valid -> busy combinational loop.
+  io.blockYounger := active && (cmdReg.opcode === EvuOpcode.Wait || cmdReg.opcode === EvuOpcode.Fence)
   when(io.command.fire) {
     cmdReg := io.command.bits
     active := true.B

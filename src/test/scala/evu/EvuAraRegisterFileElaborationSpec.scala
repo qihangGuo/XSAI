@@ -105,7 +105,7 @@ class EvuAraRegisterFileElaborationSpec extends AnyFlatSpec with Matchers with C
         val write = dut.io.pipe_writes(0)
         for (i <- values.indices) {
           write.valid.poke(true.B)
-          write.bits.eg.poke((i*8).U)
+          write.bits.eg.poke((i*16).U)
           write.bits.data.poke(values(i).U)
           write.bits.mask.poke(((BigInt(1) << 256)-1).U)
           dut.clock.step()
@@ -114,7 +114,7 @@ class EvuAraRegisterFileElaborationSpec extends AnyFlatSpec with Matchers with C
         for (i <- values.indices) {
           val read = dut.io.read(0)(i)
           read.req.valid.poke(true.B)
-          read.req.bits.eg.poke((i*8).U)
+          read.req.bits.eg.poke((i*16).U)
           read.req.bits.oldest.poke(true.B)
         }
         val pending = scala.collection.mutable.Set(0, 1, 2)
