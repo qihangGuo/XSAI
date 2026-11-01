@@ -15,6 +15,108 @@ class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matcher
   private def raw(x: Float): BigInt = BigInt(java.lang.Float.floatToRawIntBits(x).toLong & 0xffffffffL)
   behavior of "Attention FP32 quantization"
 
+  it should "queue rows before CUTE drains and retain each row target and flags through the shared pipeline" in {
+    test(new EvuSpecialSequencer(EvuParams(enable = true))).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      def clear(x: Data): Unit = x match {
+        case b: Bool => b.poke(false.B)
+        case u: UInt => u.poke(0.U)
+        case s: SInt => s.poke(0.S)
+        case v: Vec[_] => v.foreach(clear)
+        case b: Bundle => b.elements.values.foreach(clear)
+      }
+      clear(dut.io.command.bits)
+      clear(dut.io.matrix.in.bits)
+      dut.io.command.valid.poke(false.B)
+      dut.io.completion.ready.poke(false.B)
+      dut.io.flush.poke(false.B)
+      dut.io.invalidate.poke(false.B)
+      dut.io.matrix.in.valid.poke(false.B)
+      dut.io.matrix.out.ready.poke(true.B)
+      dut.io.vrf.read.foreach(_.ready.poke(true.B))
+      dut.io.vrf.readData.foreach(_.poke(0.U))
+      dut.io.cuteWrite.ready.poke(false.B)
+      def sourceData(): Unit = {
+        for (i <- 0 until 3) {
+          val reg = dut.io.vrf.read(i).bits.addr.peek().litValue.toInt
+          val value = reg match {
+            case 1 => raw(0.5f)
+            case 2 => raw(0.49f)
+            case 3 => BigInt("7f800001", 16)
+            case _ => raw(1f)
+          }
+          dut.io.vrf.readData(i).poke(pack(Seq.fill(8)(value), 32).U)
+        }
+      }
+      for (job <- 0 until 4) {
+        val c = dut.io.command.bits
+        c.opcode.poke(EvuOpcode.FpQuantToCute)
+        c.aux.poke(0x10.U)
+        c.sew.poke(2.U)
+        c.vd.poke(8.U)
+        c.vs2.poke((job + 1).U)
+        c.vl.poke((if (job == 3) 9 else 64).U)
+        c.base.poke((((job + 5) << 2) | 2).U)
+        c.pc.poke((0x80001000L + job * 4).U)
+        c.jobId.poke(job.U)
+        dut.io.command.valid.poke(true.B)
+        dut.io.command.ready.expect(true.B)
+        sourceData()
+        dut.clock.step()
+      }
+      dut.io.command.valid.poke(false.B)
+      val widths = Seq(8, 8, 8, 2)
+      val bytes = Seq(1, 0, 127, 1)
+      val flags = Seq(0, 1, 16, 1) // 1.0 + 0.5 truncates with NX too.
+      var row = 0
+      var chunk = 0
+      var completed = 0
+      var cycles = 0
+      while ((completed < 4 || row < 4) && cycles < 250) {
+        sourceData()
+        val writeReady = cycles % 4 != 0
+        val completionReady = cycles > 90 && cycles % 3 != 0
+        dut.io.cuteWrite.ready.poke(writeReady.B)
+        dut.io.completion.ready.poke(completionReady.B)
+        if (writeReady && dut.io.cuteWrite.valid.peek().litToBoolean) {
+          val w = dut.io.cuteWrite.bits
+          val n = if (row == 3 && chunk == 1) 1 else 8
+          val offset = chunk % 4 * 8
+          w.matrixReg.expect(2.U)
+          w.bank.expect(((row + 5) % 8).U)
+          w.entry.expect((((row + 5) / 8) * 2 + chunk / 4).U)
+          w.byteMask.expect((((BigInt(1) << n) - 1) << offset).U)
+          w.data.expect((pack(Seq.fill(n)(BigInt(bytes(row))), 8) << (offset * 8)).U)
+          chunk += 1
+          if (chunk == widths(row)) { row += 1; chunk = 0 }
+        }
+        if (completionReady && dut.io.completion.valid.peek().litToBoolean) {
+          val c = dut.io.completion.bits
+          c.jobId.expect(completed.U)
+          c.pc.expect((0x80001000L + completed * 4).U)
+          c.fflags.expect(flags(completed).U)
+          c.exception.expect(false.B)
+          completed += 1
+        }
+        dut.clock.step()
+        cycles += 1
+      }
+      completed shouldBe 4
+      row shouldBe 4
+      dut.io.busy.expect(false.B)
+      // Flush both queued descriptors and an occupied arithmetic pipeline.
+      dut.io.command.valid.poke(true.B)
+      dut.clock.step(3)
+      dut.io.command.valid.poke(false.B)
+      dut.io.flush.poke(true.B)
+      dut.clock.step()
+      dut.io.flush.poke(false.B)
+      dut.clock.step(5)
+      dut.io.completion.valid.expect(false.B)
+      dut.io.cuteWrite.valid.expect(false.B)
+      dut.io.busy.expect(false.B)
+    }
+  }
+
   it should "capture one scalar scale per command and ignore inactive scale lanes under CUTE backpressure" in {
     test(new EvuSpecialSequencer(EvuParams(enable = true))).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
       def clear(x: Data): Unit = x match {

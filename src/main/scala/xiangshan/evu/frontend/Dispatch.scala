@@ -111,6 +111,7 @@ class VectorDispatcher(implicit p: Parameters) extends CoreModule()(p) with HasV
   io.mem.bits.base_offset := issue_inst.rs1_data
   io.mem.bits.stride := issue_inst.rs2_data
   io.mem.bits.page := issue_inst.page
+  io.mem.bits.conservativeOrdering := issue_inst.conservativeMemoryOrdering
   io.mem.bits.vstart := issue_inst.vstart
   io.mem.bits.segstart := issue_inst.segstart
   io.mem.bits.segend := issue_inst.segend

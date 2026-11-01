@@ -150,7 +150,7 @@ class EvuAddressCheckSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
       val cases = Seq(
         (BigInt(3), 64, false, EvuAddressFault.Misaligned),
         ((BigInt(1) << 64) - 64, 128, false, EvuAddressFault.Access),
-        (BigInt(0), 513, false, EvuAddressFault.Access),
+        (BigInt(0), 8 * ep.vlenBytes + 1, false, EvuAddressFault.Access),
         (BigInt(0), 512, true, EvuAddressFault.Illegal)
       )
       for ((base, length, unbounded, fault) <- cases) {

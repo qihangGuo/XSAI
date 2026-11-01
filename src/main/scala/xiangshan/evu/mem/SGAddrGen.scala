@@ -81,6 +81,7 @@ class ScatterGatherAddrGen(sgSize: BigInt)(implicit p: Parameters) extends CoreM
     io.req(i).bits.tag   := r_enq
     io.req(i).bits.addr  := port_addr | port_byte_offset // this is broken if the addrs are misaligned
     io.req(i).bits.store := io.op.store
+    io.req(i).bits.vat := io.op.vat
 
 
     when (io.req(i).fire) {

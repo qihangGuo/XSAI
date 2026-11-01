@@ -20,9 +20,8 @@ class EvuMatrixSpecialIO(p: EvuParams) extends Bundle {
   val fflags = Output(UInt(5.W))
 }
 
-/** FP32 probability packing and CUTE result dequantization share Saturn's VRF.
-  * Two slots per quant operand overlap independent VRF reads with arithmetic
-  * and accepted CUTE writes. Neither path writes the Saturn VRF.
+/** Queued rows share one quant pipeline; beat metadata survives row changes.
+  * Matrix dequantization uses the same VRF requests after quant work drains.
   */
 class EvuSpecialSequencer(p: EvuParams) extends Module {
   private val chunkBits = log2Ceil(p.vlenBits / p.dlenBits)
@@ -39,10 +38,17 @@ class EvuSpecialSequencer(p: EvuParams) extends Module {
     val matrix = new EvuMatrixSpecialIO(p)
   })
   val active = RegInit(false.B)
-  val completionPending = RegInit(false.B)
   val cmd = Reg(new EvuCommand(p))
-  val completion = RegInit(0.U.asTypeOf(new EvuCompletion(p)))
-  val flags = RegInit(0.U(5.W))
+  val commands = Module(new Queue(new EvuCommand(p), p.quantCommandDepth, pipe = true, hasFlush = true))
+  val completions = Module(new Queue(new EvuCompletion(p), p.quantCommandDepth, pipe = true, hasFlush = true))
+  class QuantBeat extends Bundle {
+    val target = UInt(9.W)
+    val last = Bool()
+    val completion = new EvuCompletion(p)
+  }
+  val metadata = Module(new Queue(new QuantBeat, 8, pipe = true, hasFlush = true))
+  Seq(commands.io.flush.get, completions.io.flush.get, metadata.io.flush.get).foreach(_ := io.flush)
+  val flags = RegInit(VecInit.fill(p.commandDepth)(0.U(5.W)))
   val readChunk = RegInit(VecInit.fill(2)(0.U((chunkBits + 1).W)))
   val issueChunk = RegInit(0.U((chunkBits + 1).W))
   val totalChunks = (cmd.vl +& (elements - 1).U) / elements.U
@@ -56,7 +62,22 @@ class EvuSpecialSequencer(p: EvuParams) extends Module {
   matrix.io.matrix <> io.matrix
   matrix.io.flush := io.flush
   matrix.io.invalidate := io.invalidate
-  matrix.io.startAllowed := !active && !completionPending && !io.command.valid
+  commands.io.enq.valid := io.command.valid && !matrix.io.active && !io.flush
+  commands.io.enq.bits := io.command.bits
+  io.command.ready := commands.io.enq.ready && !matrix.io.active && !io.flush
+  matrix.io.startAllowed := !active && !commands.io.deq.valid && !metadata.io.deq.valid &&
+    !completions.io.deq.valid && !io.command.valid
+  io.completion <> completions.io.deq
+  when(io.flush) { io.completion.valid := false.B }
+  def resultFor(command: EvuCommand): EvuCompletion = {
+    val result = WireDefault(0.U.asTypeOf(new EvuCompletion(p)))
+    result.pc := command.pc
+    result.opcode := command.opcode
+    result.vd := command.vd
+    result.jobId := command.jobId
+    result.epoch := command.epoch
+    result
+  }
 
   for (i <- 0 until 3) {
     io.vrf.read(i).valid := false.B
@@ -91,70 +112,72 @@ class EvuSpecialSequencer(p: EvuParams) extends Module {
     }
   }
   val scaleReady = Mux(scalarScale, scalarScaleValid, operands(1).io.deq.valid)
-  quant.io.in.valid := active && operands(0).io.deq.valid && scaleReady && !io.flush
+  quant.io.in.valid := active && operands(0).io.deq.valid && scaleReady && metadata.io.enq.ready && !io.flush
   quant.io.in.bits.input := operands(0).io.deq.bits
   quant.io.in.bits.scale := Mux(scalarScale, Fill(elements, scalarScaleData), operands(1).io.deq.bits)
   quant.io.in.bits.chunk := issueChunk(chunkBits - 1, 0)
   quant.io.in.bits.validLanes := VecInit((0 until elements).map(i =>
     issueChunk * elements.U + i.U < cmd.vl)).asUInt
-  operands(0).io.deq.ready := quant.io.in.ready && active && scaleReady && !io.flush
-  operands(1).io.deq.ready := quant.io.in.ready && active && operands(0).io.deq.valid && !io.flush && !scalarScale
-  when(quant.io.in.fire) { issueChunk := issueChunk + 1.U }
+  operands(0).io.deq.ready := quant.io.in.ready && active && scaleReady && metadata.io.enq.ready && !io.flush
+  operands(1).io.deq.ready := quant.io.in.ready && active && operands(0).io.deq.valid &&
+    metadata.io.enq.ready && !io.flush && !scalarScale
+  metadata.io.enq.valid := quant.io.in.fire
+  metadata.io.enq.bits.target := cmd.base(8, 0)
+  metadata.io.enq.bits.last := issueChunk +& 1.U === totalChunks
+  metadata.io.enq.bits.completion := resultFor(cmd)
+  when(quant.io.in.fire) {
+    issueChunk := issueChunk + 1.U
+    when(metadata.io.enq.bits.last) { active := false.B }
+  }
 
   val result = quant.io.out.bits
-  io.cuteWrite.valid := active && quant.io.out.valid && !io.flush
-  quant.io.out.ready := active && io.cuteWrite.ready && !io.flush
+  val beat = metadata.io.deq.bits
+  val outputAllowed = metadata.io.deq.valid && (!beat.last || completions.io.enq.ready)
+  io.cuteWrite.valid := quant.io.out.valid && outputAllowed && !io.flush
+  quant.io.out.ready := io.cuteWrite.ready && outputAllowed && !io.flush
+  metadata.io.deq.ready := io.cuteWrite.fire
   io.cuteWrite.bits := 0.U.asTypeOf(new EvuCuteWrite(p))
   if (p.dlenBits == 256) {
-    val row = cmd.base(8, 2)
+    val row = beat.target(8, 2)
     val offset = result.chunk.pad(2)(1, 0) << 3
-    io.cuteWrite.bits.matrixReg := cmd.base(1, 0)
+    io.cuteWrite.bits.matrixReg := beat.target(1, 0)
     io.cuteWrite.bits.bank := row(2, 0)
     io.cuteWrite.bits.entry := (row >> 3) * 2.U + (result.chunk >> 2)
     io.cuteWrite.bits.byteMask := (result.validLanes.pad(32) << offset)(31, 0)
     io.cuteWrite.bits.data := (result.data.pad(256) << (offset << 3))(255, 0)
   }
-  io.command.ready := !active && !completionPending && !matrix.io.active && !io.flush
-  io.completion.valid := completionPending && !io.flush
-  io.completion.bits := completion
-  io.busy := active || completionPending || matrix.io.busy || quant.io.busy
+  val incoming = commands.io.deq.bits
+  val rejected = incoming.opcode =/= EvuOpcode.FpQuantToCute ||
+    !EvuIsa.supportsElementWidth(incoming.opcode, incoming.sew) ||
+    incoming.base(63, 9).orR || incoming.vl > (64 min (p.vlenBits / 32)).U ||
+    (p.dlenBits != 256).B
+  val empty = incoming.vl === 0.U
+  val immediate = rejected || empty
+  val lastWrite = io.cuteWrite.fire && beat.last
+  commands.io.deq.ready := !active && !matrix.io.active && !io.flush &&
+    (!immediate || (completions.io.enq.ready && !lastWrite))
+  completions.io.enq.valid := lastWrite || (commands.io.deq.fire && immediate)
+  completions.io.enq.bits := Mux(lastWrite, beat.completion, resultFor(incoming))
+  completions.io.enq.bits.fflags := Mux(lastWrite, flags(beat.completion.jobId) | result.fflags, 0.U)
+  completions.io.enq.bits.exception := !lastWrite && rejected
+  completions.io.enq.bits.cause := Mux(!lastWrite && rejected, EvuFault.Illegal, EvuFault.None)
+  io.busy := active || commands.io.deq.valid || metadata.io.deq.valid ||
+    completions.io.deq.valid || matrix.io.busy || quant.io.busy
 
-  when(io.command.fire) {
-    cmd := io.command.bits
-    flags := 0.U
+  when(commands.io.deq.fire) {
+    cmd := incoming
+    flags(incoming.jobId) := 0.U
     scalarScaleValid := false.B
     issueChunk := 0.U
     readChunk.foreach(_ := 0.U)
-    completion := 0.U.asTypeOf(new EvuCompletion(p))
-    completion.pc := io.command.bits.pc
-    completion.opcode := io.command.bits.opcode
-    completion.vd := io.command.bits.vd
-    completion.jobId := io.command.bits.jobId
-    completion.epoch := io.command.bits.epoch
-    val rejected = io.command.bits.opcode =/= EvuOpcode.FpQuantToCute ||
-      !EvuIsa.supportsElementWidth(io.command.bits.opcode, io.command.bits.sew) ||
-      io.command.bits.base(63, 9).orR || io.command.bits.vl > (64 min (p.vlenBits / 32)).U ||
-      (p.dlenBits != 256).B
-    val empty = io.command.bits.vl === 0.U
     active := !rejected && !empty
-    completionPending := rejected || empty
-    completion.exception := rejected
-    completion.cause := Mux(rejected, EvuFault.Illegal, EvuFault.None)
   }
   when(io.cuteWrite.fire) {
-    flags := flags | result.fflags
-    // Completion includes this final accepted write's flags, not just older beats.
-    when((result.chunk +& 1.U) === totalChunks) {
-      active := false.B
-      completionPending := true.B
-      completion.fflags := flags | result.fflags
-    }
+    flags(beat.completion.jobId) := flags(beat.completion.jobId) | result.fflags
   }
-  when(io.completion.fire) { completionPending := false.B }
   when(io.flush) {
     active := false.B
-    completionPending := false.B
-    flags := 0.U
+    flags.foreach(_ := 0.U)
     scalarScaleValid := false.B
     issueChunk := 0.U
     readChunk.foreach(_ := 0.U)

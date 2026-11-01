@@ -10,7 +10,7 @@ import xiangshan.evu.common._
 
 class LSIQEntry(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams {
   val op = new VectorMemMacroOp
-  def bound_all = op.mop =/= mopUnit
+  def bound_all = op.mop =/= mopUnit || op.conservativeOrdering
   val bound_offset = UInt(pgIdxBits.W)
   val ld_dep_mask = Vec(vParams.vliqEntries, Bool())
   val st_dep_mask = Vec(vParams.vsiqEntries, Bool())
@@ -23,9 +23,15 @@ class LSIQEntry(implicit p: Parameters) extends CoreBundle()(p) with HasVectorPa
 
   }
   def overlaps(other: LSIQEntry) = {
-    (op.page === other.op.page) && (bound_all || other.bound_all || (
-      (op.base_offset <= other.bound_offset && bound_offset >= other.op.base_offset)
-    ))
+    // Compare complete ranges, including a unit-stride access crossing a page.
+    // Page-relative translated commands conservatively serialize with stores:
+    // two distinct virtual pages can alias the same physical page.
+    val start = Cat(op.page, op.base_offset)
+    val otherStart = Cat(other.op.page, other.op.base_offset)
+    val bytes = ((op.nf +& 1.U) * op.vl) << op.elem_size
+    val otherBytes = ((other.op.nf +& 1.U) * other.op.vl) << other.op.elem_size
+    bound_all || other.bound_all ||
+      (start < (otherStart +& otherBytes) && otherStart < (start +& bytes))
   }
 }
 
@@ -38,7 +44,8 @@ class IFQEntry(implicit p: Parameters) extends CoreBundle()(p) with HasVectorPar
   val page_offset = UInt(pgIdxBits.W)
 }
 
-class MemRequest(bytes: Int, tagBits: Int)(implicit p: Parameters) extends CoreBundle()(p) {
+class MemRequest(bytes: Int, tagBits: Int)(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams {
+  val vat = UInt(vParams.vatSz.W)
   val addr = UInt(coreMaxAddrBits.W)
   val data = UInt((bytes*8).W)
   val mask = UInt(bytes.W)
@@ -111,7 +118,7 @@ class VectorMemUnit(sgSize: Option[BigInt] = None)(implicit p: Parameters) exten
 
     val busy = Output(Bool())
     val storeCompleted = Output(Valid(UInt(vParams.vatSz.W)))
-    val requestsDone = Output(Bool())
+    val storePending = Output(Bool())
   })
 
   def ptrIncr(u: UInt, sz: Int): Unit = {
@@ -296,6 +303,7 @@ class VectorMemUnit(sgSize: Option[BigInt] = None)(implicit p: Parameters) exten
   load_arb.io.in(1).bits.store := false.B
   load_arb.io.in(0) <> lifq.io.replay
   load_arb.io.in(0).bits.addr := Cat(liq(lifq.io.replay_liq_id).op.page, lifq.io.replay.bits.addr(pgIdxBits-1,0))
+  load_arb.io.in(0).bits.vat := liq(lifq.io.replay_liq_id).op.vat
   when (io.dmem.store_req.valid) {
     load_arb.io.in(0).valid := false.B
     lifq.io.replay.ready := false.B
@@ -414,7 +422,11 @@ class VectorMemUnit(sgSize: Option[BigInt] = None)(implicit p: Parameters) exten
   // all beats. Keep the architectural completion tied to the final ordered Ack.
   io.storeCompleted.valid := siq_deq_fire
   io.storeCompleted.bits := siq(siq_deq_ptr).op.vat
-  io.requestsDone := liq_las_fire || (sifq.io.enq.fire && sifq.io.enq.bits.last)
+  // A buffered address with Ack capacity, or address generation that can
+  // advance now, provides a real successor. Keep the window across short VRF
+  // data gaps; the coalescer timeout bounds unresolved data dependencies.
+  io.storePending := (store_req_q.io.deq.valid && sifq.io.enq.ready) ||
+    (sas.io.req.valid && store_req_q.io.enq.ready)
 
   if (vParams.latencyInject) {
     val latency = Wire(UInt(32.W))

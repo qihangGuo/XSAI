@@ -29,7 +29,7 @@ class EvuMemoryComputeOverlapSpec extends AnyFlatSpec with ChiselScalatestTester
     val ep = EvuParams(enable = true, enableDifftest = true, vlenBits = 128,
       dlenBits = 64, mlenBits = 64, lanes = 1, dispatchDepth = 1,
       loadIssueDepth = 1, storeIssueDepth = 1, executeIssueDepth = 1,
-      specialIssueDepth = 1, loadResponseDepth = 8)
+      specialIssueDepth = 1, loadResponseDepth = 8, memoryCommandDepth = 1)
     test(LazyModule(new EvuSaturnMemoryTagHarness(ep, integerOverlapOnly = true)).module)
       .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
         dut.clock.setTimeout(3000)

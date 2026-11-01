@@ -45,11 +45,11 @@ class EvuHbl2LineAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with
         dut.clock.step()
         dut.io.client.req.valid.poke(false.B)
       }
-      def busRequest(addr: Int, write: Boolean, data: BigInt = 0): Unit = {
+      def busRequest(addr: Int, write: Boolean, data: BigInt = 0, logicalMask: BigInt = (BigInt(1) << 64) - 1): Unit = {
         await(dut.io.memory.req.valid)
         dut.io.memory.req.bits.addr.expect(addr.U)
         dut.io.memory.req.bits.bytes.expect(64.U)
-        dut.io.memory.req.bits.mask.expect(byteMask.U)
+        dut.io.memory.req.bits.mask.expect((if (write) logicalMask else byteMask).U)
         dut.io.memory.req.bits.write.expect(write.B)
         if (write) dut.io.memory.req.bits.data.expect(data.U)
         dut.clock.step(2)
@@ -73,13 +73,13 @@ class EvuHbl2LineAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with
       response(old0)
       val mask0 = BigInt("00ff00ff", 16) << (60 * 8)
       val merged0 = ((old0 & ~mask0) | ((payload << (60 * 8)) & mask0)) & lineMask
-      busRequest(0, write = true, merged0)
+      busRequest(0, write = true, merged0, BigInt(5) << 60)
       response(0)
       busRequest(64, write = false)
       response(old1)
       val mask1 = BigInt("00ff00ff", 16)
       val merged1 = (old1 & ~mask1) | ((payload >> 32) & mask1)
-      busRequest(64, write = true, merged1)
+      busRequest(64, write = true, merged1, BigInt(5))
       dut.io.client.resp.valid.expect(false.B)
       response(0)
       await(dut.io.client.resp.valid)

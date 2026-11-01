@@ -4,7 +4,7 @@ import chisel3._
 import chisel3.util._
 
 /** Cross-path reservations live until completion acceptance, not execution
-  * issue. Memory has a single owner; independent compute need not drain it.
+  * issue. Memory has a bounded command window; independent compute need not drain it.
   */
 class EvuCommandScoreboard(p: EvuParams) extends Module {
   private val jobBits = log2Ceil(p.commandDepth)
@@ -25,16 +25,19 @@ class EvuCommandScoreboard(p: EvuParams) extends Module {
     val memoryOrderStalls = Output(UInt(64.W))
     val registerHazardStalls = Output(UInt(64.W))
     val memoryComputeOverlap = Output(UInt(64.W))
+    val memoryOutstanding = Output(UInt(log2Ceil(p.memoryCommandDepth + 1).W))
   })
   private val valid = RegInit(VecInit.fill(p.commandDepth)(false.B))
   private val reads = Reg(Vec(p.commandDepth, UInt(p.vectorRegs.W)))
   private val writes = Reg(Vec(p.commandDepth, UInt(p.vectorRegs.W)))
   private val chainable = Reg(Vec(p.commandDepth, Bool()))
-  private val memoryLive = RegInit(false.B)
-  private val memoryJobId = Reg(UInt(jobBits.W))
+  private val memoryJobs = RegInit(VecInit.fill(p.commandDepth)(false.B))
+  val memoryCount = PopCount(memoryJobs)
+  val memoryLive = memoryCount =/= 0.U
+  io.memoryOutstanding := memoryCount
   val busyReads = valid.zip(reads).map { case (v, m) => Mux(v, m, 0.U) }.reduce(_ | _)
   val busyWrites = valid.zip(writes).map { case (v, m) => Mux(v, m, 0.U) }.reduce(_ | _)
-  val ordered = !io.isMemory || !memoryLive
+  val ordered = !io.isMemory || memoryCount < p.memoryCommandDepth.U
   val protectedJobs = valid.zip(chainable).map { case (v, c) =>
     v && !(p.egChaining.B && io.chainable && c)
   }
@@ -50,12 +53,12 @@ class EvuCommandScoreboard(p: EvuParams) extends Module {
   val overlap = RegInit(0.U(64.W))
   when(io.commandValid && !ordered) { orderStalls := orderStalls + 1.U }
   when(io.commandValid && ordered && !independent) { registerStalls := registerStalls + 1.U }
-  when(memoryLive && valid.zipWithIndex.map { case (v, i) => v && i.U =/= memoryJobId }.reduce(_ || _)) {
+  when(memoryLive && valid.zip(memoryJobs).map { case (v, m) => v && !m }.reduce(_ || _)) {
     overlap := overlap + 1.U
   }
   when(io.release.valid) {
     valid(io.release.bits) := false.B
-    when(memoryLive && io.release.bits === memoryJobId) { memoryLive := false.B }
+    memoryJobs(io.release.bits) := false.B
   }
   when(io.accept) {
     assert(io.allowed, "EVU accepted a command across a reservation or memory-order hazard")
@@ -64,11 +67,11 @@ class EvuCommandScoreboard(p: EvuParams) extends Module {
     reads(io.jobId) := io.readMask
     writes(io.jobId) := io.writeMask
     chainable(io.jobId) := io.chainable
-    when(io.isMemory) { memoryLive := true.B; memoryJobId := io.jobId }
+    memoryJobs(io.jobId) := io.isMemory
   }
   when(io.flush) {
     valid.foreach(_ := false.B)
-    memoryLive := false.B
+    memoryJobs.foreach(_ := false.B)
     orderStalls := 0.U
     registerStalls := 0.U
     overlap := 0.U

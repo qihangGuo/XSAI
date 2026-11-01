@@ -365,6 +365,7 @@ case class VectorParams(
   vrfBanking: Int = 8,
   debugVrf: Boolean = false,
   reductionContexts: Int = 1,
+  interleaveReductions: Boolean = false,
 
   issStructure: VectorIssueStructure = VectorIssueStructure.Unified,
 

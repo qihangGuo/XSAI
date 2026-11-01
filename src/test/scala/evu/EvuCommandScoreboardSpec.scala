@@ -10,8 +10,53 @@ import xiangshan.evu._
 class EvuCommandScoreboardSpec extends AnyFlatSpec with ChiselScalatestTester with Matchers {
   behavior of "Production EVU cross-command reservations"
 
+  for (depth <- Seq(2, 4)) {
+    it should s"bound $depth memory jobs independently of compute and retain ownership until completion" in {
+      test(new EvuCommandScoreboard(EvuParams(enable = true, memoryCommandDepth = depth)))
+        .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+          dut.io.commandValid.poke(true.B)
+          dut.io.readMask.poke(1.U)
+          dut.io.writeMask.poke(0.U)
+          dut.io.matrixReadMask.poke(0.U)
+          dut.io.isMemory.poke(true.B)
+          dut.io.chainable.poke(true.B)
+          dut.io.accept.poke(false.B)
+          dut.io.release.valid.poke(false.B)
+          dut.io.release.bits.poke(0.U)
+          dut.io.flush.poke(false.B)
+          for (job <- 0 until depth) {
+            dut.io.jobId.poke(job.U)
+            dut.io.memoryOutstanding.expect(job.U)
+            dut.io.allowed.expect(true.B)
+            dut.io.accept.poke(true.B)
+            dut.clock.step()
+          }
+          dut.io.accept.poke(false.B)
+          dut.io.memoryOutstanding.expect(depth.U)
+          dut.io.allowed.expect(false.B)
+          dut.io.isMemory.poke(false.B)
+          dut.io.allowed.expect(true.B)
+          dut.io.release.valid.poke(true.B)
+          dut.io.release.bits.poke((depth - 1).U)
+          dut.clock.step()
+          dut.io.release.valid.poke(false.B)
+          dut.io.isMemory.poke(true.B)
+          dut.io.allowed.expect(true.B)
+          dut.io.memoryOutstanding.expect((depth - 1).U)
+          dut.io.chainable.poke(false.B)
+          dut.io.writeMask.poke(1.U)
+          dut.io.allowed.expect(false.B) // Conservative cross-path WAR guard.
+          dut.io.flush.poke(true.B)
+          dut.clock.step()
+          dut.io.flush.poke(false.B)
+          dut.io.memoryOutstanding.expect(0.U)
+          dut.io.allowed.expect(true.B)
+        }
+    }
+  }
+
   it should "overlap independent compute and one memory owner without relaxing RAW WAR WAW or matrix reads" in {
-    test(new EvuCommandScoreboard(EvuParams(enable = true)))
+    test(new EvuCommandScoreboard(EvuParams(enable = true, memoryCommandDepth = 1)))
       .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
         dut.io.commandValid.poke(false.B)
         dut.io.readMask.poke(0.U)
@@ -97,7 +142,7 @@ class EvuCommandScoreboardSpec extends AnyFlatSpec with ChiselScalatestTester wi
   }
 
   it should "delegate ordinary pairs to EG hazards while retaining special and matrix protection" in {
-    test(new EvuCommandScoreboard(EvuParams(enable = true)))
+    test(new EvuCommandScoreboard(EvuParams(enable = true, memoryCommandDepth = 1)))
       .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
         dut.io.commandValid.poke(true.B)
         dut.io.readMask.poke(0.U)

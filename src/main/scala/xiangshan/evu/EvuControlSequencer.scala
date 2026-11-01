@@ -61,6 +61,8 @@ object EvuOpcode {
 }
 
 class EvuMemoryRequest(p: EvuParams) extends Bundle {
+  val jobId = UInt(log2Ceil(p.commandDepth).W)
+  val epoch = UInt(2.W)
   val addr  = UInt(64.W)
   val data  = UInt(p.mlenBits.W)
   // Byte enables for the logical MLEN request, including partial stores.

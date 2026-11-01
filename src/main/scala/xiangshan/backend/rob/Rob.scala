@@ -200,7 +200,8 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
    * Enqueue (from dispatch)
    */
   // special cases
-  val hasBlockBackward = RegInit(false.B)
+  private val backwardBarrier = Module(new RobEnqueueBarrier)
+  val hasBlockBackward = backwardBarrier.io.blocked
   val hasWaitForward = RegInit(false.B)
   val enqPtr = enqPtrVec(0)
   val deqPtr = deqPtrVec(0)
@@ -450,11 +451,11 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
     io.toDecode.commitMcfg := 0.U.asTypeOf(io.toDecode.commitMcfg)
   }
 
-  // When blockBackward instruction leaves Rob (commit or walk), hasBlockBackward should be set to false.B
-  // To reduce registers usage, for hasBlockBackward cases, we allow enqueue after ROB is empty.
-  when(isEmpty && !amuBuffer.map(_.io.evuBusy).getOrElse(false.B)) {
-    hasBlockBackward := false.B
-  }
+  // Ordinary EVU memory has already passed non-speculative preflight when it
+  // retires. Let the next command enter while its external Ack is outstanding.
+  // WAIT/FENCE, configuration and other backward barriers still drain EVU.
+  backwardBarrier.io.robEmpty := isEmpty
+  backwardBarrier.io.evuBusy := amuBuffer.map(_.io.evuBusy).getOrElse(false.B)
   // When any instruction commits, hasNoSpecExec should be set to false.B
   when(io.commits.hasWalkInstr || io.commits.hasCommitInstr) {
     hasWaitForward := false.B
@@ -513,10 +514,17 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
     }
   }
 
+  backwardBarrier.io.enqueue.valid := false.B
+  backwardBarrier.io.enqueue.bits := false.B
   for (i <- 0 until RenameWidth) {
     val enqUop = io.enq.req(i)
     when(enqUop.valid && enqUop.bits.blockBackward && io.enq.canAccept) {
-      hasBlockBackward := true.B
+      backwardBarrier.io.enqueue.valid := true.B
+      val f7 = enqUop.bits.instr(31, 25)
+      val ordinaryEvuMemory = p(ExternalVectorKey).enable.B &&
+        enqUop.bits.fuType === FuType.evu.U &&
+        (xiangshan.evu.EvuIsa.isLoad(f7) || xiangshan.evu.EvuIsa.isStore(f7))
+      backwardBarrier.io.enqueue.bits := ordinaryEvuMemory
     }
   }
 
@@ -643,7 +651,8 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
   val deqPtrEntryValid = deqPtrEntry.commit_v
   val deqHasFlushed = RegInit(false.B)
   val intrBitSetReg = RegNext(io.csr.intrBitSet)
-  val intrEnable = intrBitSetReg && !hasWaitForward && deqPtrEntry.interrupt_safe && !deqHasFlushed && !io.evuBusy
+  val evuTrapBlocked = amuBuffer.map(_.io.evuCommittedBusy).getOrElse(false.B)
+  val intrEnable = intrBitSetReg && !hasWaitForward && deqPtrEntry.interrupt_safe && !deqHasFlushed && !evuTrapBlocked
   val deqNeedFlush = deqPtrEntry.needFlush && deqPtrEntry.commit_v && deqPtrEntry.commit_w
   val deqHitExceptionGenState = exceptionDataRead.valid && exceptionDataRead.bits.robIdx === deqPtr
   val deqNeedFlushAndHitExceptionGenState = deqNeedFlush && deqHitExceptionGenState
@@ -654,8 +663,8 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
   val deqHasReplayInst = deqNeedFlushAndHitExceptionGenState && exceptionDataRead.bits.replayInst
   val deqIsVlsException = deqHasException && deqPtrEntry.isVls && !exceptionDataRead.bits.isEnqExcp
   val deqIsVlsFlushPipe = deqHasFlushPipe && deqPtrEntry.isVls
-  val deqCanException = deqHasException && (!deqIsVlsException || deqVlsCanCommit)
-  val deqCanFlushPipe = deqHasFlushPipe && (!deqIsVlsFlushPipe || deqVlsCanCommit)
+  val deqCanException = deqHasException && (!deqIsVlsException || deqVlsCanCommit) && !evuTrapBlocked
+  val deqCanFlushPipe = deqHasFlushPipe && (!deqIsVlsFlushPipe || deqVlsCanCommit) && !evuTrapBlocked
   // delay 2 cycle wait exceptionGen out
   // vls exception can be committed only when RAB commit all its reg pairs
   deqVlsCanCommit := RegNext(RegNext((deqIsVlsException || deqIsVlsFlushPipe) && deqPtrEntry.commit_w)) && rab.io.status.commitEnd

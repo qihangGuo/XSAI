@@ -34,13 +34,18 @@ class ExecuteSequencerIO(maxDepth: Int, nFUs: Int)(implicit p: Parameters) exten
   val acc_merge = Output(Bool())
 }
 
-class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs: Int)(implicit p: Parameters) extends Sequencer[ExecuteMicroOp]()(p) {
+class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs: Int,
+    ordinaryOnly: Boolean = false, val reductionOnly: Boolean = false)(implicit p: Parameters) extends Sequencer[ExecuteMicroOp]()(p) {
   def usesPerm = supported_insns.count(_.props.contains(UsesGatherUnit.Y)) > 0
   def usesAcc = supported_insns.count(_.props.contains(Reduction.Y)) > 0
   def usesRvd = supported_insns.count(_.props.contains(ReadsVD.Y)) > 0
   def usesCompress = supported_insns.count(_.props.contains(F6(OPMFunct6.compress))) > 0
 
-  def accepts(inst: VectorIssueInst) = !inst.vmu && new VectorDecoder(inst, supported_insns, Nil).matched
+  def accepts(inst: VectorIssueInst) = {
+    val ctrl = new VectorDecoder(inst, supported_insns, Seq(Reduction))
+    !inst.vmu && ctrl.matched && (!ordinaryOnly.B || !ctrl.bool(Reduction)) &&
+      (!reductionOnly.B || ctrl.bool(Reduction))
+  }
 
   val io = IO(new ExecuteSequencerIO(maxPipeDepth, nFUs))
 
@@ -318,7 +323,21 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   exu_scheduler.io.reqs(0).depth := pipe_stages
 
   val wvd_eg = getEgId(inst.rd, Mux(inst.reduction, 0.U, eidx), vd_eew, inst.writes_mask)
-  io.pipe_write_req.request := valid && pipelined && exu_scheduler.io.reqs(0).available
+  val read_slide_buffer = slide && Mux(slide_up,
+    next_eidx > slide_offset,
+    eidx +& slide_offset < inst.vconfig.vtype.vlMax)
+  val read_eidx_buffer = rgather_v || rgatherei16
+  val operandsReady = valid && !data_hazard &&
+    !(renv1 && !(rvs1Captured || io.rvs1.req.fire)) &&
+    !(renv2 && !(rvs2Captured || io.rvs2.req.fire)) &&
+    !(renvd && !(rvdCaptured || io.rvd.req.fire)) &&
+    !(renvm && !(rvmCaptured || io.rvm.req.fire)) &&
+    !(read_slide_buffer && !io.vgu.slide_req.ready) &&
+    !(read_eidx_buffer && !io.vgu.gather_eidx.valid) &&
+    !(renacc && !io.acc_valid)
+  // A stalled consumer must not win a speculative bank reservation over the
+  // reduction producing its operands, especially when both share one FU.
+  io.pipe_write_req.request := operandsReady && pipelined && exu_scheduler.io.reqs(0).available
   io.pipe_write_req.bank_sel := (if (vrfBankBits == 0) 1.U else UIntToOH(vrfBank(wvd_eg), vParams.vrfBanking))
   io.pipe_write_req.pipe_depth := pipe_stages
   io.pipe_write_req.oldest := oldest
@@ -328,25 +347,12 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     io.pipe_write_req.bank_sel := ~(0.U(vParams.vrfBanking.W))
   }
 
-  val read_slide_buffer = slide && Mux(slide_up,
-    next_eidx > slide_offset,
-    eidx +& slide_offset < inst.vconfig.vtype.vlMax)
-  val read_eidx_buffer = rgather_v || rgatherei16
-
   io.vgu.slide_req.bits.head := (if (usesPerm) slide_head else 0.U)
   io.vgu.slide_req.bits.tail := (if (usesPerm) slide_tail else 0.U)
 
-  val iss_valid = (valid &&
-    !data_hazard &&
-    !(renv1 && !(rvs1Captured || io.rvs1.req.fire)) &&
-    !(renv2 && !(rvs2Captured || io.rvs2.req.fire)) &&
-    !(renvd && !(rvdCaptured || io.rvd.req.fire)) &&
-    !(renvm && !(rvmCaptured || io.rvm.req.fire)) &&
-    !(read_slide_buffer && !io.vgu.slide_req.ready) &&
-    !(read_eidx_buffer && !io.vgu.gather_eidx.valid) &&
+  val iss_valid = (operandsReady &&
     !(pipelined && !io.pipe_write_req.available) &&
-    !(pipelined && !exu_scheduler.io.reqs(0).available) &&
-    !(renacc && !io.acc_valid)
+    !(pipelined && !exu_scheduler.io.reqs(0).available)
   )
   io.vgu.slide_req.valid := iss_valid && read_slide_buffer && io.iss.ready && usesPerm.B
   io.vgu.gather_eidx.ready := iss_valid && read_eidx_buffer && io.iss.ready && usesPerm.B

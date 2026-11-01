@@ -15,7 +15,9 @@ object EvuDecoder extends DecodeConstants {
 
   private def op(funct7: Int, scalarBase: Boolean = false): (BitPat, XSDecodeBase) = {
     val src = if (scalarBase) SrcType.reg else SrcType.no
-    // Keep the address space stable from preflight through the final memory Ack.
+    // Memory preflight remains non-speculative. The ROB releases an ordinary
+    // memory backward barrier at scalar retirement; context changes and traps
+    // separately drain retired EVU work through the final memory Ack.
     val barrier = Set(0x10, 0x11, 0x18, 0x19, 0x1a, 0x45, 0x46, 0x52, 0x53).contains(funct7)
     xv(funct7) -> XSDecode(src, SrcType.no, SrcType.X, FuType.evu,
       funct7.U, SelImm.IMM_EVU, UopSplitType.X, xWen = false, noSpec = barrier, blockBack = barrier)

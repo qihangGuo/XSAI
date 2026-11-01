@@ -14,6 +14,7 @@ class EvuMemoryTagRouter(p: EvuParams) extends Module {
     val lookupOwner = Output(Bool())
     val busy = Output(Bool())
     val tagStall = Output(Bool())
+    val occupancy = Output(UInt(log2Ceil(p.maxMemOutstanding + 1).W))
   })
   val live = RegInit(VecInit.fill(p.maxMemOutstanding)(false.B))
   val owner = Reg(Vec(p.maxMemOutstanding, Bool()))
@@ -62,4 +63,5 @@ class EvuMemoryTagRouter(p: EvuParams) extends Module {
   io.lookupOwner := owner(io.lookupTag)
   io.busy := live.asUInt.orR || draining
   io.tagStall := arbiter.io.out.valid && !free.orR && !io.flush && !draining
+  io.occupancy := PopCount(live)
 }

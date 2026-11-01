@@ -13,6 +13,7 @@ import xiangshan.evu.insns.{HasVectorDecoderSignals}
 class VectorMemMacroOp(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams {
   val debug_id = UInt(debugIdSz.W)
   val vat = UInt(vParams.vatSz.W)
+  val conservativeOrdering = Bool()
 
   val base_offset = UInt(pgIdxBits.W)
   val page        = UInt((paddrBits - pgIdxBits).W)
@@ -40,6 +41,7 @@ class VectorMemMacroOp(implicit p: Parameters) extends CoreBundle()(p) with HasV
 
 // Bundle between VDQ and Backend
 class VectorIssueInst(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams with HasVectorDecoderSignals {
+  val conservativeMemoryOrdering = Bool()
   val pc = UInt(vaddrBitsExtended.W)
   val bits = UInt(32.W)
   val vconfig = new VConfig
@@ -298,6 +300,17 @@ class PipeHazard(pipe_depth: Int)(implicit p: Parameters) extends CoreBundle()(p
   val eg = UInt(log2Ceil(egsTotal).W)
   val vat = UInt(vParams.vatSz.W)
   def eg_oh = UIntToOH(eg)
+}
+
+class EvuExecutionPerf extends Bundle {
+  val fmaIssue = UInt(64.W)
+  val fmaNoWork = UInt(64.W)
+  val fmaOperandWait = UInt(64.W)
+  val fmaFeedbackWait = UInt(64.W)
+  val fmaInterleave = UInt(64.W)
+  val reductionFull = UInt(64.W)
+  val expIssue = UInt(64.W)
+  val divIssue = UInt(64.W)
 }
 
 class SequencerHazard(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams {

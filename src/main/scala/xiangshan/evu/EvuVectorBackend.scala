@@ -48,11 +48,12 @@ class EvuVectorBackendIO(p: EvuParams) extends Bundle {
   val matrixOutput = Decoupled(new MatrixMicroBlock(p))
   val matrixFflags = Output(UInt(5.W))
   val vrfPerf = Output(new xiangshan.evu.backend.VrfPerf)
+  val executionPerf = Output(new xiangshan.evu.common.EvuExecutionPerf)
   val memoryOrderStalls = Output(UInt(64.W))
   val registerHazardStalls = Output(UInt(64.W))
   val memoryComputeOverlap = Output(UInt(64.W))
-  val memoryCommandStart = Output(Valid(UInt(log2Ceil(p.commandDepth).W)))
-  val memoryCommandEnd = Output(Bool())
+  val memoryOutstanding = Output(UInt(log2Ceil(p.memoryCommandDepth + 1).W))
+  val memoryStorePending = Output(Bool())
 }
 
 /**
@@ -87,7 +88,8 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     enableOOO = true,
     pipelinedVatClear = true,
     issStructure = if (p.splitFpIssue) xiangshan.evu.common.VectorIssueStructure.SplitFP else VectorParams.lgvParams.issStructure,
-    reductionContexts = p.reductionContexts
+    reductionContexts = p.reductionContexts,
+    interleaveReductions = p.interleaveReductions
   )
   private implicit val saturnP: Parameters = EvuVectorParameters(
     xsParameters,
@@ -105,6 +107,7 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   private val special = Module(new EvuSpecialSequencer(p))
   io.debugVrf.foreach(_ := saturn.io.debugVrf.get)
   io.vrfPerf := saturn.io.vrfPerf
+  io.executionPerf := saturn.io.executionPerf
   val cmd = io.command.bits
   val localVl = Mux(cmd.aux(6), Mux(cmd.vl === 0.U || io.vstart =/= 0.U, 0.U, 1.U), cmd.vl)
   private val zeroCompletionPending = RegInit(false.B)
@@ -143,9 +146,12 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   ).map(opcode === _).reduce(_ || _)
 
   val isMemory = cmd.opcode === EvuOpcode.Load || cmd.opcode === EvuOpcode.Store
-  io.memoryCommandStart.valid := io.command.fire && isMemory
-  io.memoryCommandStart.bits := cmd.jobId
-  io.memoryCommandEnd := saturn.io.memoryRequestsDone
+  val nextVat = RegInit(0.U(saturnParams.vatSz.W))
+  // Store operand release is earlier than physical completion. Keep metadata
+  // reserved independently so a wrapped VAT cannot overwrite an Ack owner.
+  val contextLive = RegInit(VecInit.fill(vatEntries)(false.B))
+  val contextAvailable = !contextLive(nextVat)
+  io.memoryStorePending := saturn.io.memoryStorePending
   val isExp2 = cmd.opcode === EvuOpcode.Exp2
   val isGatherImm = cmd.opcode === EvuOpcode.GatherImm
   val supportedWidth = EvuIsa.supportsElementWidth(cmd.opcode, cmd.sew)
@@ -276,9 +282,8 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
       commandWriteMask := registerGroup(cmd.vd, destinationRegisters)
     }
   }
-  // One memory command at a time owns virtualBase/error state. Independent
-  // arithmetic may run on either side of it, but all cross-command register
-  // RAW/WAR/WAW and matrix scale-read reservations remain conservative.
+  // Bound memory commands independently of arithmetic. Ordinary Saturn pairs
+  // retain EG hazards; special and matrix paths retain whole-register guards.
   reservations.io.commandValid := io.command.valid
   reservations.io.readMask := commandReadMask
   reservations.io.writeMask := commandWriteMask
@@ -294,6 +299,7 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   io.memoryOrderStalls := reservations.io.memoryOrderStalls
   io.registerHazardStalls := reservations.io.registerHazardStalls
   io.memoryComputeOverlap := reservations.io.memoryComputeOverlap
+  io.memoryOutstanding := reservations.io.memoryOutstanding
 
   // Matrix/CUTE consumes scale and bias through the same VRF. It has no
   // architectural write, but its read reservation must remain until the
@@ -307,14 +313,14 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     !io.command.valid && !io.flush
 
   saturn.io.issue.valid := io.command.valid && isSaturnOpcode(cmd.opcode) &&
-    !isSpecialOpcode && !immediateCompletion && supportedWidth && commandHazardFree && !io.flush
+    !isSpecialOpcode && !immediateCompletion && supportedWidth && commandHazardFree && contextAvailable && !io.flush
   special.io.command.valid := io.command.valid && isSpecialOpcode && supportedWidth &&
     commandHazardFree && !io.flush
   special.io.invalidate := io.command.fire && commandWriteMask.orR
   special.io.command.bits := cmd
   val backendReady = Mux(immediateCompletion, !zeroCompletionPending,
     Mux(isSpecialOpcode, special.io.command.ready && supportedWidth,
-      saturn.io.issue.ready && isSaturnOpcode(cmd.opcode) && supportedWidth &&
+      saturn.io.issue.ready && contextAvailable && isSaturnOpcode(cmd.opcode) && supportedWidth &&
         cmd.vl =/= 0.U && !io.flush))
   io.command.ready := backendReady && commandHazardFree && !io.flush
   saturn.io.issue.bits := 0.U.asTypeOf(saturn.io.issue.bits)
@@ -337,6 +343,7 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   // Mapped commands use a page-relative address internally, avoiding any
   // truncation of canonical virtual addresses to Saturn's physical width.
   saturn.io.issue.bits.page := Mux(cmd.pageMap.enabled, 0.U, cmd.base >> 12)
+  saturn.io.issue.bits.conservativeMemoryOrdering := cmd.pageMap.enabled
   saturn.io.issue.bits.rm := 0.U
   saturn.io.issue.bits.emul := 0.U
   saturn.io.issue.bits.fast_sg := false.B
@@ -344,13 +351,24 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
 
   // The dispatcher allocates VATs in-order. Mirroring its tail at command
   // acceptance lets an out-of-order VAT release recover the original job ID.
-  val nextVat = RegInit(0.U(saturnParams.vatSz.W))
   val jobIdByVat = Reg(Vec(vatEntries, UInt(log2Ceil(p.commandDepth).W)))
   val pcByVat = Reg(Vec(vatEntries, UInt(64.W)))
   val memoryByVat = Reg(Vec(vatEntries, Bool()))
   val opcodeByVat = Reg(Vec(vatEntries, UInt(8.W)))
   val vdByVat = Reg(Vec(vatEntries, UInt(p.regIndexWidth.W)))
   val epochByVat = Reg(Vec(vatEntries, UInt(2.W)))
+  val pageMapByVat = Reg(Vec(vatEntries, new EvuPageMap(p)))
+  val virtualBaseByVat = Reg(Vec(vatEntries, UInt(64.W)))
+  val memoryErrorAddress = RegInit(VecInit.fill(vatEntries)(0.U(64.W)))
+  val memoryErrorSticky = RegInit(VecInit.fill(vatEntries)(false.B))
+  val memoryFaultSticky = RegInit(VecInit.fill(vatEntries)(EvuFault.None))
+  // The final store Ack can release its VAT in the same cycle. Forward its
+  // error into completion rather than waiting for the sticky registers.
+  val returningMemoryFault = Wire(Valid(new Bundle {
+    val vat = UInt(saturnParams.vatSz.W)
+    val address = UInt(64.W)
+    val cause = UInt(4.W)
+  }))
   when(io.command.fire) {
     when (immediateCompletion) {
       zeroCompletionReg.pc := cmd.pc
@@ -372,12 +390,18 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     }
   }
   when(saturn.io.issue.fire) {
+    assert(!contextLive(nextVat), "EVU reused metadata before physical completion")
+    contextLive(nextVat) := true.B
     pcByVat(nextVat) := cmd.pc
     memoryByVat(nextVat) := isMemory
     jobIdByVat(nextVat) := cmd.jobId
     opcodeByVat(nextVat) := cmd.opcode
     vdByVat(nextVat) := cmd.vd
     epochByVat(nextVat) := cmd.epoch
+    pageMapByVat(nextVat) := cmd.pageMap
+    virtualBaseByVat(nextVat) := Mux(cmd.pageMap.enabled, cmd.base & ~4095.U(64.W), 0.U)
+    memoryErrorSticky(nextVat) := false.B
+    memoryFaultSticky(nextVat) := EvuFault.None
     nextVat := nextVat + 1.U
   }
   when(io.flush) { nextVat := 0.U }
@@ -394,20 +418,22 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
       completedVxsat(release.bits) := saturn.io.completionVxsat(i)
     }
   }
-  val memoryErrorAddress = RegInit(0.U(64.W))
-  val memoryErrorSticky = RegInit(false.B)
-  val memoryFaultSticky = RegInit(EvuFault.None)
   val visibleReleases = pendingReleases | releasedThisCycle
   val completionVat = PriorityEncoder(visibleReleases)
+  val completionFaultNow = returningMemoryFault.valid && returningMemoryFault.bits.vat === completionVat
+  val completionMemoryError = memoryErrorSticky(completionVat) || completionFaultNow
   val saturnCompletion = Wire(Decoupled(new EvuCompletion(p)))
   saturnCompletion.valid := visibleReleases.orR && !io.flush
   saturnCompletion.bits.opcode := opcodeByVat(completionVat)
   saturnCompletion.bits.vd := vdByVat(completionVat)
   saturnCompletion.bits.pc := pcByVat(completionVat)
-  saturnCompletion.bits.tval := memoryErrorAddress
-  saturnCompletion.bits.tvalValid := memoryByVat(completionVat) && memoryErrorSticky
-  saturnCompletion.bits.exception := memoryByVat(completionVat) && memoryErrorSticky
-  saturnCompletion.bits.cause := Mux(memoryByVat(completionVat), memoryFaultSticky, EvuFault.None)
+  saturnCompletion.bits.tval := Mux(memoryErrorSticky(completionVat),
+    memoryErrorAddress(completionVat), Mux(completionFaultNow, returningMemoryFault.bits.address, 0.U))
+  saturnCompletion.bits.tvalValid := memoryByVat(completionVat) && completionMemoryError
+  saturnCompletion.bits.exception := memoryByVat(completionVat) && completionMemoryError
+  saturnCompletion.bits.cause := Mux(memoryByVat(completionVat) && completionMemoryError,
+    Mux(memoryErrorSticky(completionVat), memoryFaultSticky(completionVat), returningMemoryFault.bits.cause),
+    EvuFault.None)
   val releasingCompletion = saturn.io.completed.map(r => r.valid && r.bits === completionVat)
   saturnCompletion.bits.fflags := Mux(releasingCompletion.reduce(_ || _),
     Mux1H(releasingCompletion, saturn.io.completionFflags), completedFflags(completionVat))
@@ -441,19 +467,21 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     matrixHazardCount := matrixHazardCount - 1.U
   }
   when(io.flush) {
+    contextLive.foreach(_ := false.B)
     pendingReleases := 0.U
-    memoryErrorSticky := false.B
+    memoryErrorSticky.foreach(_ := false.B)
     zeroCompletionPending := false.B
-    memoryFaultSticky := EvuFault.None
+    memoryFaultSticky.foreach(_ := EvuFault.None)
     matrixHazardRead.foreach(_ := 0.U)
     matrixHazardCount := 0.U
     matrixHazardHead := 0.U
     matrixHazardTail := 0.U
   }.otherwise {
+    when(saturnCompletion.fire) { contextLive(completionVat) := false.B }
     pendingReleases := visibleReleases & ~Mux(saturnCompletion.fire, UIntToOH(completionVat, vatEntries), 0.U(vatEntries.W))
     when(saturnCompletion.fire && memoryByVat(completionVat)) {
-      memoryErrorSticky := false.B
-      memoryFaultSticky := EvuFault.None
+      memoryErrorSticky(completionVat) := false.B
+      memoryFaultSticky(completionVat) := EvuFault.None
     }
   }
 
@@ -467,6 +495,7 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   // Saturn queue indices can be wider than the external HBL2 source IDs.
   val hblLocalTag = Reg(Vec(p.maxMemOutstanding, chiselTypeOf(saturn.io.dmem.load_req.bits.tag)))
   val hblDrop = RegInit(VecInit.fill(p.maxMemOutstanding)(false.B))
+  val hblVat = Reg(Vec(p.maxMemOutstanding, UInt(saturnParams.vatSz.W)))
   private val saturnSlots = p.maxMemOutstanding
   require(saturnSlots > 0)
   // These are client-local IDs; EvuMemoryTagRouter allocates global sources
@@ -475,16 +504,20 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   val hasFreeTag = freeMask.orR
   val freeTag = PriorityEncoder(freeMask)
   val chooseStore = !saturn.io.dmem.load_req.valid && saturn.io.dmem.store_req.valid
-  val virtualBase = RegInit(0.U(64.W))
-  when(io.command.fire && isMemory) {
-    virtualBase := Mux(cmd.pageMap.enabled, cmd.base & ~4095.U(64.W), 0.U)
-  }
+  val requestVat = Mux(chooseStore, saturn.io.dmem.store_req.bits.vat, saturn.io.dmem.load_req.bits.vat)
+  val requestVirtualAddress = virtualBaseByVat(requestVat) +
+    (Mux(chooseStore, saturn.io.dmem.store_req.bits.addr, saturn.io.dmem.load_req.bits.addr) &
+      ~(p.mlenBytes - 1).U(64.W))
+  val translate = Module(new EvuPageTranslate(p))
+  translate.io.pageMap := pageMapByVat(requestVat)
+  translate.io.vaddr := requestVirtualAddress & ~63.U(64.W)
 
   io.memory.req.valid := hasFreeTag &&
     (saturn.io.dmem.load_req.valid || saturn.io.dmem.store_req.valid) && !io.flush
-  io.memory.req.bits.addr := virtualBase +
-    (Mux(chooseStore, saturn.io.dmem.store_req.bits.addr, saturn.io.dmem.load_req.bits.addr) &
-      ~(p.mlenBytes - 1).U(64.W))
+  io.memory.req.bits.addr := translate.io.paddr | requestVirtualAddress(5, 0)
+  io.memory.req.bits.jobId := jobIdByVat(requestVat)
+  io.memory.req.bits.epoch := epochByVat(requestVat)
+  when(io.memory.req.valid) { assert(translate.io.legal, "VMU request escaped its preflight page map") }
   io.memory.req.bits.data := Mux(chooseStore, saturn.io.dmem.store_req.bits.data, 0.U)
   io.memory.req.bits.mask := Mux(chooseStore, saturn.io.dmem.store_req.bits.mask,
     ((BigInt(1) << p.mlenBytes) - 1).U)
@@ -494,7 +527,8 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   saturn.io.dmem.store_req.ready := io.memory.req.ready && hasFreeTag && chooseStore && !io.flush
 
   when(io.memory.req.fire) {
-    hblAddress(freeTag) := io.memory.req.bits.addr
+    hblAddress(freeTag) := requestVirtualAddress
+    hblVat(freeTag) := requestVat
     hblInFlight(freeTag) := true.B
     hblDrop(freeTag) := false.B
     hblIsStore(freeTag) := chooseStore
@@ -516,15 +550,20 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     true.B,
     Mux(responseStore, saturn.io.dmem.store_ack.ready, saturn.io.dmem.load_resp.ready)
   )
+  returningMemoryFault.valid := io.memory.resp.fire && io.memory.resp.bits.error && !responseDrop && !io.flush
+  returningMemoryFault.bits.vat := hblVat(responseTag)
+  returningMemoryFault.bits.address := hblAddress(responseTag)
+  returningMemoryFault.bits.cause := io.memory.resp.bits.fault
   when(io.memory.resp.fire) {
     // Cancelled responses still reclaim their tags, but cannot fault a new
     // memory owner after flush (or resurrect a fault on the flush edge).
-    when(io.memory.resp.bits.error && !responseDrop && !io.flush) {
-      when(!memoryErrorSticky) {
-        memoryErrorAddress := hblAddress(responseTag)
-        memoryFaultSticky := io.memory.resp.bits.fault
+    when(returningMemoryFault.valid && !(saturnCompletion.fire && completionVat === hblVat(responseTag))) {
+      val vat = hblVat(responseTag)
+      when(!memoryErrorSticky(vat)) {
+        memoryErrorAddress(vat) := hblAddress(responseTag)
+        memoryFaultSticky(vat) := io.memory.resp.bits.fault
       }
-      memoryErrorSticky := true.B
+      memoryErrorSticky(vat) := true.B
     }
     hblInFlight(responseTag) := false.B
     hblDrop(responseTag) := false.B

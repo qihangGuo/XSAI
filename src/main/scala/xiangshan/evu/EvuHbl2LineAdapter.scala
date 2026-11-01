@@ -5,6 +5,8 @@ import chisel3.util._
 
 /** Up to 64 logical bytes; the HBL2-facing instance always carries a full aligned line. */
 class EvuLineMemoryRequest(p: EvuParams) extends Bundle {
+  val jobId = UInt(log2Ceil(p.commandDepth).W)
+  val epoch = UInt(2.W)
   val addr = UInt(64.W)
   val data = UInt(512.W)
   val mask = UInt(64.W)
@@ -39,6 +41,7 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
     val memory = new EvuLineMemoryIO(p)
     val flush = Input(Bool())
     val busy = Output(Bool())
+    val partialWrite = Output(Bool())
   })
 
   private val n = p.maxMemOutstanding
@@ -101,14 +104,20 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
     arbiter.io.in(i).valid := !io.flush && (states(i) === readReq || states(i) === writeReq)
     arbiter.io.in(i).bits.addr := (requests(i).addr & ~63.U(64.W)) + Mux(second(i), 64.U, 0.U)
     arbiter.io.in(i).bits.data := putData(i)
-    arbiter.io.in(i).bits.mask := Fill(64, 1.U(1.W))
+    // Bus writes are still PutFullData. Retain the logical byte mask solely
+    // for exact difftest attribution after cross-command store combining.
+    arbiter.io.in(i).bits.mask := Mux(states(i) === writeReq, partMask(i), Fill(64, 1.U(1.W)))
     arbiter.io.in(i).bits.bytes := 64.U
     arbiter.io.in(i).bits.write := states(i) === writeReq
     arbiter.io.in(i).bits.tag := i.U
+    arbiter.io.in(i).bits.jobId := requests(i).jobId
+    arbiter.io.in(i).bits.epoch := requests(i).epoch
     when(arbiter.io.in(i).fire) {
       states(i) := Mux(states(i) === readReq, readWait, writeWait)
     }
   }
+  io.partialWrite := io.client.req.fire && incoming.write && incoming.mask.orR &&
+    (!incoming.mask.andR || incoming.bytes =/= 64.U || incoming.addr(5, 0) =/= 0.U)
 
   val responses = Module(new RRArbiter(new EvuLineMemoryResponse(p), n))
   io.client.resp <> responses.io.out

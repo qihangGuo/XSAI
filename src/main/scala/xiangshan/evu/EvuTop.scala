@@ -72,6 +72,18 @@ class EvuPerf extends Bundle {
   val memoryComputeOverlap = UInt(64.W)
   val vmuLoadMerges = UInt(64.W)
   val vmuStoreMerges = UInt(64.W)
+  val vmuCommandCycles = UInt(64.W)
+  val vmuCommandPeak = UInt(64.W)
+  val memoryTagCycles = UInt(64.W)
+  val memoryTagPeak = UInt(64.W)
+  val memoryGets = UInt(64.W)
+  val memoryPuts = UInt(64.W)
+  val vmuPartialWrites = UInt(64.W)
+  val vmuBufferFull = UInt(64.W)
+  val vmuAckWait = UInt(64.W)
+  val vmuEntryStalls = UInt(64.W)
+  val jobFullCycles = UInt(64.W)
+  val execution = new xiangshan.evu.common.EvuExecutionPerf
 }
 
 /** Architectural job states exported to the scalar/AMU side. */
@@ -118,7 +130,6 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   private val jobEpochs        = RegInit(VecInit.fill(ep.commandDepth)(0.U(2.W)))
   private val nextJobId        = RegInit(0.U(log2Ceil(ep.commandDepth).W))
   private val currentEpoch     = RegInit(0.U(2.W))
-  private val activePageMap = RegInit(0.U.asTypeOf(new EvuPageMap(ep)))
   // EVU-local RVV state.  It is architectural state of the single Saturn
   // vector unit, not a second vector register file.
   private val rvvConfigured = RegInit(false.B)
@@ -161,10 +172,11 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   val launchCanStart = commandArbiter.io.out.bits.opcode =/= EvuOpcode.Launch || !matrixJobActive
   val vectorMemoryCommand = commandArbiter.io.out.bits.opcode === EvuOpcode.Load ||
     commandArbiter.io.out.bits.opcode === EvuOpcode.Store
-  val memoryCanStart = !vectorMemoryCommand || !vmuLineBusy
+  // The backend owns the bounded command window and per-command translations.
+  // Old responses may drain while the next independent command starts.
   val issuedCommand = Wire(Decoupled(new EvuCommand(ep)))
   issuedCommand.valid := commandArbiter.io.out.valid && !io.flush && hasJobSlot && launchCanStart &&
-    !control.io.blockYounger && memoryCanStart
+    !control.io.blockYounger
   issuedCommand.bits := commandArbiter.io.out.bits
   issuedCommand.bits.jobId := nextJobId
   issuedCommand.bits.epoch := currentEpoch
@@ -223,7 +235,7 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   // Backend readiness alone is insufficient because a long Saturn
   // operation can hold a completion for many cycles.
   commandArbiter.io.out.ready := issuedCommand.ready && !io.flush &&
-    hasJobSlot && launchCanStart && !control.io.blockYounger && memoryCanStart
+    hasJobSlot && launchCanStart && !control.io.blockYounger
   val completionArbiter = Module(new Arbiter(new EvuCompletion(ep), 2))
   completionArbiter.io.in(0) <> control.io.completion
   when(control.io.completion.bits.exception) {
@@ -268,10 +280,6 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
     when(!io.completion.bits.exception) { rvvVstart := 0.U }
   }
   when(issuedCommand.fire) {
-    when(issuedCommand.bits.opcode === EvuOpcode.Load || issuedCommand.bits.opcode === EvuOpcode.Store ||
-      issuedCommand.bits.opcode === EvuOpcode.Launch) {
-      activePageMap := issuedCommand.bits.pageMap
-    }
     acceptedOrder(acceptedTail) := nextJobId
     acceptedTail := acceptedTail + 1.U
   }
@@ -410,7 +418,6 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
     matrixJobActive := false.B
     matrixStickyError := false.B
     matrixStickyFflags := 0.U
-    activePageMap := 0.U.asTypeOf(activePageMap)
   }
 
   bus.b.ready := false.B
@@ -429,8 +436,8 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   val vmuLines = Module(new EvuVmuLineCoalescer(ep))
   vmuLineBusy := vmuLines.io.busy
   vmuLines.io.flush := io.flush
-  vmuLines.io.start := vectorBackend.io.memoryCommandStart
-  vmuLines.io.end := vectorBackend.io.memoryCommandEnd
+  vmuLines.io.storePending := vectorBackend.io.memoryStorePending
+  vmuLines.io.drain := io.drain.request.valid || control.io.blockYounger
   tagRouter.io.flush := io.flush
   tagRouter.io.adapterBusy := lineAdapter.io.busy
   tagRouter.io.clients(0) <> matrixStores.io.memory
@@ -444,6 +451,8 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   vectorReq.bits.bytes := ep.mlenBytes.U
   vectorReq.bits.write := vectorBackend.io.memory.req.bits.write
   vectorReq.bits.tag := vectorBackend.io.memory.req.bits.tag
+  vectorReq.bits.jobId := vectorBackend.io.memory.req.bits.jobId
+  vectorReq.bits.epoch := vectorBackend.io.memory.req.bits.epoch
   val vectorResp = vmuLines.io.client.resp
   vectorBackend.io.memory.resp.valid := vectorResp.valid
   vectorBackend.io.memory.resp.bits.data := vectorResp.bits.data
@@ -457,22 +466,14 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   lineAdapter.io.flush := io.flush
 
   val physicalReq = lineAdapter.io.memory.req
-  // A cancelled request may still be queued at WidthWidget while a later
-  // command changes activePageMap. Keep translation with its global source
-  // until the corresponding physical transactions have drained.
-  val requestPageMaps = Reg(Vec(ep.maxMemOutstanding, new EvuPageMap(ep)))
-  when(memReq.fire) { requestPageMaps(memReq.bits.tag) := activePageMap }
-  val translation = Module(new EvuPageTranslate(ep))
-  translation.io.pageMap := requestPageMaps(physicalReq.bits.tag)
-  // CUTE matrix output remains a privileged physical-address producer.
+  // VMU translation precedes physical-line merging. Matrix requests already
+  // carry physical addresses; neither path consumes a global mutable map.
   tagRouter.io.lookupTag := physicalReq.bits.tag
-  translation.io.pageMap.enabled := requestPageMaps(physicalReq.bits.tag).enabled && tagRouter.io.lookupOwner
-  translation.io.vaddr := physicalReq.bits.addr
-  val physicalAddress = translation.io.paddr
+  val physicalAddress = physicalReq.bits.addr
   val (getLegal, getReq) = edge.Get(physicalReq.bits.tag, physicalAddress, 6.U)
   val (putLegal, putReq) = edge.Put(physicalReq.bits.tag, physicalAddress, 6.U,
     physicalReq.bits.data)
-  val legal = translation.io.legal && edge.manager.containsSafe(physicalAddress) &&
+  val legal = edge.manager.containsSafe(physicalAddress) &&
     Mux(physicalReq.bits.write, putLegal, getLegal)
   // Keep reads on ordinary D. Matrix reads would instead use CUTE's sideband.
   getReq.user.lift(MatrixKey).foreach(_ := 0.U)
@@ -504,7 +505,7 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
     val tag = physicalReq.bits.tag
     physicalStores(tag).addr := physicalAddress
     physicalStores(tag).data := physicalReq.bits.data
-    physicalStores(tag).mask := Fill(64, 1.U(1.W))
+    physicalStores(tag).mask := Mux(tagRouter.io.lookupOwner, physicalReq.bits.mask, Fill(64, 1.U(1.W)))
     tracedStore(tag) := physicalReq.bits.write
   }
   io.storeTrace.valid := bus.d.fire && tracedStore(bus.d.bits.source) &&
@@ -519,8 +520,8 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   }
 
   io.busy := control.io.busy || vectorBackend.io.busy ||
-    dispatchAdapter.io.out.valid || io.dispatch.valid || lineAdapter.io.busy || jobValid.asUInt.orR ||
-    matrixJobActive || matrixStores.io.busy || tagRouter.io.busy || io.matrixInput.valid ||
+    dispatchAdapter.io.out.valid || io.dispatch.valid || memoryBusy || jobValid.asUInt.orR ||
+    matrixJobActive || matrixStores.io.busy || io.matrixInput.valid ||
     completionQueue.valid
   val drainPending = RegInit(false.B)
   io.drain.request.ready := !drainPending && !io.flush
@@ -622,4 +623,54 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   io.perf.memoryComputeOverlap := vectorBackend.io.memoryComputeOverlap
   io.perf.vmuLoadMerges := perfVmuLoadMerges
   io.perf.vmuStoreMerges := perfVmuStoreMerges
+  val jobFullCycles = RegInit(0.U(64.W))
+  when(io.flush) { jobFullCycles := 0.U }
+    .elsewhen(commandArbiter.io.out.valid && !hasJobSlot) { jobFullCycles := jobFullCycles + 1.U }
+  io.perf.jobFullCycles := jobFullCycles
+  io.perf.execution := vectorBackend.io.executionPerf
+
+  // Occupancy sums are tag-cycles/command-cycles, not transaction counts.
+  val events = Seq(
+    "command_cycles" -> vectorBackend.io.memoryOutstanding,
+    "tag_cycles" -> tagRouter.io.occupancy,
+    "get" -> (bus.a.fire && !physicalReq.bits.write).asUInt,
+    "put" -> (bus.a.fire && physicalReq.bits.write).asUInt,
+    "partial" -> (lineAdapter.io.partialWrite && tagRouter.io.clients(1).req.fire).asUInt,
+    "buffer_full" -> vmuLines.io.bufferFull.asUInt,
+    "ack_wait" -> vmuLines.io.ackWait.asUInt,
+    "entry_stall" -> (issuedCommand.valid && vectorMemoryCommand && !vectorBackend.io.command.ready).asUInt
+  )
+  val memoryCounters = events.map { case (_, increment) =>
+    val counter = RegInit(0.U(64.W))
+    when(io.flush) { counter := 0.U }.otherwise { counter := counter + increment }
+    counter
+  }
+  val commandPeak = RegInit(0.U(64.W))
+  val tagPeak = RegInit(0.U(64.W))
+  when(io.flush) { commandPeak := 0.U; tagPeak := 0.U }.otherwise {
+    commandPeak := commandPeak.max(vectorBackend.io.memoryOutstanding)
+    tagPeak := tagPeak.max(tagRouter.io.occupancy)
+  }
+  io.perf.vmuCommandCycles := memoryCounters(0)
+  io.perf.memoryTagCycles := memoryCounters(1)
+  io.perf.memoryGets := memoryCounters(2)
+  io.perf.memoryPuts := memoryCounters(3)
+  io.perf.vmuPartialWrites := memoryCounters(4)
+  io.perf.vmuBufferFull := memoryCounters(5)
+  io.perf.vmuAckWait := memoryCounters(6)
+  io.perf.vmuEntryStalls := memoryCounters(7)
+  io.perf.vmuCommandPeak := commandPeak
+  io.perf.memoryTagPeak := tagPeak
+  if (ep.enableDifftest) {
+    // Optional simulation-only snapshots at a completed FENCE. Subtract
+    // adjacent snapshots around a kernel; no performance CSR/ISA change.
+    val trace = freechips.rocketchip.util.PlusArg("evu_mem_trace", width = 1)
+    val fenceIndex = RegInit(0.U(32.W))
+    when(io.completion.fire && io.completion.bits.opcode === EvuOpcode.Fence) {
+      fenceIndex := fenceIndex + 1.U
+      when(trace.asBool) {
+        printf(p"[EVU-VMU] fence=${fenceIndex} t=${perfCycles} cmd=${memoryCounters(0)} tag=${memoryCounters(1)} get=${memoryCounters(2)} put=${memoryCounters(3)} partial=${memoryCounters(4)} full=${memoryCounters(5)} ack=${memoryCounters(6)} entry=${memoryCounters(7)} win=${vectorBackend.io.memoryOrderStalls} merge=${perfVmuStoreMerges}\n")
+      }
+    }
+  }
 }

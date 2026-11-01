@@ -2,7 +2,85 @@
 
 整理日期：2026-10-26；最近实测分析更新：2026-10-28。
 
-最新阶段检查点见 [2026-10-28 预热与正确性记录](checkpoints/2026-10-28-flash-warm-300289.md)：`scalar_batched_v3` 预热后为 **300,289 周期**，两次完整内核均通过两套独立 FP64 校验及 difftest，GOOD TRAP、`pending=0`。相对历史核内 RVV 的 322,302 周期少 6.83%，加速比约 1.073 倍，比较的是同一算子的整套软硬件方案。此前 cold 结果为 323,025 周期；下文各阶段的旧结果和待验收说明保留为历史记录，最新验收以该检查点为准。配套源码使用两个主仓库及 difftest 的同名 tag `checkpoint/evu-flash-warm-300289-20261028`。
+最新已测阶段检查点见 [2026-10-28 预热与正确性记录](checkpoints/2026-10-28-flash-warm-300289.md)：`scalar_batched_v3` 预热后为 **300,289 周期**，两次完整内核均通过两套独立 FP64 校验及 difftest，GOOD TRAP、`pending=0`。相对历史核内 RVV 的 322,302 周期少 6.83%，加速比约 1.073 倍，比较的是同一算子的整套软硬件方案。此前 cold 结果为 323,025 周期；下文各阶段的旧结果和待验收说明保留为历史记录，最新服务器验收以该检查点为准。配套源码使用两个主仓库及 difftest 的同名 tag `checkpoint/evu-flash-warm-300289-20261028`。当前在开发的 v4 不属于该 tag 的已测结果。
+
+## 2026-10-28 本轮实现：软件 v4 与三项 RTL 调度优化
+
+本轮仅修改 `XSAI_external_vector`，不新增 ISA、不修改 NEMU 或核内 RVV。
+默认 cold 入口仍为 `flash_attention_evu_profile_cold.c`，通过 include 链使用
+`scalar_batched_v4`，一次完整 Q128/KV256/D64，无预热、无 FP64、无 baseline，
+保持 21 个阶段样本。以下是代码实现范围，不是服务器周期验收结果。
+
+### 测试算法优化方法
+
+1. 第二 tile 的 alpha 保存为 `row_alpha[Q]`，在输出更新执行独立 FP32
+   `old_output * alpha`，再依次加 PV0、PV1，最后乘最终倒数。不替换为 FMA，
+   保留原舍入顺序。删除约 64 KiB 逻辑 output 读写，增加 alpha 的 512 B
+   存储和 512 B 读取；不能将逻辑字节量直接换算为缓存行或周期收益。
+2. 最后一个 tile 的行和确定后提前计算并保存 `row_reciprocal[Q]`，归一化时
+   读取它。仍为 512 次量化比例除法和 128 次最终倒数，目标是与其他行重叠。
+   四行准备拆成分批 load、max、state 三步，而非逐行完成整串操作。
+3. 两个 score chunk 分别归约 max，保留它们并计算
+   `max_exp = exp2(FP32(chunk_max - row_max))`。score max 归约从 256 次变为
+   512 次，概率 max 从 512 次变为 0，sum 仍 512 次；总归约 1280→1024，
+   同时新增 512 次单元素 exp2，不能宣称净省 512 次归约。
+
+三个独立消融开关为 `EVU_FLASH_FUSE_ALPHA`、`EVU_FLASH_EARLY_RECIP`、
+`EVU_FLASH_CHUNK_MAX`，默认随 `EVU_FLASH_SCALAR_OPS=1` 开启；都不新增
+VL 切换。Makefile 用包含三个开关的对象目录及非默认镜像名隔离配置。
+`correct_warm` 和原 FP64 测试通过共享内核同步生效，精度阈值未修改。
+
+### 硬件 RTL 优化方法
+
+1. `AMUCtrlBuffer` 的 `issuePtr` 与按序完成/回收的 `deqPtr` 分离，使已退休的
+   独立命令不再受完成头附近一个 CommitWidth 窗口限制。WAIT/FENCE 继续
+   阻塞年轻命令，直到完成与状态流水排空；redirect 重扫但跳过已接受项。
+   屏障期间普通标量项仍可回收，issue 指针须追平 nextDeqPtr，避免停在已清空项。
+   默认 `commandDepth/completionDepth` 从 8 增为 16，可用参数关闭独立下发。
+2. FMA/比较路径为普通指令及各归约分配独立 sequencer，动态分配归约上下文。
+   各归约保留原四个部分累加 slot、合并与 fold 顺序，带 VAT 的返回路由不变；
+   通过 RR 仲裁共享原物理 FU 和结果通道，预约不同延迟的返回拍，不增加 FMA。
+   只有真正赢得 FU 握手的归约才将 accumulator 标为 busy。逻辑 VRF 请求者
+   增多，但物理 bank 数、SRAM 容量和每 bank 的 **1RW** 属性不变。
+   写预约只在操作数就绪后参与，避免未就绪的消费者挡住正在生成其操作数的归约。
+3. 量化加入默认 4 项命令队列与完成队列、8 项 beat 元数据队列。当前行最后
+   一次量化输入被接收后即可准备下一行，不必等旧行最后 CUTE 写返回；每拍携带
+   target、last、job、PC、epoch，flags 按 job 累计。完成仍以该行最后一次 CUTE
+   写握手为准，完成队列满则背压；flush 清队列和流水。矩阵反量化仍等量化排空。
+
+新增入口窗口、job 满、FMA 发射/空闲/等待、归约上下文满、exp/div 发射计数。
+`fmaInterleave` 仅计连续两拍不同 VAT 的归约发射；`fmaOperandWait` 为 sequencer
+有工作但无候选发射的总等待，并非纯 VRF bank 冲突；`fmaFeedbackWait` 为任一
+归约等待 accumulator 可用的周期，各项会重叠，不能相加当作周期分解。
+这些计数从 reset 开始累计，job 满计数另在 flush 时清零，不是仅内核区间。
+
+### 本地检查与服务器验收边界
+
+- 临时 AST 调度检查已通过 54 种软件配置、各连续两次，检查有序表达式、
+  未初始化读取、比例/行和/量化/最终输出和有效操作数；矩阵/归约视为不透明节点。
+- `scripts/check_flash_chunk_max.py` 调用现有 NEMU 动态库的纯 `vfexp2_compute`，
+  不执行 CPU。512 个固定输入 chunk、2048 个随机 chunk、19328 个边界三点
+  检查通过，边界逆序为零；这是有限抽查，不是完整 FP32 单调性证明。
+- 最终完整 `mill -i xiangshan.compile` 通过。生产 VLEN4096/DLEN256 的
+  内存 CHIRRTL 检查通过，确认新增 sequencer 接线及 1RW SRAM 实例保留。
+- 共享 FMA 定向 Treadle 使用生产 ExecuteSequencer、SpecialSequencer、FMA 和
+  共享发射仲裁，两个 sum 在操作数背压下交错，结果与 flags 正确；与标量源、
+  归约返回路由组合共 4 项通过。全后端 Treadle 展开过慢，未完成该集成仿真，
+  保留为 `EVU_FULL_BACKEND_TREADLE=1` 的可选用例，不能将其计作通过。
+- AMU 20 条命令越过旧窗口，以及原完成/redirect/预检查用例通过；新增
+  fence 后越过 12 个普通标量项的恢复下发用例独立重跑通过，共覆盖 3 个用例。
+- 新增四行量化队列测试通过，覆盖 CUTE/完成背压、不同行目标与 flags、
+  VL9 尾行及 flush。既有量化、量化接线、归约返回的 8 项组合也已通过。
+  未就绪操作数不参加写预约的 2 项回归通过。
+- 四个 FlashAttention 入口的 RISC-V Clang `-fsyntax-only` 检查通过。
+  未运行本地 emu，未编译 guest/native bin，未生成 Verilog。
+  完整输出数值与周期仍须服务器验收，以上定向检查不是整核 difftest。
+
+服务器需重建匹配 RTL 的 emu，然后重建原 cold 目标，确认 banner 为 v4、
+`alpha_fused=1 early_reciprocal=1 chunk_max_reuse=1`、21 样本、`profile_errors=0`、
+GOOD TRAP、difftest 无 mismatch、`pending=0`。先与旧 cold 323,025 周期比较，
+不能将新 cold 与旧 warm 直接当作同条件优化量。随后运行 `correct_warm`，
+要求两遍输出均通过原 FP64 阈值，再与旧 warm 300,289 周期比较。
 
 本文记录 Flash Attention 核内 RVV + AME 实现与外挂 EVU 实现的差异，并按测试算法、硬件 RTL 两条路线列出后续优化方法。除明确标为已完成的改动外，以下内容均为优化建议，不表示已经实现或已经测得相应收益。源码行号以整理时的版本为准，后续修改可能使其偏移。
 

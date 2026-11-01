@@ -37,8 +37,25 @@ enum { Q = 128, KV = 256, D = 64, TILE = 128, CHUNK = 64 };
 #if EVU_FLASH_SCALAR_OPS != 0 && EVU_FLASH_SCALAR_OPS != 1
 #error "EVU_FLASH_SCALAR_OPS must be 0 or 1"
 #endif
+#ifndef EVU_FLASH_FUSE_ALPHA
+#define EVU_FLASH_FUSE_ALPHA EVU_FLASH_SCALAR_OPS
+#endif
+#ifndef EVU_FLASH_EARLY_RECIP
+#define EVU_FLASH_EARLY_RECIP EVU_FLASH_SCALAR_OPS
+#endif
+#ifndef EVU_FLASH_CHUNK_MAX
+#define EVU_FLASH_CHUNK_MAX EVU_FLASH_SCALAR_OPS
+#endif
+#if (EVU_FLASH_FUSE_ALPHA != 0 && EVU_FLASH_FUSE_ALPHA != 1) || \
+    (EVU_FLASH_EARLY_RECIP != 0 && EVU_FLASH_EARLY_RECIP != 1) || \
+    (EVU_FLASH_CHUNK_MAX != 0 && EVU_FLASH_CHUNK_MAX != 1)
+#error "EVU_FLASH_FUSE_ALPHA, EVU_FLASH_EARLY_RECIP and EVU_FLASH_CHUNK_MAX must be 0 or 1"
+#endif
+#if (EVU_FLASH_FUSE_ALPHA || EVU_FLASH_EARLY_RECIP || EVU_FLASH_CHUNK_MAX) && !EVU_FLASH_SCALAR_OPS
+#error "The new schedules require instruction-local scalar operations"
+#endif
 #if EVU_FLASH_SCALAR_OPS
-#define FA_KERNEL_NAME "scalar_batched_v3"
+#define FA_KERNEL_NAME "scalar_batched_v4"
 #define FA_LOAD_E0(vd, addr) XV_LOAD_E0(vd, addr)
 #define FA_STORE_E0(vd, addr) XV_STORE_E0(vd, addr)
 #define FA_FADD_E0(vd, a, b) XV_FADD_E0(vd, a, b)
@@ -92,6 +109,12 @@ static float scores[Q][TILE] ALIGN, pv[FA_PV_BUFFERS][Q][TILE] ALIGN, output[Q][
  */
 static float row_max[Q][CHUNK] ALIGN, row_sum[Q] ALIGN;
 static float p_scale[2][Q] ALIGN;
+#if EVU_FLASH_FUSE_ALPHA
+static float row_alpha[Q] ALIGN;
+#endif
+#if EVU_FLASH_EARLY_RECIP
+static float row_reciprocal[Q] ALIGN;
+#endif
 static float constants[6][TILE] ALIGN, qk_scale[TILE] ALIGN, value_scale[TILE] ALIGN;
 #ifndef EVU_FLASH_SKIP_REFERENCE
 static double golden[Q][D] ALIGN, quantized_golden[Q][D] ALIGN;
@@ -185,128 +208,6 @@ static void qk_matrix(unsigned key_base) {
   EVU_FLASH_PHASE_END(QK_WAIT_DRAIN);
 }
 
-/* Compile-time register assignment: P0/P1 v0..v7, max v8..v11,
- * alpha/inverse scale v12..v15, running sum v16..v19, sum1 v20..v23,
- * shared scratch v24/v25, constants v26..v31. Once both score chunks
- * become probabilities, max can be reused for max_exp; alpha is dead
- * after the scalar sum update and becomes inverse_scale. No cross-row
- * reduction or VL>64 probability packing is used.
- */
-#if EVU_FLASH_ROW_BATCH >= 2
-#define FA_ROW_1(OP) OP(1, 2, 3, 9, 13, 17, 21)
-#else
-#define FA_ROW_1(OP)
-#endif
-#if EVU_FLASH_ROW_BATCH == 4
-#define FA_ROW_23(OP) OP(2, 4, 5, 10, 14, 18, 22) OP(3, 6, 7, 11, 15, 19, 23)
-#else
-#define FA_ROW_23(OP)
-#endif
-#define FA_ROWS(OP) OP(0, 0, 1, 8, 12, 16, 20) FA_ROW_1(OP) FA_ROW_23(OP)
-
-#if EVU_FLASH_SCALAR_OPS
-#define FA_PREPARE_ROW(lane, p0, p1, max, alpha, sum, sum1) do { \
-  const unsigned row = base + (lane); \
-  XV_LOAD(p0, scores[row], 2); \
-  XV_LOAD(p1, scores[row] + CHUNK, 2); \
-  XV_FMAX(24, p0, p1, 2); \
-  XV_FREDUCE_MAX(max, 26, 24, 2); \
-  if (!first) { \
-    XV_LOAD_E0(25, row_max[row]); \
-    XV_FMAX_E0(max, 25, max); \
-    XV_FSUB_E0(alpha, max, 25); \
-    XV_EXP2_E0(alpha, alpha); \
-    XV_LOAD(24, output[row], 2); \
-    XV_FMUL_SCALAR(24, alpha, 24); \
-    XV_STORE(24, output[row], 2); \
-  } \
-  XV_STORE_E0(max, row_max[row]); \
-} while (0);
-#else
-#define FA_PREPARE_ROW(lane, p0, p1, max, alpha, sum, sum1) do { \
-  const unsigned row = base + (lane); \
-  XV_LOAD(p0, scores[row], 2); \
-  XV_LOAD(p1, scores[row] + CHUNK, 2); \
-  XV_FMAX(24, p0, p1, 2); \
-  XV_FREDUCE_MAX(max, 26, 24, 2); \
-  XV_BROADCAST(max, max, 2); \
-  if (!first) { \
-    XV_LOAD(25, row_max[row], 2); \
-    XV_FMAX(max, 25, max, 2); \
-    XV_FSUB(alpha, max, 25, 2); \
-    XV_EXP2(alpha, alpha, 2); \
-    XV_LOAD(24, output[row], 2); \
-    XV_FMUL(24, alpha, 24, 2); \
-    XV_STORE(24, output[row], 2); \
-  } \
-  XV_STORE(max, row_max[row], 2); \
-} while (0);
-#endif
-
-#define FA_SUBTRACT_P0(lane, p0, p1, max, alpha, sum, sum1) FA_FSUB_SCALAR(p0, max, p0);
-#define FA_SUBTRACT_P1(lane, p0, p1, max, alpha, sum, sum1) FA_FSUB_SCALAR(p1, max, p1);
-#define FA_EXP_P0(lane, p0, p1, max, alpha, sum, sum1) XV_EXP2(p0, p0, 2);
-#define FA_EXP_P1(lane, p0, p1, max, alpha, sum, sum1) XV_EXP2(p1, p1, 2);
-#define FA_REDUCE_P0(lane, p0, p1, max, alpha, sum, sum1) do { \
-  XV_FREDUCE_SUM(sum, 27, p0, 2); \
-  XV_FREDUCE_MAX(max, 27, p0, 2); \
-} while (0);
-#define FA_SCALAR_P0(lane, p0, p1, max, alpha, sum, sum1) do { \
-  const unsigned row = base + (lane); \
-  if (!first) { \
-    FA_LOAD_E0(24, &row_sum[row]); \
-    FA_FMUL_E0(24, alpha, 24); \
-    FA_FADD_E0(sum, sum, 24); \
-  } \
-  FA_FMUL_E0(24, 29, max); \
-  FA_STORE_E0(24, &p_scale[0][row]); \
-  FA_FMAX_E0(max, 31, max); \
-  FA_FDIV_E0(alpha, max, 28); \
-} while (0);
-#define FA_QUANTIZE_P0(lane, p0, p1, max, alpha, sum, sum1) do { \
-  FA_QUANTIZE(((base + (lane)) << 2) | 1, alpha, p0); \
-} while (0);
-#define FA_REDUCE_P1(lane, p0, p1, max, alpha, sum, sum1) do { \
-  XV_FREDUCE_SUM(sum1, 27, p1, 2); \
-  XV_FREDUCE_MAX(max, 27, p1, 2); \
-} while (0);
-#define FA_SCALAR_P1(lane, p0, p1, max, alpha, sum, sum1) do { \
-  const unsigned row = base + (lane); \
-  FA_FADD_E0(sum, sum1, sum); \
-  FA_STORE_E0(sum, &row_sum[row]); \
-  FA_FMUL_E0(24, 29, max); \
-  FA_STORE_E0(24, &p_scale[1][row]); \
-  FA_FMAX_E0(max, 31, max); \
-  FA_FDIV_E0(alpha, max, 28); \
-} while (0);
-#define FA_QUANTIZE_P1(lane, p0, p1, max, alpha, sum, sum1) do { \
-  FA_QUANTIZE(((base + (lane)) << 2) | 2, alpha, p1); \
-} while (0);
-
-static void softmax_quantize_rows(unsigned key_base) {
-  const unsigned first = key_base == 0;
-  EVU_FLASH_PHASE_BEGIN(ROW_SOFTMAX_QUANTIZE, key_base / TILE, -1);
-  for (unsigned base = 0; base < Q; base += EVU_FLASH_ROW_BATCH) {
-    FA_ROWS(FA_PREPARE_ROW)
-    FA_ROWS(FA_SUBTRACT_P0)
-    FA_ROWS(FA_SUBTRACT_P1)
-    FA_ROWS(FA_EXP_P0)
-    FA_ROWS(FA_EXP_P1)
-    FA_ROWS(FA_REDUCE_P0)
-    FA_BEGIN_SCALARS();
-    FA_ROWS(FA_SCALAR_P0)
-    FA_END_SCALARS();
-    FA_ROWS(FA_QUANTIZE_P0)
-    FA_ROWS(FA_REDUCE_P1)
-    FA_BEGIN_SCALARS();
-    FA_ROWS(FA_SCALAR_P1)
-    FA_END_SCALARS();
-    FA_ROWS(FA_QUANTIZE_P1)
-  }
-  sync_evu();
-  EVU_FLASH_PHASE_END(ROW_SOFTMAX_QUANTIZE);
-}
-
 static void pv_matrix(unsigned key_base, unsigned chunk) {
   EVU_FLASH_PHASE_BEGIN(PV_PACK, key_base / TILE, chunk);
   // Keep V layout adaptation and zero padding inside end-to-end timing.
@@ -336,92 +237,13 @@ static void pv_matrix(unsigned key_base, unsigned chunk) {
   EVU_FLASH_PHASE_END(PV_WAIT_DRAIN);
 }
 
-#if EVU_FLASH_MERGE_PV
-#define FA_ADD_SECOND_PV(p0, p1, row) do { \
-  XV_LOAD(p1, pv[1][row], 2); \
-  XV_FADD(p0, p0, p1, 2); \
-} while (0)
-#else
-#define FA_ADD_SECOND_PV(p0, p1, row) do {} while (0)
-#endif
-#define FA_OUTPUT_ROW(lane, p0, p1, max, alpha, sum, sum1) do { \
-  const unsigned row = base + (lane); \
-  if (first) { \
-    XV_LOAD(p0, pv[0][row], 2); \
-    XV_FADD(p0, 27, p0, 2); \
-  } else { \
-    XV_LOAD(p0, output[row], 2); \
-    XV_LOAD(p1, pv[0][row], 2); \
-    XV_FADD(p0, p0, p1, 2); \
-  } \
-  FA_ADD_SECOND_PV(p0, p1, row); \
-} while (0);
-#define FA_NORMALIZE_SCALAR(lane, p0, p1, max, alpha, sum, sum1) do { \
-  FA_LOAD_E0(alpha, &row_sum[base + (lane)]); \
-  FA_FDIV_E0(alpha, alpha, 30); \
-} while (0);
-#if EVU_FLASH_SCALAR_OPS
-#define FA_NORMALIZE_VECTOR(lane, p0, p1, max, alpha, sum, sum1) \
-  XV_FMUL_SCALAR(p0, alpha, p0);
-#else
-#define FA_NORMALIZE_VECTOR(lane, p0, p1, max, alpha, sum, sum1) do { \
-  XV_BROADCAST(alpha, alpha, 2); \
-  XV_FMUL(p0, alpha, p0, 2); \
-} while (0);
-#endif
-#define FA_STORE_OUTPUT(lane, p0, p1, max, alpha, sum, sum1) \
-  XV_STORE(p0, output[base + (lane)], 2);
-
-static void output_update(unsigned key_base, unsigned chunk) {
-  const unsigned first = key_base == 0 && (EVU_FLASH_MERGE_PV || chunk == 0);
-  const unsigned last = key_base + TILE == KV && (EVU_FLASH_MERGE_PV || chunk == 1);
-  const int profile_chunk = EVU_FLASH_MERGE_PV ? -1 : (int)chunk;
-  (void)profile_chunk;
-  if (last) {
-    EVU_FLASH_PHASE_BEGIN(OUTPUT_ACCUMULATE_NORMALIZE, key_base / TILE, profile_chunk);
-  } else {
-    EVU_FLASH_PHASE_BEGIN(OUTPUT_ACCUMULATE, key_base / TILE, profile_chunk);
-  }
-  for (unsigned base = 0; base < Q; base += EVU_FLASH_ROW_BATCH) {
-    // Keep (old_output + PV0) + PV1; first output still adds positive zero.
-    FA_ROWS(FA_OUTPUT_ROW)
-    if (last) {
-      FA_BEGIN_SCALARS();
-      FA_ROWS(FA_NORMALIZE_SCALAR)
-      FA_END_SCALARS();
-      FA_ROWS(FA_NORMALIZE_VECTOR)
-    }
-    FA_ROWS(FA_STORE_OUTPUT)
-  }
-  sync_evu();
-  if (last) {
-    EVU_FLASH_PHASE_END(OUTPUT_ACCUMULATE_NORMALIZE);
-  } else {
-    EVU_FLASH_PHASE_END(OUTPUT_ACCUMULATE);
-  }
-}
-
-static void flash_attention_evu(void) {
-  EVU_FLASH_PHASE_BEGIN(SETUP_CONSTANTS, -1, -1);
-  // The first PV pass initializes every output row, including on repeated runs.
-  config_e32(CHUNK);
-  XV_LOAD(26, constants[0], 2);
-  XV_LOAD(27, constants[1], 2);
-  XV_LOAD(28, constants[2], 2);
-  XV_LOAD(29, constants[3], 2);
-  XV_LOAD(30, constants[4], 2);
-  XV_LOAD(31, constants[5], 2);
-  sync_evu();
-  EVU_FLASH_PHASE_END(SETUP_CONSTANTS);
-  for (unsigned key = 0; key < KV; key += TILE) {
-    qk_matrix(key);
-    softmax_quantize_rows(key);
-    pv_matrix(key, 0);
-    if (!EVU_FLASH_MERGE_PV) output_update(key, 0);
-    pv_matrix(key, 1);
-    output_update(key, 1);
-  }
-}
+#define FA_SCHEDULE_SOFTMAX softmax_quantize_rows
+#define FA_SCHEDULE_OUTPUT output_update
+#define FA_SCHEDULE_KERNEL flash_attention_evu
+#include "flash_attention_evu_schedule.h"
+#undef FA_SCHEDULE_SOFTMAX
+#undef FA_SCHEDULE_OUTPUT
+#undef FA_SCHEDULE_KERNEL
 
 #ifndef EVU_FLASH_SKIP_REFERENCE
 /* Independent FP64 exp for nonpositive inputs; degree-16 polynomial after
@@ -552,7 +374,7 @@ static unsigned check_output(void) {
         !(ae <= error_bound[row][d] + margin) ||
         !(aq <= 2e-6 + 1e-4 * (quantized_golden[row][d] < 0.0 ?
           -quantized_golden[row][d] : quantized_golden[row][d]))) {
-      if (failures < 4) printf("[EVU-FLASH] mismatch row=%u d=%u actual=0x%08x fp64=0x%08x quant=0x%08x\n",
+      if (failures < 4) printf("[FA] mismatch row=%u d=%u actual=0x%08x fp64=0x%08x quant=0x%08x\n",
         row, d, bits(output[row][d]), bits((float)golden[row][d]), bits((float)quantized_golden[row][d]));
       ++failures;
     }
@@ -560,7 +382,7 @@ static unsigned check_output(void) {
   double nmse = energy > 0.0 ? squared / energy : squared;
   double qnmse = energy > 0.0 ? quant_squared / energy : quant_squared;
   if (!(qnmse <= 1e-8) || !(nmse <= 2e-5)) ++failures;
-  printf("[EVU-FLASH] max_abs_x1e9=%lu nmse_x1e12=%lu quant_max_abs_x1e9=%lu quant_nmse_x1e12=%lu failures=%u\n",
+  printf("[FA] acc a9=%lu n12=%lu qa9=%lu qn12=%lu err=%u\n",
     (unsigned long)(max_error * 1e9), (unsigned long)(nmse * 1e12),
     (unsigned long)(max_quant_error * 1e9), (unsigned long)(qnmse * 1e12), failures);
   return failures;
@@ -571,23 +393,18 @@ static unsigned check_output(void) {
 __attribute__((used, noinline)) static int flash_attention_test_main(void) {
   const uint64_t required_caps = XV_CAP_FPQUANT_CUTE | XV_CAP_GATHER_IMM;
   if (XV_CSR_READ(XV_EVLENB) != 512 || (XV_CSR_READ(XV_EVCAP) & required_caps) != required_caps) {
-    printf("[EVU-FLASH] requires VLEN4096, FPQUANT-to-CUTE and immediate gather\n");
+    printf("[FA] FAIL unsupported EVU\n");
     return 1;
   }
-  printf("[EVU-FLASH] division=%s broadcast=%s scale_divisions=%u normalize_divisions=%u\n",
-    EVU_FLASH_SCALAR_OPS ? "instruction_local_element_zero" : "single_lane_scale_reciprocal_broadcast",
-    EVU_FLASH_SCALAR_OPS ? "scalar_operand" : "gather_imm", Q * (KV / CHUNK), Q);
-  printf("[EVU-FLASH] kernel=" FA_KERNEL_NAME " row_batch=%u compact_state=1 "
-         "pv_pair=%u output_passes=%u scalar_ops=%u scale_vl_switches=%u normalize_vl_switches=%u\n",
-    EVU_FLASH_ROW_BATCH, EVU_FLASH_MERGE_PV, FA_OUTPUT_PASSES, EVU_FLASH_SCALAR_OPS,
-    FA_SCALE_VL_SWITCHES, FA_NORMALIZE_VL_SWITCHES);
+  printf("[FA] " FA_KERNEL_NAME " q=%u/%u/%u rows=%u pv=%u sc=%u arm=%u%u%u w=1 ref=1 runs=%u\n",
+    Q, KV, D, EVU_FLASH_ROW_BATCH, EVU_FLASH_MERGE_PV, EVU_FLASH_SCALAR_OPS,
+    EVU_FLASH_FUSE_ALPHA, EVU_FLASH_EARLY_RECIP, EVU_FLASH_CHUNK_MAX, REPEATS);
   init_inputs();
-  printf("[EVU-FLASH] reference begin q=%u kv=%u d=%u\n", Q, KV, D);
+  printf("[FA] ref\n");
   uint64_t reference_start = read_cycle();
   make_reference();
   uint64_t reference_cycles = read_cycle() - reference_start;
-  printf("[EVU-FLASH] reference done cycles=%lu unique_queries=%u/%u unique_value_columns=%u/%u\n",
-    (unsigned long)reference_cycles, reference_unique_queries, Q, reference_unique_columns, D);
+  printf("[FA] ref_c=%lu run\n", (unsigned long)reference_cycles);
   flash_attention_evu(); // fixed warm-up; validation/printing outside timing
   if (check_output()) return 1;
   uint64_t cycles[REPEATS], instructions[REPEATS];
@@ -599,13 +416,13 @@ __attribute__((used, noinline)) static int flash_attention_test_main(void) {
     instructions[i] = read_instret() - n;
     cycles[i] = read_cycle() - c;
     if (check_output() || (XV_CSR_READ(XV_EVSTATUS) & 2) || (XV_CSR_READ(XV_EFFLAGS) & 0x1c)) return 1;
-    printf("[EVU-FLASH] run=%u q=%u kv=%u d=%u e2e_cycles=%lu e2e_instret=%lu efflags=0x%lx\n",
-      i, Q, KV, D, (unsigned long)cycles[i], (unsigned long)instructions[i], (unsigned long)XV_CSR_READ(XV_EFFLAGS));
+    printf("[FA] run=%u c=%lu i=%lu fl=%lx\n",
+      i, (unsigned long)cycles[i], (unsigned long)instructions[i], (unsigned long)XV_CSR_READ(XV_EFFLAGS));
   }
   for (unsigned i = 0; i < REPEATS; ++i) for (unsigned j = i + 1; j < REPEATS; ++j)
     if (cycles[j] < cycles[i]) { uint64_t t = cycles[i]; cycles[i] = cycles[j]; cycles[j] = t; }
   uint64_t median = cycles[REPEATS / 2];
-  printf("[EVU-FLASH] median_cycles=%lu historical_rvv_cycles=%lu historical_speedup_x1000=%lu\n",
+  printf("[FA] PASS median=%lu rvv_hist=%lu speedup1000=%lu\n",
     (unsigned long)median, (unsigned long)BASELINE_CYCLES, (unsigned long)(BASELINE_CYCLES * 1000 / median));
   return 0;
 }

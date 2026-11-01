@@ -22,18 +22,115 @@ that extra baseline for measuring profiler overhead.
 | `flash_attention_evu_correct_warm` | 1 | 0 | 1 | Both goldens |
 | `flash_attention_evu_profile_cold` | 0 | 0 | 1 | None |
 
-## Current Software Revision: Scalar Instructions and Batched PV Updates
+## Compact Output
+
+All FlashAttention guest entries now use short `[FA]` lines.
+The cold entry prints five lines on success; correctness/warm prints nine;
+individual samples, percentages, duplicate groups and
+successful status-check lines are no longer printed. Error diagnostics remain.
+All kernel runs, timers, phase-count checks, accuracy checks and thresholds
+are unchanged. EMU's own PERF/difftest output is unaffected.
+
+- `q=Q/KV/D`, `rows`, `pv`, `sc`: shape, row batch, PV pairing, scalar ISA.
+- `arm`: three digits for alpha fusion, early reciprocal and chunk-max reuse.
+- `w`, `ref`, `b`: warm-up, FP64 reference/checking, hooks-disabled baseline.
+- `c`, `i`: measured kernel cycles and retired instructions.
+- `qk=S/W`, `pv=S/W`: submission / wait-drain cycles; `sm`: softmax/quantize.
+- `pack`: PV packing; `out=A/N`: output accumulation / accumulation+normalize.
+- `setup`, `other`, `samples`, `err`: setup cycles, cycles outside phases,
+  actual/expected sample count and profile errors.
+- `acc a9/n12/qa9/qn12`: unchanged max-absolute/NMSE metrics scaled by
+  1e9/1e12, then the corresponding probability-quantized golden metrics.
+
+The longer banners and field names below describe historical logs. In new
+logs, require `PASS`, `err=0`, `samples=21/21` (23/23 without PV pairing), and
+the appropriate `w`/`ref`, plus emu GOOD TRAP and difftest `pending=0`.
+Printing remains outside kernel timing; changed code/cache layout can still
+shift measured cycles. Rebuild the guest only; no RTL/NEMU rebuild is needed.
+
+## Selected Correctness/Warm Schedule
+
+`flash_attention_evu_correct_warm` now defaults to the fastest of the four
+measured schedules: four-row scalar batches, compact state, paired PV updates,
+fused alpha, chunk-max reuse, and **no early reciprocal**. It computes
+`1/row_sum` during output update instead of storing/reloading reciprocals.
+Its compact banner must show `rows=4 pv=1 sc=1 arm=101 w=1 ref=1 b=0`.
+Both FP64 goldens and tolerances are retained, as are the warm-up, one profiled
+kernel and 21 phase samples. The standard image name remains
+`flash_attention_evu_correct_warm-riscv64-xs.bin`; objects use a distinct
+`rows4-pv1-scalar1-alpha1-recip0-max1` directory. Explicit nondefault Make
+settings still select separately named images.
+
+The completed historical `flash_attention_ablation.log` records:
+
+| Alpha / early reciprocal / chunk max | Warmed kernel cycles |
+| --- | ---: |
+| 1 / 1 / 1 | 289381 |
+| **1 / 0 / 1** | **278609** |
+| 1 / 1 / 0 | 293818 |
+| 0 / 1 / 1 | 297874 |
+
+That experiment passed cross-variant bitwise checks, difftest, GOOD TRAP and
+`pending=0`, but did not run FP64 checks. The selected schedule still needs
+its own rebuilt correctness/warm server run; 278609 is not a prediction of
+the compact standalone image's exact cycle count. The one-off multi-variant
+executable and its Make configuration have been removed; its log is retained.
+The cold, ordinary and full-breakdown defaults are unchanged (all three
+optimizations enabled), so their results do not directly measure this selected
+schedule unless their Make switches are explicitly matched.
+
+## Current Software Revision: Fused Alpha, Early Reciprocal and Chunk Max
+
+The default shared kernel is now `scalar_batched_v4`. In addition to compact
+state, paired PV updates, four-row batching and local scalar instructions, it:
+
+- Saves second-tile alpha as one FP32 value per row and applies it in output
+  update, removing 64 KiB of logical output traffic. Independent multiply/add
+  rounding and `(old_output * alpha + PV0) + PV1` order are retained.
+- Computes final `1/row_sum` during softmax and saves 512 bytes of reciprocals
+  for normalization. Division count remains 640; only placement changes.
+- Loads multiple rows before reducing their score maxima and updating state.
+  Two score-chunk maxima supply `exp2(chunk_max - row_max)`: score max reductions
+  increase from 256 to 512, probability max reductions fall from 512 to zero,
+  sum reductions remain 512. Total reductions fall from 1280 to 1024, with
+  512 extra scalar exponent evaluations. These are not measured cycle savings.
+
+`EVU_FLASH_FUSE_ALPHA`, `EVU_FLASH_EARLY_RECIP` and `EVU_FLASH_CHUNK_MAX` default
+to `EVU_FLASH_SCALAR_OPS`, except correctness/warm defaults early reciprocal
+to zero as described above. They may each be set to zero for schedule comparisons.
+Enabling any requires scalar operations. Image/object variants also include
+`-alphaA-recipR-maxM`; the all-default cold image keeps its original name.
+The banner includes `alpha_fused=1 early_reciprocal=1 chunk_max_reuse=1`.
+The workload, cold run count, FP64 omission, phase names and 21 samples remain
+unchanged. The warmed correctness entry also uses the shared v4 kernel and
+retains its existing FP64 tolerances.
+
+This round also changes RTL: separate AMU issue/reclaim cursors, 16 command
+slots, shared-FMA reduction interleaving and four queued quantization rows.
+Rebuild emu on the server. No new ISA or NEMU change is introduced by v4;
+an existing reference supporting the v3 scalar instructions is still required.
+The supplied v4 cold log measures 313216 kernel cycles, GOOD TRAP and
+`profile_errors=0`, but omits FP64 checking. A v4 warmed independent-correctness
+result is still pending; the per-feature measurements are recorded above.
+
+The scalar-max shortcut is checked against the existing reference library by
+`scripts/check_flash_chunk_max.py` without executing its CPU or building any
+binary. It covers 512 fixed-workload chunks, 2048 randomized chunks and 19328
+boundary triplets. This is a finite numerical check, not an exhaustive FP32
+monotonicity proof or a substitute for the warmed correctness run.
+
+## Previous Software Revision: Scalar Instructions and Batched PV Updates
 
 The default `flash_attention_evu_profile_cold` now runs exactly one complete
 Q128/KV256/D64 kernel with all three software changes: compact P scales/row
 sums, paired PV output updates, four-row batches and instruction-local scalar
-operations. It has no warm-up,
+operations. That v3 revision has no warm-up,
 baseline run, guest FP64 reference or output-accuracy check. This revision
 requires the matching new RTL/emu, NEMU reference and guest to be rebuilt
 on the server. The previous 476634-cycle result used `compact_batched_v2`
 before the scalar instruction change; the latest cold run is recorded below.
 
-The expected banner is:
+The historical v3 banner is:
 
 ```text
 kernel=scalar_batched_v3 profile_schema=compact_pv_pair_v2 row_batch=4 compact_state=1 pv_pair=1 output_passes=2 scalar_ops=1 scale_vl_switches=0 normalize_vl_switches=0
@@ -62,6 +159,8 @@ is always enabled. Defaults are 4, 1 and 1. Scalar0 selects the previous
 `-rowsN-pvM-scalarS-` in their image names, and all variants have distinct
 object directories, preventing a previously built schedule from being reused.
 These are alternative builds, not multiple configurations executed in one run.
+For the current complete variant suffix and default v4 behavior, see the
+preceding section.
 
 The paired schema collects 21 samples (one ordinary output update and one
 normalized update). With PV pairing disabled, `compact_chunk_pv_v2` collects
@@ -83,7 +182,7 @@ completed independent FP64 checks and warmed run. See the roadmap for the RTL
 validation record and the failed legacy Verilator invocation; the syntax and
 AST checks themselves produce no executable, object or Verilog.
 
-### Latest Cold Server Result
+### Last Measured Cold Server Result: V3
 
 `flash_attention_break_cold_evu.log` measures `scalar_batched_v3`: the cold
 profiled kernel took 323025 cycles and 34567 instructions. The 21 phase samples
@@ -355,9 +454,9 @@ make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM NAME=flash_attention_evu_bre
 Retain the same `AM_HOME`, compiler settings, hardware configuration, clocks
 and cache settings between EVU and RVV comparisons. Current default software
 uses scalar instructions in addition to GatherImm and FP quantization, so the
-EMU, NEMU and guest sources must be a matching revision. The new test entry
-does not change RTL, NEMU or capability bits: reuse the emu/reference pair
-that passed the latest scalar_batched_v3 cold run and rebuild only the guest.
+EMU, NEMU and guest sources must support the same ISA. The current v4 hardware
+changes require a newly built emu, not the previously measured v3 executable.
+This round does not add NEMU instructions or alter capability bits.
 
 Acceptance for all modes is `result=PASS`, `profile_errors=0`, `samples=21`
 (`23` with PV pairing disabled),

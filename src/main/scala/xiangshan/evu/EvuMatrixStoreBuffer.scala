@@ -91,6 +91,8 @@ class EvuMatrixStoreBuffer(p: EvuParams) extends Module {
     arbiter.io.in(i).bits.bytes := 64.U
     arbiter.io.in(i).bits.write := true.B
     arbiter.io.in(i).bits.tag := tag
+    arbiter.io.in(i).bits.jobId := 0.U
+    arbiter.io.in(i).bits.epoch := 0.U
     when(arbiter.io.in(i).fire) { states(i) := waiting }
   }
   io.memory.req.valid := arbiter.io.out.valid && freeTags.orR

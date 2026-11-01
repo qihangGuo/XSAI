@@ -18,6 +18,11 @@ and measured result against the FP64 goldens. See the
 [cycle breakdown guide](FLASH_ATTENTION_BREAKDOWN.md) for commands and
 acceptance criteria.
 
+The correctness/warm entry now defaults to the best measured schedule:
+alpha fusion and chunk-max reuse enabled, early reciprocal disabled
+(`arm=101`). Four-row scalar batches, compact state and paired PV updates
+remain enabled. Other entries retain their existing defaults.
+
 1. CUTE computes a 128x128x64 QK tile. CUTE -> EVU applies Q/K/softmax/log2(e)
    scales and stores the dequantized score tile through HBL2.
 2. EVU performs row maxima, online rescaling, Exp2, sum and per-chunk P scales.

@@ -28,6 +28,7 @@ class AmuCtrlBufferIO()(implicit val p: Parameters, val params: BackendParams) e
   val canEnqueue = Output(Bool())
   val canEnqueueForDispatch = Output(Bool())
   val evuBusy = Output(Bool())
+  val evuCommittedBusy = Output(Bool())
   val evuPreflightBusy = Output(Bool())
   val evuRetired = Output(Valid(new EvuCoreCommand(p(ExternalVectorKey))))
 
@@ -267,6 +268,19 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
   // To AMU
   val deqPtr = RegInit(0.U.asTypeOf(new RobPtr))
   val deqEntries = (0 until CommitWidth).map(i => amuCtrlEntries((deqPtr + i.U).value))
+  val separateIssue = p(ExternalVectorKey).enable && p(ExternalVectorKey).decoupledAmuIssue
+  val issuePtr = RegInit(0.U.asTypeOf(new RobPtr))
+  val dispatchPtr = if (separateIssue) issuePtr else deqPtr
+  val issueEntries = (0 until CommitWidth).map(i => amuCtrlEntries((dispatchPtr + i.U).value))
+  val issueBarrier = RegInit(false.B)
+  val issuedOutstanding = amuCtrlEntries.map(e => e.valid && e.evuAccepted && !e.canDeq).reduce(_ || _)
+  val statusDrain = RegInit(0.U(4.W))
+  statusDrain := Cat(statusDrain(2, 0), io.evuCompletion.map(_.fire).getOrElse(false.B))
+  when(issueBarrier && !issuedOutstanding && !statusDrain.orR && !evuStatusPulse) {
+    issueBarrier := false.B
+  }
+  def issuedOrSkipped(e: AmuCtrlEntry): Bool =
+    e.valid && e.committed && (!e.needAMU || e.canDeq || e.evuAccepted)
 
   class AmuCtrlTableEntry extends Bundle {
     val op = UInt(2.W)
@@ -278,10 +292,12 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
   val amuCtrl_table = ChiselDB.createTable(s"AMUCtrl_table", new AmuCtrlTableEntry, basicDB = true)
 
   io.toAMU.zipWithIndex.foreach { case (amuCtrl, i) =>
-    val deqEntry = deqEntries(i)
-    val olderAmuReqValid = if (i == 0) false.B else deqEntries.take(i).map(_.amuReqValid).reduce(_ || _)
+    val deqEntry = issueEntries(i)
+    val olderAmuReqValid = if (i == 0) false.B else issueEntries.take(i).map(_.amuReqValid).reduce(_ || _)
+    val olderIssued = issueEntries.take(i).map(issuedOrSkipped).foldLeft(true.B)(_ && _)
     deqEntry.checkSanity(s"AMUCtrlBuffer: deqEntry[$i]")
-    amuCtrl.valid := deqEntry.amuReqValid
+    amuCtrl.valid := deqEntry.amuReqValid && !io.redirect.valid &&
+      (if (separateIssue) olderIssued && !issueBarrier else true.B)
     amuCtrl.bits := Mux(deqEntry.amuReqValid, deqEntry.amuCtrl, 0.U.asTypeOf(new AmuCtrlIO))
     when (amuCtrl.fire) {
       // XSCore serializes these lanes through a fixed-priority arbiter.
@@ -289,6 +305,10 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
       assert(!deqEntry.canDeq, s"AMUCtrlBuffer: deqEntry[$i] is already set to canDeq")
       when (amuCtrl.bits.evu) {
         deqEntry.evuAccepted := true.B
+        val f7 = amuCtrl.bits.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey))).instr(31, 25)
+        when(separateIssue.B && (f7 === xiangshan.evu.EvuIsa.waitOp || f7 === xiangshan.evu.EvuIsa.fence)) {
+          issueBarrier := true.B
+        }
       }.otherwise {
         deqEntry.canDeq := true.B
       }
@@ -329,11 +349,11 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
 
     // Difftest
     if (env.EnableDifftest && HasMatrixExtension) {
-      val difftestPC = dt_pc.get((deqPtr + i.U).value)
+      val difftestPC = dt_pc.get((dispatchPtr + i.U).value)
       val difftestAmuCtrl = DifftestModule(new DiffAmuCtrlEvent, delay = 3, dontCare = true)
       difftestAmuCtrl.valid  := amuCtrl.fire && !amuCtrl.bits.evu
       difftestAmuCtrl.op     := amuCtrl.bits.op
-      val pcTransType = dt_pcTransType.get((deqPtr + i.U).value)
+      val pcTransType = dt_pcTransType.get((dispatchPtr + i.U).value)
       difftestAmuCtrl.pc     := Mux(pcTransType.shouldBeSext, SignExt(difftestPC, XLEN), difftestPC)
       difftestAmuCtrl.coreid := io.hartId.get
       difftestAmuCtrl.index  := i.U
@@ -405,18 +425,20 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
 
   // A retired WAIT/FENCE must keep dispatch blocked through the ROB ->
   // backend -> CSR status pipeline as well as through the final write Ack.
-  val statusDrain = RegInit(0.U(4.W))
-  statusDrain := Cat(statusDrain(2, 0), io.evuCompletion.map(_.fire).getOrElse(false.B))
   io.evuBusy := amuCtrlEntries.map(e =>
     e.valid && e.needAMU && e.writebacked && e.amuCtrl.evu && !e.canDeq
   ).reduce(_ || _) || statusDrain.orR
-  // Preflight may walk pages beside older ordinary arithmetic. Keep it behind
-  // every older memory/control command and the status pipeline, not its own
-  // yet-to-write-back entry. Faults still travel through the normal ROB path.
+  // A faulting scalar EVU instruction has not committed and must never wait
+  // for its own nonexistent external completion before taking the trap.
+  io.evuCommittedBusy := amuCtrlEntries.map(e =>
+    e.valid && e.needAMU && e.committed && e.writebacked && e.amuCtrl.evu && !e.canDeq
+  ).reduce(_ || _) || statusDrain.orR || evuStatusPulse
+  // Preflight may walk pages beside older ordinary memory or arithmetic. Keep it behind
+  // older control commands and the status pipeline, not ordinary memory.
+  // The VMU now owns per-command translations, ordering and asynchronous faults.
   io.evuPreflightBusy := amuCtrlEntries.map { e =>
     val f7 = e.amuCtrl.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey))).instr(31, 25)
-    val serial = xiangshan.evu.EvuIsa.isLoad(f7) || xiangshan.evu.EvuIsa.isStore(f7) ||
-      f7 === xiangshan.evu.EvuIsa.launch || f7 === xiangshan.evu.EvuIsa.waitOp ||
+    val serial = f7 === xiangshan.evu.EvuIsa.launch || f7 === xiangshan.evu.EvuIsa.waitOp ||
       f7 === xiangshan.evu.EvuIsa.fence || f7 === xiangshan.evu.EvuIsa.setvli ||
       f7 === xiangshan.evu.EvuIsa.setvl
     e.valid && e.needAMU && e.writebacked && e.amuCtrl.evu && !e.canDeq && serial
@@ -424,6 +446,23 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
 
   val deqCondSeq = deqEntries.map(x => ~x.canDeq)
   val deqCount = PriorityEncoder(deqCondSeq :+ true.B)
+  if (separateIssue) {
+    val issueAdvance = issueEntries.zip(io.toAMU).map { case (entry, port) => issuedOrSkipped(entry) || port.fire }
+    val issueCount = PriorityEncoder(issueAdvance.map(!_) :+ true.B)
+    val nextDeqPtr = deqPtr + deqCount
+    val nextIssuePtr = issuePtr + Mux(!issueBarrier && !io.redirect.valid, issueCount, 0.U)
+    // Scalar entries can retire while a barrier freezes EVU dispatch. Never
+    // leave the issue cursor behind entries that retirement has invalidated.
+    issuePtr := Mux(isAfter(nextDeqPtr, nextIssuePtr), nextDeqPtr, nextIssuePtr)
+    // Re-scan surviving entries after redirect. Accepted requests are skipped,
+    // never re-issued; retirement stays the sole completion/status owner.
+    when(io.redirect.valid) { issuePtr := nextDeqPtr }
+    XSPerfAccumulate("evu_amu_issue_window_blocked", issueEntries.head.valid &&
+      issueEntries.head.committed && !issueBarrier && !io.toAMU.map(_.fire).reduce(_ || _) &&
+      issueEntries.map(_.amuReqValid).reduce(_ || _))
+    XSPerfAccumulate("evu_amu_issue_ahead_cycles", issuePtr =/= deqPtr && issuedOutstanding)
+    XSPerfAccumulate("evu_amu_barrier_cycles", issueBarrier)
+  }
   // Update deqPtr and invalidate entries
   deqPtr := deqPtr + deqCount
   for (i <- 0 until CommitWidth) {

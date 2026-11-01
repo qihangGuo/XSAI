@@ -71,9 +71,10 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
   csrMod.io.evu <> csrIn.evu
   private val evuOwnershipChange = isCSRAcc && (
     addr === "h180".U || addr === "h280".U || addr === "h680".U ||
-    addr === "h300".U || addr === "h100".U ||
+    addr === "h300".U || addr === "h100".U || addr === "h200".U || addr === "h600".U ||
+    addr === "h30a".U || addr === "h10a".U || addr === "h60a".U || addr === "h747".U ||
     addr >= "h3a0".U && addr <= "h3ef".U ||
-    addr >= "hbc0".U && addr <= "hbff".U) || isMret || isSret || isMNret
+    addr >= "hbc0".U && addr <= "hbff".U) || isMret || isSret || isMNret || isDret
   private val evuControl = p(ExternalVectorKey).enable.B &&
     (isCSRAcc && xiangshan.evu.EvuCSRs.needsDrain(addr) || evuOwnershipChange)
   private val evuReady = !evuControl || csrIn.evu.drained

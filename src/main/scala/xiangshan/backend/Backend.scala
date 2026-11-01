@@ -784,6 +784,9 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
   csrio.perf.ctrlInfo <> ctrlBlock.io.perfInfo.ctrlInfo
   private val fenceio = intExuBlock.io.fenceio.get
   io.fenceio <> fenceio
+  // CPU FENCE, SFENCE/HFENCE and FENCE.I may not pass retired EVU stores.
+  // Keep the existing fence FSM and its store-buffer flush handshake.
+  fenceio.sbuffer.sbIsEmpty := io.fenceio.sbuffer.sbIsEmpty && !ctrlBlock.io.evuBusy
 
   // to fpExuBlock
   fpExuBlock.io.flush := ctrlBlock.io.toExuBlock.flush

@@ -99,9 +99,9 @@ static unsigned fa_validate(const char *mode) {
 #endif
   uint64_t status = XV_CSR_READ(XV_EVSTATUS), flags = XV_CSR_READ(XV_EFFLAGS);
   if ((status & 2) || (flags & 0x1c)) ++failures;
-  printf("[EVU-FLASH-BREAKDOWN] check=%s validation_cycles=%lu "
-         "evstatus=0x%lx efflags=0x%lx failures=%u\n", mode,
-    (unsigned long)validation_cycles, (unsigned long)status, (unsigned long)flags, failures);
+  if (failures)
+    printf("[FA] FAIL %s st=%lx fl=%lx err=%u check_c=%lu\n", mode,
+      (unsigned long)status, (unsigned long)flags, failures, (unsigned long)validation_cycles);
   return failures;
 }
 
@@ -118,72 +118,39 @@ static uint64_t fa_measure(unsigned enabled, uint64_t *instructions) {
   return cycles;
 }
 
-static uint64_t fa_pct_x100(uint64_t cycles, uint64_t wall) {
-  return wall ? cycles * UINT64_C(10000) / wall : 0;
-}
-
-#ifndef EVU_FLASH_PERF_ONLY
-static void fa_print_group(const char *name, uint64_t cycles, uint64_t wall) {
-  uint64_t pct = fa_pct_x100(cycles, wall);
-  printf("[EVU-FLASH-BREAKDOWN] group=%s cycles=%lu wall_pct=%lu.%02lu\n",
-    name, (unsigned long)cycles, (unsigned long)(pct / 100), (unsigned long)(pct % 100));
-}
-#endif
-
 static unsigned fa_report(uint64_t baseline, uint64_t wall) {
-  uint64_t cycles[FA_PHASE_COUNT] = {0}, instructions[FA_PHASE_COUNT] = {0};
+  uint64_t cycles[FA_PHASE_COUNT] = {0};
   unsigned calls[FA_PHASE_COUNT] = {0};
-  uint64_t accounted = 0, accounted_instructions = 0;
+  uint64_t accounted = 0;
   for (unsigned i = 0; i < fa_sample_count; ++i) {
     const fa_sample_t *sample = &fa_samples[i];
     if (sample->phase >= FA_PHASE_COUNT) { fa_profile_error = 1; continue; }
     cycles[sample->phase] += sample->cycles;
-    instructions[sample->phase] += sample->instructions;
     ++calls[sample->phase];
-#ifndef EVU_FLASH_PERF_ONLY
-    uint64_t pct = fa_pct_x100(sample->cycles, wall);
-    printf("[EVU-FLASH-BREAKDOWN] sample=%u phase=%s tile=%d chunk=%d "
-           "cycles=%lu instret=%lu wall_pct=%lu.%02lu\n", i,
-      fa_phase_names[sample->phase], sample->tile, sample->chunk,
-      (unsigned long)sample->cycles, (unsigned long)sample->instructions,
-      (unsigned long)(pct / 100), (unsigned long)(pct % 100));
-#endif
   }
   for (unsigned phase = 0; phase < FA_PHASE_COUNT; ++phase) {
     accounted += cycles[phase];
-    accounted_instructions += instructions[phase];
-    if (calls[phase] != fa_expected_calls[phase]) fa_profile_error = 1;
-    uint64_t pct = fa_pct_x100(cycles[phase], wall);
-    printf("[EVU-FLASH-BREAKDOWN] phase=%s calls=%u cycles=%lu instret=%lu "
-           "wall_pct=%lu.%02lu\n", fa_phase_names[phase], calls[phase],
-      (unsigned long)cycles[phase], (unsigned long)instructions[phase],
-      (unsigned long)(pct / 100), (unsigned long)(pct % 100));
+    if (calls[phase] != fa_expected_calls[phase]) {
+      fa_profile_error = 1;
+      printf("[FA] FAIL phase=%s calls=%u/%u\n", fa_phase_names[phase],
+        calls[phase], fa_expected_calls[phase]);
+    }
   }
   if (fa_sample_count != FA_EXPECTED_SAMPLES || fa_phase_active || accounted > wall || !wall)
     fa_profile_error = 1;
-#ifndef EVU_FLASH_PERF_ONLY
-  fa_print_group("setup_constants", cycles[FA_PHASE_SETUP_CONSTANTS], wall);
-  fa_print_group("qk_submit_wait_drain",
-    cycles[FA_PHASE_QK_SUBMIT] + cycles[FA_PHASE_QK_WAIT_DRAIN], wall);
-  fa_print_group("row_softmax_quantize", cycles[FA_PHASE_ROW_SOFTMAX_QUANTIZE], wall);
-  fa_print_group("pv_pack_submit_wait_drain", cycles[FA_PHASE_PV_PACK] +
-    cycles[FA_PHASE_PV_SUBMIT] + cycles[FA_PHASE_PV_WAIT_DRAIN], wall);
-  fa_print_group("output_accumulate", cycles[FA_PHASE_OUTPUT_ACCUMULATE], wall);
-  fa_print_group("output_accumulate_normalize", cycles[FA_PHASE_OUTPUT_ACCUMULATE_NORMALIZE], wall);
-#endif
-  printf("[EVU-FLASH-BREAKDOWN] samples=%u expected_samples=%u accounted_cycles=%lu "
-         "outside_phases_cycles=%lu accounted_instret=%lu profile_errors=%u\n",
-    fa_sample_count, FA_EXPECTED_SAMPLES, (unsigned long)accounted,
+  printf("[FA] qk=%lu/%lu sm=%lu pack=%lu pv=%lu/%lu\n",
+    (unsigned long)cycles[FA_PHASE_QK_SUBMIT], (unsigned long)cycles[FA_PHASE_QK_WAIT_DRAIN],
+    (unsigned long)cycles[FA_PHASE_ROW_SOFTMAX_QUANTIZE], (unsigned long)cycles[FA_PHASE_PV_PACK],
+    (unsigned long)cycles[FA_PHASE_PV_SUBMIT], (unsigned long)cycles[FA_PHASE_PV_WAIT_DRAIN]);
+  printf("[FA] setup=%lu out=%lu/%lu other=%lu samples=%u/%u err=%u\n",
+    (unsigned long)cycles[FA_PHASE_SETUP_CONSTANTS], (unsigned long)cycles[FA_PHASE_OUTPUT_ACCUMULATE],
+    (unsigned long)cycles[FA_PHASE_OUTPUT_ACCUMULATE_NORMALIZE],
     (unsigned long)(wall >= accounted ? wall - accounted : 0),
-    (unsigned long)accounted_instructions, fa_profile_error);
+    fa_sample_count, FA_EXPECTED_SAMPLES, fa_profile_error);
 #if !defined(EVU_FLASH_PERF_ONLY) && !EVU_FLASH_SKIP_BASELINE
   // This delta includes cache/order/layout effects, not just timer reads.
   int64_t delta = wall >= baseline ? (int64_t)(wall - baseline) : -(int64_t)(baseline - wall);
-  uint64_t magnitude = wall >= baseline ? wall - baseline : baseline - wall;
-  uint64_t pct = fa_pct_x100(magnitude, baseline);
-  printf("[EVU-FLASH-BREAKDOWN] profile_minus_baseline_cycles=%ld "
-         "delta_pct=%s%lu.%02lu note=includes_instrumentation_and_run_variation\n",
-    (long)delta, delta < 0 ? "-" : "", (unsigned long)(pct / 100), (unsigned long)(pct % 100));
+  printf("[FA] profile_minus_base=%ld\n", (long)delta);
 #else
   (void)baseline;
 #endif
@@ -193,68 +160,45 @@ static unsigned fa_report(uint64_t baseline, uint64_t wall) {
 __attribute__((used, noinline)) static int flash_attention_breakdown_main(void) {
   const uint64_t required_caps = XV_CAP_FPQUANT_CUTE | XV_CAP_GATHER_IMM;
   if (XV_CSR_READ(XV_EVLENB) != 512 || (XV_CSR_READ(XV_EVCAP) & required_caps) != required_caps) {
-    printf("[EVU-FLASH-BREAKDOWN] requires VLEN4096, FPQUANT-to-CUTE and immediate gather\n");
+    printf("[FA] FAIL unsupported EVU\n");
     return 1;
   }
 #ifdef EVU_FLASH_PERF_ONLY
-  printf("[EVU-FLASH-BREAKDOWN] mode=performance_only q=%u kv=%u d=%u warmup=%u "
-         "baseline_runs=0 profiled_runs=1 fp64_reference=0 output_accuracy_check=0 "
-         "existing_fences_only=1 timing_state=%s\n", Q, KV, D, EVU_FLASH_BREAKDOWN_WARMUP,
-    EVU_FLASH_BREAKDOWN_WARMUP ? "after_warmup" : "no_warmup");
+  const unsigned reference = 0, baseline_runs = 0;
 #else
-  printf("[EVU-FLASH-BREAKDOWN] q=%u kv=%u d=%u warmup=%u baseline_runs=%u "
-         "profiled_runs=1 correctness=1 existing_fences_only=1\n", Q, KV, D,
-    EVU_FLASH_BREAKDOWN_WARMUP, EVU_FLASH_SKIP_BASELINE ? 0 : 1);
+  const unsigned reference = 1, baseline_runs = !EVU_FLASH_SKIP_BASELINE;
 #endif
-  printf("[EVU-FLASH-BREAKDOWN] division=%s broadcast=%s "
-         "scale_divisions=%u normalize_divisions=%u\n",
-    EVU_FLASH_SCALAR_OPS ? "instruction_local_element_zero" : "single_lane_scale_reciprocal_broadcast",
-    EVU_FLASH_SCALAR_OPS ? "scalar_operand" : "gather_imm", Q * (KV / CHUNK), Q);
-  printf("[EVU-FLASH-BREAKDOWN] kernel=" FA_KERNEL_NAME " profile_schema=" FA_PROFILE_SCHEMA " "
-         "row_batch=%u compact_state=1 pv_pair=%u output_passes=%u scalar_ops=%u "
-         "scale_vl_switches=%u normalize_vl_switches=%u\n",
-    EVU_FLASH_ROW_BATCH, EVU_FLASH_MERGE_PV, FA_OUTPUT_PASSES, EVU_FLASH_SCALAR_OPS,
-    FA_SCALE_VL_SWITCHES, FA_NORMALIZE_VL_SWITCHES);
+  printf("[FA] " FA_KERNEL_NAME " q=%u/%u/%u rows=%u pv=%u sc=%u arm=%u%u%u w=%u ref=%u b=%u\n",
+    Q, KV, D, EVU_FLASH_ROW_BATCH, EVU_FLASH_MERGE_PV, EVU_FLASH_SCALAR_OPS,
+    EVU_FLASH_FUSE_ALPHA, EVU_FLASH_EARLY_RECIP, EVU_FLASH_CHUNK_MAX,
+    EVU_FLASH_BREAKDOWN_WARMUP, reference, baseline_runs);
   uint64_t start = read_cycle();
   init_inputs();
-  printf("[EVU-FLASH-BREAKDOWN] init_cycles=%lu\n", (unsigned long)(read_cycle() - start));
+  printf("[FA] init=%lu %s\n", (unsigned long)(read_cycle() - start), reference ? "ref" : "run");
 #ifndef EVU_FLASH_PERF_ONLY
-  printf("[EVU-FLASH-BREAKDOWN] reference begin\n");
   start = read_cycle();
   make_reference();
-  printf("[EVU-FLASH-BREAKDOWN] reference done cycles=%lu "
-         "unique_queries=%u/%u unique_value_columns=%u/%u\n",
-    (unsigned long)(read_cycle() - start), reference_unique_queries, Q, reference_unique_columns, D);
+  printf("[FA] ref_c=%lu run\n", (unsigned long)(read_cycle() - start));
 #endif
   uint64_t instructions;
 #if EVU_FLASH_BREAKDOWN_WARMUP
-  printf("[EVU-FLASH-BREAKDOWN] warmup begin\n");
   uint64_t warmup = fa_measure(0, &instructions);
   if (fa_validate("warmup")) return 1;
-  printf("[EVU-FLASH-BREAKDOWN] mode=warmup wall_cycles=%lu instret=%lu\n",
+  printf("[FA] warm c=%lu i=%lu\n",
     (unsigned long)warmup, (unsigned long)instructions);
 #endif
   uint64_t baseline = 0;
 #if !defined(EVU_FLASH_PERF_ONLY) && !EVU_FLASH_SKIP_BASELINE
-  printf("[EVU-FLASH-BREAKDOWN] baseline begin\n");
   baseline = fa_measure(0, &instructions);
   if (fa_validate("baseline")) return 1;
-  printf("[EVU-FLASH-BREAKDOWN] mode=hooks_disabled e2e_cycles=%lu e2e_instret=%lu\n",
+  printf("[FA] base c=%lu i=%lu\n",
     (unsigned long)baseline, (unsigned long)instructions);
 #endif
-  printf("[EVU-FLASH-BREAKDOWN] profile begin\n");
   uint64_t wall = fa_measure(1, &instructions);
   unsigned failures = fa_validate("profiled");
-  printf("[EVU-FLASH-BREAKDOWN] mode=profiled wall_cycles=%lu wall_instret=%lu\n",
-    (unsigned long)wall, (unsigned long)instructions);
   failures += fa_report(baseline, wall);
-#ifdef EVU_FLASH_PERF_ONLY
-  printf("[EVU-FLASH-BREAKDOWN] result=%s failures=%u fp64_checked=0\n",
-    failures ? "FAIL" : "PASS", failures);
-#else
-  printf("[EVU-FLASH-BREAKDOWN] result=%s failures=%u fp64_checked=1 warmup_checked=%u\n",
-    failures ? "FAIL" : "PASS", failures, EVU_FLASH_BREAKDOWN_WARMUP);
-#endif
+  printf("[FA] %s c=%lu i=%lu w=%u ref=%u err=%u\n", failures ? "FAIL" : "PASS",
+    (unsigned long)wall, (unsigned long)instructions, EVU_FLASH_BREAKDOWN_WARMUP, reference, failures);
   return failures != 0;
 }
 

@@ -20,6 +20,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     val busy = Output(Bool())
     val debugVrf = Option.when(vParams.debugVrf)(Output(Vec(egsTotal, UInt(dLen.W))))
     val vrfPerf = Output(new VrfPerf)
+    val executionPerf = Output(new EvuExecutionPerf)
 
     val index_access = new VectorIndexAccessIO
     val mask_access = new VectorMaskAccessIO
@@ -65,11 +66,17 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
   val xissParams = vParams.issStructure.generate(vParams)
   val all_supported_insns = xissParams.map(_.insns).flatten
+  val interleave = vParams.interleaveReductions && vParams.reductionContexts > 1
+  val contextCounts = xissParams.map(_.seqs.map { s =>
+    if (interleave && (s.name == "fp_fma" || s.name == "fp_cmp")) 1 + vParams.reductionContexts else 1
+  })
 
   val vlissq = Module(new IssueQueue(vParams.vlissqEntries, 1))
   val vsissq = Module(new IssueQueue(vParams.vsissqEntries, 1))
   val vpissq = Module(new IssueQueue(vParams.vpissqEntries, vParams.reductionContexts))
-  val vxissqs = xissParams.map(q => Module(new IssueQueue(q.depth, q.seqs.size)).suggestName(s"vxissq_${q.name}"))
+  val vxissqs = xissParams.zip(contextCounts).map { case (q, counts) =>
+    Module(new IssueQueue(q.depth, counts.sum)).suggestName(s"vxissq_${q.name}")
+  }
 
   val vxus = xissParams.map(_.seqs.map(s => Module(new ExecutionUnit(s.fus, s.name)).suggestName(s"vxu${s.name}")))
   val flat_vxus = vxus.flatten
@@ -78,19 +85,35 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   val vls = Module(new LoadSequencer)
   val vss = Module(new StoreSequencer)
   val reductionSeqs = (0 until vParams.reductionContexts).map { i =>
-    Module(new SpecialSequencer(all_supported_insns, i, vParams.reductionContexts)).suggestName(s"vps$i")
+    Module(new SpecialSequencer(all_supported_insns, i, vParams.reductionContexts, interleave)).suggestName(s"vps$i")
   }
   val vps = reductionSeqs.head // Only context zero handles permutations and VMU index/mask streams.
-  val vxs = xissParams.map(q => q.seqs.map(s =>
-    Module(new ExecuteSequencer(s.insns, maxPipeDepth, s.fus.size)).suggestName(s"vxs${s.name}")
-  ))
+  val executionContexts = xissParams.zip(contextCounts).map { case (q, counts) =>
+    q.seqs.zip(counts).map { case (s, count) =>
+      (0 until count).map { c =>
+        Module(new ExecuteSequencer(s.insns, maxPipeDepth, s.fus.size,
+          ordinaryOnly = count > 1 && c == 0, reductionOnly = count > 1 && c > 0))
+          .suggestName(s"vxs${s.name}_$c")
+      }
+    }
+  }
+  val vxs = executionContexts.map(_.flatten)
 
   val allSeqs = Seq(vls, vss) ++ reductionSeqs ++ vxs.flatten
   val allIssQs = Seq(vlissq, vsissq, vpissq) ++ vxissqs
 
   val flat_vxs = vxs.flatten
+  val contextsByFu = executionContexts.flatten
+  val fuBySequencer = contextsByFu.zip(flat_vxus).flatMap { case (seqs, xu) => seqs.map(_ => xu) }
+  val representativeByFu = contextsByFu.map(seqs => flat_vxs.indexOf(seqs.head))
+  io.executionPerf := 0.U.asTypeOf(io.executionPerf)
+  def perfCount(condition: Bool): UInt = {
+    val counter = RegInit(0.U(64.W))
+    when(condition) { counter := counter + 1.U }
+    counter
+  }
   val pendingWrites = Wire(Vec(vParams.vrfBanking, Valid(new VectorWriteHazard)))
-  require(flat_vxs.size == flat_vxus.size)
+  require(contextsByFu.size == flat_vxus.size)
 
   io.fp_req.valid := false.B
   io.fp_req.bits := DontCare
@@ -143,6 +166,20 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     ReadsVS1AsMask, ReadsVS2AsMask, ReadsVS1, ReadsVS2, ReadsVD,
     VMBitReadsVM, AlwaysReadsVM, WritesVD, WritesScalar, ScalarToVD0
   ))).decode(vdq.io.deq.bits)
+  // Allocate a shared owner before either half of a reduction enters its
+  // queue. VAT parity cannot select contexts: alternating sum/max commands
+  // would otherwise pin every sum to the same context.
+  val reductionAllocated = RegInit(VecInit.fill(vParams.reductionContexts)(false.B))
+  val reductionChoice = PriorityEncoderOH(VecInit(reductionAllocated.map(!_)).asUInt)
+  val dispatchReduction = !vdq.io.deq.bits.vmu && dis_ctrl.bool(Reduction)
+  val reductionBlocked = interleave.B && dispatchReduction && reductionAllocated.asUInt.andR
+  io.executionPerf.reductionFull := perfCount(vdq.io.deq.valid && reductionBlocked)
+  for ((seq, c) <- reductionSeqs.zipWithIndex) {
+    when(seq.io.acc_done && seq.io.busy) { reductionAllocated(c) := false.B }
+    when(interleave.B && vdq.io.deq.fire && dispatchReduction && reductionChoice(c)) {
+      reductionAllocated(c) := true.B
+    }
+  }
 
   // Load sequencer
   vlissq.io.enq.bits.nf_log2 := log2_up(vdq.io.deq.bits.nf, 8)
@@ -183,7 +220,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   // Connect issue queues to sequencers
 
   val issq_stall = Wire(Vec(issGroups.size, Bool()))
-  vdq.io.deq.ready := !issq_stall.orR
+  vdq.io.deq.ready := !issq_stall.orR && !reductionBlocked
 
   var flat_vxu_id: Int = 0
 
@@ -218,8 +255,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
       val (other_vxus, same_vxu): (Seq[ExecutionUnit], Option[ExecutionUnit]) = seq match {
         case s: ExecuteSequencer => {
-          val other_vxus = flat_vxus.zipWithIndex.filter(_._2 != flat_vxu_id).map(_._1)
-          val same_vxu = flat_vxus(flat_vxu_id)
+          val same_vxu = fuBySequencer(flat_vxu_id)
+          val other_vxus = flat_vxus.filterNot(_ == same_vxu)
           flat_vxu_id += 1
           (other_vxus, Some(same_vxu))
         }
@@ -258,10 +295,18 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       }
     }
 
-    val accepts = group.seqs.map(_.accepts(vdq.io.deq.bits))
+    val accepts = group.seqs.zipWithIndex.map { case (seq, c) =>
+      val contextAllowed = if (!interleave) true.B else if (group.issq == vpissq) {
+        !dispatchReduction || reductionChoice(c)
+      } else seq match {
+        case s: ExecuteSequencer if s.reductionOnly => reductionChoice(c - 1)
+        case _ => true.B
+      }
+      seq.accepts(vdq.io.deq.bits) && contextAllowed
+    }
     issq_stall(i) := !group.issq.io.enq.ready && accepts.orR
 
-    group.issq.io.enq.valid := vdq.io.deq.valid && !issq_stall.orR && accepts.orR
+    group.issq.io.enq.valid := vdq.io.deq.valid && !issq_stall.orR && !reductionBlocked && accepts.orR
     group.issq.io.enq.bits.viewAsSupertype(new VectorIssueInst) := vdq.io.deq.bits
     group.issq.io.enq.bits.seq := VecInit(accepts).asUInt
 
@@ -300,9 +345,10 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     if (i != 0) { seq.io.iss.ready := false.B }
   }
 
+  val executeCandidates = scala.collection.mutable.ArrayBuffer.empty[DecoupledIO[ExecuteMicroOpWithData]]
   for (i <- 0 until flat_vxs.size) {
     val vxs = flat_vxs(i)
-    val vxu = flat_vxus(i)
+    val vxu = fuBySequencer(i)
 
     vrf.io.vxs(i).rvs1.req <> vxs.io.rvs1.req
     vrf.io.vxs(i).rvs2.req <> vxs.io.rvs2.req
@@ -315,7 +361,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     vrf.io.vxs(i).prefetch := vxs.io.prefetch
 
     val vxs_iss = vxs.io.iss.bits
-    val vxu_iss = vxu.io.iss.bits
+    val candidate = Wire(Decoupled(new ExecuteMicroOpWithData(vxu.nFUs)))
+    val vxu_iss = candidate.bits
 
     val rvs1_data = Mux1H(Seq(
       vxs_iss.use_scalar_rvs1 -> dLenSplat(vxs_iss.scalar, vxs_iss.rvs1_eew),
@@ -349,9 +396,10 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     vxu_iss.rmask := Mux(vxs_iss.vm, ~(0.U(dLenB.W)), vm_resp)
     vxu_iss.rvm_data := Mux(vxs_iss.vm, ~(0.U(dLen.W)), vxs.io.rvm_data)
 
-    vxu.io.iss.valid := vxs.io.iss.valid
-    vxs.io.iss.ready := vxu.io.iss.ready
-    vxu.io.iss.bits.viewAsSupertype(new ExecuteMicroOp(vxu.nFUs)) := vxs.io.iss.bits
+    candidate.valid := vxs.io.iss.valid
+    vxs.io.iss.ready := candidate.ready
+    candidate.bits.viewAsSupertype(new ExecuteMicroOp(vxu.nFUs)) := vxs.io.iss.bits
+    executeCandidates += candidate
 
     when (vxs_iss.acc) {
       val owners = reductionSeqs.map(s => s.io.busy && s.io.vat === vxs.io.vat)
@@ -397,6 +445,39 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     }
   }
 
+  // Contexts share one arithmetic unit and one physical result channel.
+  // Reserve output time across all contexts, including different latencies.
+  for (((seqs, xu), factory) <- contextsByFu.zip(flat_vxus).zip(xissParams.flatMap(_.seqs))) {
+    val arb = Module(new SharedExecutionArbiter(seqs.size, maxPipeDepth, xu.nFUs))
+    for ((seq, c) <- seqs.zipWithIndex) { arb.io.in(c) <> executeCandidates(flat_vxs.indexOf(seq)) }
+    xu.io.iss <> arb.io.out
+    if (factory.name == "fp_fma") {
+      val previousVat = RegEnable(xu.io.iss.bits.vat, xu.io.iss.fire)
+      val previousValid = RegNext(xu.io.iss.fire, false.B)
+      val previousReduction = RegEnable(xu.io.iss.bits.acc, false.B, xu.io.iss.fire)
+      io.executionPerf.fmaIssue := perfCount(xu.io.iss.fire)
+      io.executionPerf.fmaNoWork := perfCount(!seqs.map(_.io.busy).reduce(_ || _))
+      io.executionPerf.fmaOperandWait := perfCount(seqs.map(_.io.busy).reduce(_ || _) && !arb.io.out.valid)
+      io.executionPerf.fmaFeedbackWait := perfCount(seqs.filter(_.reductionOnly)
+        .map(s => s.io.busy && !s.io.acc_valid).foldLeft(false.B)(_ || _))
+      io.executionPerf.fmaInterleave := perfCount(xu.io.iss.fire && previousValid &&
+        previousReduction && xu.io.iss.bits.acc && xu.io.iss.bits.vat =/= previousVat &&
+        (seqs.count(_.reductionOnly) > 1).B)
+    }
+    if (factory.name == "fp_exp") { io.executionPerf.expIssue := perfCount(xu.io.iss.fire) }
+    if (factory.name == "fp_div") { io.executionPerf.divIssue := perfCount(xu.io.iss.fire) }
+    for ((seq, c) <- seqs.zipWithIndex) {
+      val idx = flat_vxs.indexOf(seq)
+      vrf.io.vxs(idx).pipe_write_req.request := seq.io.pipe_write_req.request
+      vrf.io.vxs(idx).pipe_write_req.bank_sel := seq.io.pipe_write_req.bank_sel
+      vrf.io.vxs(idx).pipe_write_req.pipe_depth := seq.io.pipe_write_req.pipe_depth
+      vrf.io.vxs(idx).pipe_write_req.oldest := seq.io.pipe_write_req.oldest
+      vrf.io.vxs(idx).pipe_write_req.fire := seq.io.pipe_write_req.fire
+      seq.io.pipe_write_req.available := vrf.io.vxs(idx).pipe_write_req.available &&
+        arb.io.available(c)
+    }
+  }
+
   val frontend_rindex = Wire(new VectorReadIO)
   val frontend_rmask  = Wire(new VectorReadIO)
   vrf.io.frontend.rindex <> frontend_rindex
@@ -405,10 +486,16 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   // ============================
   // Connect writes to VRF
   for (i <- 0 until flat_vxs.size) {
-    vrf.io.vxs(i).pipe_write_req <> flat_vxs(i).io.pipe_write_req
-    vrf.io.pipe_writes(i) <> flat_vxus(i).io.pipe_write
-    vrf.io.iter_writes(i) <> flat_vxus(i).io.iter_write
-    vrf.io.iterOwners(i) := flat_vxus(i).io.iterWriteVat
+    vrf.io.pipe_writes(i) := 0.U.asTypeOf(vrf.io.pipe_writes(i))
+    vrf.io.iter_writes(i).valid := false.B
+    vrf.io.iter_writes(i).bits := 0.U.asTypeOf(vrf.io.iter_writes(i).bits)
+    vrf.io.iterOwners(i) := 0.U
+  }
+  for ((xu, i) <- flat_vxus.zipWithIndex) {
+    val port = representativeByFu(i)
+    vrf.io.pipe_writes(port) <> xu.io.pipe_write
+    vrf.io.iter_writes(port) <> xu.io.iter_write
+    vrf.io.iterOwners(port) := xu.io.iterWriteVat
   }
 
   val load_write = Wire(Decoupled(new VectorWrite(dLen)))
@@ -543,7 +630,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     if (vxs.usesAcc) {
       for (seq <- reductionSeqs) {
         when (vxs.io.vat === seq.io.vat && vxs.io.busy && seq.io.busy) {
-          seq.io.acc_data.ready := vxs.io.acc_ready
+          seq.io.acc_data.ready := vxs.io.acc_ready && vxs.io.iss.ready
           seq.io.acc_slot := vxs.io.acc_slot
           seq.io.acc_other_slot := vxs.io.acc_other_slot
           seq.io.acc_merge := vxs.io.acc_merge

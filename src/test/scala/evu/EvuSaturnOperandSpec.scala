@@ -30,6 +30,7 @@ class EvuSaturnOperandHarness(special: Boolean, pipelinedReads: Boolean = false)
     val prefetch = Output(Vec(3, Valid(new VectorReadReq)))
     val issueIndex = Output(UInt(log2Ceil(maxVLMax).W))
     val writeBank = Output(UInt(vParams.vrfBanking.W))
+    val writeRequest = Output(Bool())
   })
   val inst = WireInit(0.U.asTypeOf(new BackendIssueInst))
   inst.vconfig.vl := io.vl
@@ -42,6 +43,7 @@ class EvuSaturnOperandHarness(special: Boolean, pipelinedReads: Boolean = false)
   io.prefetch := 0.U.asTypeOf(io.prefetch)
   io.issueIndex := 0.U
   io.writeBank := 0.U
+  io.writeRequest := false.B
   if (special) {
     val seq = Module(new SpecialSequencer(IntegerPipeFactory.insns ++ PermuteUnitFactory.insns))
     // Masked indexed load: index vector v8 and mask v0 both select bank 0.
@@ -111,6 +113,7 @@ class EvuSaturnOperandHarness(special: Boolean, pipelinedReads: Boolean = false)
     io.prefetch := seq.io.prefetch
     io.issueIndex := seq.io.iss.bits.eidx
     io.writeBank := seq.io.pipe_write_req.bank_sel
+    io.writeRequest := seq.io.pipe_write_req.request
   }
 }
 
@@ -310,11 +313,13 @@ class EvuSaturnOperandSpec extends AnyFlatSpec with ChiselScalatestTester {
         dut.clock.step(3)
         dut.io.req.foreach(_.expect(false.B))
         dut.io.issue.expect(false.B)
+        dut.io.writeRequest.expect(false.B)
         dut.io.ready.foreach(_.poke(false.B))
         dut.io.olderWrites.poke(0.U)
         val ports = if (special) Seq(1, 0) else Seq(3, 2, 0, 1)
         for ((port, index) <- ports.zipWithIndex) {
           dut.io.issue.expect(false.B)
+          dut.io.writeRequest.expect(false.B)
           dut.io.req(port).expect(true.B)
           dut.io.resp(port).poke((0x100 + port).U)
           dut.io.ready(port).poke(true.B)
@@ -324,6 +329,7 @@ class EvuSaturnOperandSpec extends AnyFlatSpec with ChiselScalatestTester {
           dut.io.req(port).expect(false.B)
           dut.io.data(port).expect((0x100 + port).U)
           dut.io.issue.expect((index == ports.size-1).B)
+          dut.io.writeRequest.expect((!special && index == ports.size-1).B)
         }
         dut.clock.step(3)
         for (port <- ports) dut.io.data(port).expect((0x100 + port).U)

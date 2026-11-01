@@ -22,15 +22,19 @@ case class EvuParams(
     loadInflightDepth:  Int = 32,
     loadResponseDepth:  Int = 32,
     maxMemOutstanding:  Int = 8,
-    commandDepth:       Int = 8,
-    completionDepth:    Int = 8,
+    memoryCommandDepth: Int = 2,
+    commandDepth:       Int = 16,
+    completionDepth:    Int = 16,
     matrixStoreEntries: Int = 16,
     matrixStoreQueueDepth: Int = 8,
     egChaining: Boolean = true,
     vmuLineCoalescing: Boolean = true,
     splitFpIssue: Boolean = true,
     reductionContexts: Int = 2,
-    scalarInstructions: Boolean = true
+    scalarInstructions: Boolean = true,
+    decoupledAmuIssue: Boolean = true,
+    interleaveReductions: Boolean = true,
+    quantCommandDepth: Int = 4
 ) {
   require(vlenBits > 0 && vlenBits   % 8 == 0)
   require(dlenBits > 0 && dlenBits   % 8 == 0 && vlenBits > dlenBits && vlenBits % dlenBits == 0)
@@ -50,6 +54,10 @@ case class EvuParams(
   require(maxMemOutstanding >= 8 && (maxMemOutstanding & (maxMemOutstanding - 1)) == 0)
   require(matrixStoreEntries >= 2 && matrixStoreQueueDepth > 0)
   require(commandDepth > 0 && completionDepth > 0)
+  require(memoryCommandDepth >= 1 && memoryCommandDepth <= 4 && memoryCommandDepth <= commandDepth)
+  require(commandDepth <= 32 && (commandDepth & (commandDepth - 1)) == 0,
+    "EVU job IDs must fit the Saturn VAT space and wrap at a power of two")
+  require(quantCommandDepth >= 1 && quantCommandDepth <= commandDepth)
   require(reductionContexts >= 1 && reductionContexts <= 4)
 
   val vrfBankCount: Int = vrfBanks
@@ -62,7 +70,7 @@ case class EvuParams(
   val translationPages: Int = (8 * vlenBytes + 4095) / 4096 + 1
 }
 
-/** Translations checked before retirement, valid for one serialized command. */
+/** Translations checked before retirement, retained separately for each command. */
 class EvuPageMap(p: EvuParams) extends Bundle {
   val enabled = Bool()
   val base = UInt(64.W)
