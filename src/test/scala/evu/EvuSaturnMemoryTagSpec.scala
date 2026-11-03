@@ -103,6 +103,9 @@ class EvuSaturnMemoryTagSpec extends AnyFlatSpec with ChiselScalatestTester with
         var response = Option.empty[Response]
         val memory = mutable.Map.empty[BigInt, BigInt]
         val accesses = mutable.ArrayBuffer.empty[(BigInt, Boolean)]
+        val storeMasks = mutable.Map.empty[BigInt, BigInt]
+        val beatMask = (BigInt(1) << ep.mlenBits) - 1
+        val fullByteMask = (BigInt(1) << ep.mlenBytes) - 1
         var cycles = 0
         var lastStoreAddress = Option.empty[BigInt]
         var failLastStore = false
@@ -130,9 +133,16 @@ class EvuSaturnMemoryTagSpec extends AnyFlatSpec with ChiselScalatestTester with
             (pending.map(_.tag) ++ response.map(_.tag)) should not contain tag
             val addr = req.addr.peek().litValue
             val write = req.write.peek().litToBoolean
-            req.mask.expect(((BigInt(1) << ep.mlenBytes) - 1).U)
+            val expectedMask = if (write) storeMasks.getOrElse(addr, fullByteMask) else fullByteMask
+            req.mask.expect(expectedMask.U)
             accesses += ((addr, write))
-            if (write) memory(addr) = req.data.peek().litValue
+            if (write) {
+              val bitMask = (0 until ep.mlenBytes).filter(expectedMask.testBit).foldLeft(BigInt(0)) {
+                (mask, byte) => mask | (BigInt(255) << (8 * byte))
+              }
+              memory(addr) = (memory.getOrElse(addr, BigInt(0)) & ~bitMask) |
+                (req.data.peek().litValue & bitMask)
+            }
             val delay = if (write && lastStoreAddress.contains(addr)) 80 else 0
             pending += Response(tag, if (write) BigInt(0) else memory(addr), cycles + delay,
               delay != 0 && failLastStore)
@@ -143,7 +153,7 @@ class EvuSaturnMemoryTagSpec extends AnyFlatSpec with ChiselScalatestTester with
         }
 
         def issue(store: Boolean, reg: Int, base: Int, job: Int, sew: Int,
-                  error: Boolean = false, zeroVl: Boolean = false): Unit = {
+                  error: Boolean = false, zeroVl: Boolean = false, vl: Option[Int] = None): Unit = {
           lastStoreAddress = Option.when(store)(BigInt(base + ep.vlenBytes - ep.mlenBytes))
           failLastStore = error
           val cmd = dut.io.command.bits
@@ -152,7 +162,7 @@ class EvuSaturnMemoryTagSpec extends AnyFlatSpec with ChiselScalatestTester with
           cmd.vd.poke(reg.U)
           cmd.vs1.poke(0.U)
           cmd.vs2.poke(0.U)
-          cmd.vl.poke((if (zeroVl) 0 else ep.vlenBytes >> sew).U)
+          cmd.vl.poke((if (zeroVl) 0 else vl.getOrElse(ep.vlenBytes >> sew)).U)
           cmd.base.poke(base.U)
           cmd.stride.poke(0.S)
           cmd.length.poke(ep.vlenBytes.U)
@@ -210,9 +220,9 @@ class EvuSaturnMemoryTagSpec extends AnyFlatSpec with ChiselScalatestTester with
         }
 
         val chunks = ep.vlenBytes / ep.mlenBytes
-        chunks shouldBe 16
-        // Three vectors advance the 32-entry load queue through tags 0..31 and back to 0.
-        for (round <- 0 until 3) {
+        chunks shouldBe 8
+        // Five vectors wrap the 32-entry load queue with full 64-byte beats.
+        for (round <- 0 until 5) {
           val src = 0x1000 + round * 0x400
           val dst = 0x4000 + round * 0x400
           val reg = round + 1
@@ -223,13 +233,36 @@ class EvuSaturnMemoryTagSpec extends AnyFlatSpec with ChiselScalatestTester with
           }
           for (chunk <- values.indices) memory(BigInt(src + chunk * ep.mlenBytes)) = values(chunk)
           accesses.clear()
-          issue(store = false, reg = reg, base = src, job = round * 2, sew = round)
+          issue(store = false, reg = reg, base = src, job = round * 2, sew = round % 3)
           accesses.toSeq shouldBe values.indices.map(chunk => (BigInt(src + chunk * ep.mlenBytes), false))
           for (chunk <- values.indices) dut.io.vrf(reg * chunks + chunk).expect(values(chunk).U)
           accesses.clear()
-          issue(store = true, reg = reg, base = dst, job = round * 2 + 1, sew = round)
+          issue(store = true, reg = reg, base = dst, job = round * 2 + 1, sew = round % 3)
           accesses.toSeq shouldBe values.indices.map(chunk => (BigInt(dst + chunk * ep.mlenBytes), true))
           for (chunk <- values.indices) memory(BigInt(dst + chunk * ep.mlenBytes)) shouldBe values(chunk)
+        }
+        // Exercise byte/halfword/word tails on either side of the new 64-byte boundary.
+        val guard = BigInt("a5" * ep.mlenBytes, 16)
+        for (sew <- Seq(0, 1, 2);
+             vl <- Seq(1, (ep.mlenBytes >> sew) - 1, ep.mlenBytes >> sew, (ep.mlenBytes >> sew) + 1)) {
+          val bytes = vl << sew
+          for (chunk <- 0 until chunks) {
+            val address = BigInt(0x7000 + chunk * ep.mlenBytes)
+            memory(address) = guard
+            val active = math.max(0, math.min(ep.mlenBytes, bytes - chunk * ep.mlenBytes))
+            storeMasks(address) = (BigInt(1) << active) - 1
+          }
+          accesses.clear()
+          issue(store = true, reg = 1, base = 0x7000, job = 10, sew = sew, vl = Some(vl))
+          accesses.size shouldBe ((bytes + ep.mlenBytes - 1) / ep.mlenBytes)
+          for (chunk <- 0 until chunks) {
+            val active = math.max(0, math.min(ep.mlenBytes, bytes - chunk * ep.mlenBytes))
+            val mask = (BigInt(1) << (active * 8)) - 1
+            val source = dut.io.vrf(chunks + chunk).peek().litValue
+            memory(BigInt(0x7000 + chunk * ep.mlenBytes)) shouldBe
+              (((guard & ~mask) | (source & mask)) & beatMask)
+          }
+          storeMasks.clear()
         }
         issue(store = true, reg = 1, base = 0x6000, job = 6, sew = 0, error = true)
         issue(store = false, reg = 1, base = 0x1000, job = 7, sew = 0)

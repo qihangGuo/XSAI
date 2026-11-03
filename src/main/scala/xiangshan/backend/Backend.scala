@@ -887,6 +887,10 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
     check.req.bits.length := Mux(launch, payload.length, effectiveLength)
     check.req.bits.read := load
     check.req.bits.write := store
+    // Custom ordinary stores are unmasked and unit-stride. Only a 64-byte
+    // VMU beat with full aligned coverage is guaranteed to avoid external RMW.
+    check.req.bits.fullLineWrite := (p(ExternalVectorKey).mlenBits == 512).B &&
+      f7 === EvuIsa.store && !payload.base(5, 0).orR && !effectiveLength(5, 0).orR
     check.req.bits.alignment := effectiveSew
     check.req.bits.unbounded := launch
     check.req.bits.illegal := !launch && (csrio.evu.config.vill ||
@@ -922,6 +926,20 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
     }
     when(check.resp.fire && check.resp.bits.fault =/= EvuAddressFault.None) {
       evuCheckedFault := check.resp.bits
+    }
+    check.perf.foreach { perf =>
+      val trace = freechips.rocketchip.util.PlusArg("evu_mem_trace", width = 1)
+      val fenceIndex = RegInit(0.U(32.W))
+      val outputWait = RegInit(0.U(64.W))
+      val serialWait = RegInit(0.U(64.W))
+      when(source.valid && memory && !check.resp.valid && !killed) { outputWait := outputWait + 1.U }
+      when(source.valid && memory && !checking && preflightBlocked && !killed) { serialWait := serialWait + 1.U }
+      when(csrio.evu.completed.valid && csrio.evu.completed.bits.opcode === xiangshan.evu.EvuOpcode.Fence) {
+        fenceIndex := fenceIndex + 1.U
+        when(trace.asBool) {
+          printf(p"[EVU-PREFLIGHT] fence=${fenceIndex} cmd=${perf.commands} busy=${perf.busy} checks=${perf.checks} reads=${perf.reads} writes=${perf.writes} fullstore=${perf.fullStores} lookupstall=${perf.lookupStall} tlbreq=${perf.tlbRequests} tlbmiss=${perf.tlbMisses} sbwait=${perf.sbWait} outputwait=${outputWait} serialwait=${serialWait}\n")
+        }
+      }
     }
   }
   wbDataPath.io.fromFpExu <> fpExuBlock.io.out

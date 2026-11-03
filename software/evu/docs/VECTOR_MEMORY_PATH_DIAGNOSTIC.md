@@ -3,9 +3,11 @@
 EVU entry: `software/evu/vector_memory_path_evu_test.c`.
 RVV entry: `nexus-am/tests/exp2test/tests/performance/vfexp2_memory_path_matched.c`.
 The existing primary online softmax tests are not changed. The new entries
-include their existing kernels, and share the driver in
-`nexus-am/tests/exp2test/include/vector_memory_path_bench.h`. Synchronize the
-header and the RVV Makefile as well as the EVU source when using the server.
+include their existing kernels. EVU ships `vector_memory_path_bench.h` and
+`online_softmax_bench.h` in `software/evu/include/`; RVV uses identical copies
+in `nexus-am/tests/exp2test/include/`. Keep both copies identical when changing
+the shared driver. EVU does not require the RVV test headers under `AM_HOME`.
+Synchronize each test's headers, source and Makefile when using the server.
 No RTL, NEMU, CUTE, or new performance CSR is required.
 
 ## Questions answered

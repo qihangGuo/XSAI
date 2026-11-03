@@ -11,7 +11,7 @@ class EvuVmuLineCoalescerSpec extends AnyFlatSpec with ChiselScalatestTester wit
   behavior of "Bounded multi-command VMU line coalescing"
 
   it should "serialize overlapping and cross-epoch stores including a crossing request's second line" in {
-    test(new EvuVmuLineCoalescer(EvuParams(enable = true)))
+    test(new EvuVmuLineCoalescer(EvuParams(enable = true), collectRmwStores = false))
       .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
         dut.io.flush.poke(false.B)
         dut.io.drain.poke(false.B)
@@ -79,7 +79,7 @@ class EvuVmuLineCoalescerSpec extends AnyFlatSpec with ChiselScalatestTester wit
 
   for (issued <- Seq(false, true)) {
     it should s"cancel a ${if (issued) "sent" else "buffered"} owner on flush before reusing its tag" in {
-      test(new EvuVmuLineCoalescer(EvuParams(enable = true))).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      test(new EvuVmuLineCoalescer(EvuParams(enable = true), collectRmwStores = false)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
         dut.io.flush.poke(false.B)
         dut.io.drain.poke(false.B)
         dut.io.storePending.poke(true.B)
@@ -136,7 +136,7 @@ class EvuVmuLineCoalescerSpec extends AnyFlatSpec with ChiselScalatestTester wit
 
   for (write <- Seq(false, true)) {
     it should s"share two half-line ${if (write) "stores" else "loads"} and acknowledge both owners after memory" in {
-      test(new EvuVmuLineCoalescer(EvuParams(enable = true)))
+      test(new EvuVmuLineCoalescer(EvuParams(enable = true), collectRmwStores = false))
         .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
           dut.io.flush.poke(false.B)
           dut.io.drain.poke(false.B)
@@ -207,7 +207,7 @@ class EvuVmuLineCoalescerSpec extends AnyFlatSpec with ChiselScalatestTester wit
   }
 
   it should "bound collection when a pending store stops making progress" in {
-    test(new EvuVmuLineCoalescer(EvuParams(enable = true)))
+    test(new EvuVmuLineCoalescer(EvuParams(enable = true), collectRmwStores = false))
       .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
         dut.io.flush.poke(false.B)
         dut.io.drain.poke(false.B)
@@ -257,7 +257,7 @@ class EvuVmuLineCoalescerSpec extends AnyFlatSpec with ChiselScalatestTester wit
 
   for (error <- Seq(false, true)) {
     it should s"combine disjoint jobs and fan out ${if (error) "faults" else "Acks"} only after a physical response" in {
-      test(new EvuVmuLineCoalescer(EvuParams(enable = true)))
+      test(new EvuVmuLineCoalescer(EvuParams(enable = true), collectRmwStores = false))
         .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
           dut.io.flush.poke(false.B)
           dut.io.drain.poke(false.B)
@@ -324,7 +324,7 @@ class EvuVmuLineCoalescerSpec extends AnyFlatSpec with ChiselScalatestTester wit
   }
   for (depth <- Seq(1, 2, 4)) {
     it should s"send an isolated partial store immediately at command depth $depth" in {
-      test(new EvuVmuLineCoalescer(EvuParams(enable = true, memoryCommandDepth = depth)))
+      test(new EvuVmuLineCoalescer(EvuParams(enable = true, memoryCommandDepth = depth), collectRmwStores = false))
         .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
           dut.io.flush.poke(false.B)
           dut.io.drain.poke(false.B)
@@ -366,7 +366,7 @@ class EvuVmuLineCoalescerSpec extends AnyFlatSpec with ChiselScalatestTester wit
   }
 
   it should "avoid collection bubbles in 96 sequential scalar state stores without successors" in {
-    test(new EvuVmuLineCoalescer(EvuParams(enable = true, memoryCommandDepth = 2)))
+    test(new EvuVmuLineCoalescer(EvuParams(enable = true, memoryCommandDepth = 2), collectRmwStores = false))
       .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
         dut.io.flush.poke(false.B)
         dut.io.drain.poke(false.B)

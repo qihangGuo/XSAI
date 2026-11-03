@@ -16,6 +16,7 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0, reduc
     val vss = new Bundle {
       val rvd = Flipped(new VectorReadIO)
       val rvm = Flipped(new VectorReadIO)
+      val e0Read = Input(Bool())
     }
     val vxs = Vec(exSeqs, new Bundle {
       val rvs1 = Flipped(new VectorReadIO)
@@ -24,6 +25,7 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0, reduc
       val rvm = Flipped(new VectorReadIO)
       val pipe_write_req = Flipped(new VectorPipeWriteReqIO(maxExuDepth))
       val prefetch = Input(Vec(3, Valid(new VectorReadReq)))
+      val e0Read = Input(Vec(3, Bool()))
     })
     val vps = Vec(reductionContexts, new Bundle {
       val rvs2 = Flipped(new VectorReadIO)
@@ -63,7 +65,8 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0, reduc
     llWrites = exSeqs + 2, // load + reset
     maxExuDepth,
     prefetchPorts = (0 until exSeqs).flatMap(i => (0 until 3).map(group => (group, i))),
-    trackWrites = true
+    trackWrites = true,
+    scalarPorts = (0 until exSeqs).flatMap(i => (0 until 3).map(group => (group, i))) :+ (2, exSeqs)
   ))
   val resetting = RegInit(true.B)
   io.perf := vrf.io.perf
@@ -78,8 +81,10 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0, reduc
   }
   for (i <- 0 until exSeqs; port <- 0 until 3) {
     vrf.io.prefetch(i * 3 + port) := io.vxs(i).prefetch(port)
+    vrf.io.e0Read(i * 3 + port) := io.vxs(i).e0Read(port) && !resetting
     when (resetting) { vrf.io.prefetch(i * 3 + port).valid := false.B }
   }
+  vrf.io.e0Read(exSeqs * 3) := io.vss.e0Read && !resetting
 
   io.debug.foreach(_ := vrf.io.debug.get)
   val reset_ctr = RegInit(0.U(log2Ceil(egsTotal).W))

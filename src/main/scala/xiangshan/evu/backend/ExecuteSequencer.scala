@@ -10,7 +10,16 @@ import freechips.rocketchip.tile._
 import xiangshan.evu.common._
 import xiangshan.evu.insns._
 
-class ExecuteSequencerIO(maxDepth: Int, nFUs: Int)(implicit p: Parameters) extends SequencerIO(new ExecuteMicroOp(nFUs)) {
+class ExecuteWaitSignals extends Bundle {
+  val dependency = Bool()
+  val operands = Bool()
+  val feedback = Bool()
+  val permutation = Bool()
+  val writeback = Bool()
+  val execution = Bool()
+}
+
+class ExecuteSequencerIO(maxDepth: Int, nFUs: Int, forwarding: Boolean = false)(implicit p: Parameters) extends SequencerIO(new ExecuteMicroOp(nFUs)) {
   // The requester may receive its three operands over different cycles when
   // the Ara-style VRF serializes a bank conflict.  Keep the response data at
   // the sequencer so issue waits for collected operands rather than requiring
@@ -20,6 +29,12 @@ class ExecuteSequencerIO(maxDepth: Int, nFUs: Int)(implicit p: Parameters) exten
   val rvd  = new VectorReadIO
   val rvm  = new VectorReadIO
   val prefetch = Output(Vec(3, Valid(new VectorReadReq)))
+  val e0Read = Output(Vec(3, Bool()))
+  val waitReason = Output(new ExecuteWaitSignals)
+  val earlyOperandReads = Output(UInt(3.W))
+  val reductionPrefetch = Output(Bool())
+  val rawDependencies = Output(UInt(egsTotal.W))
+  val forward = Option.when(forwarding)(Vec(3, new VectorForwardOperand))
   val rvs1_data = Output(UInt(dLen.W))
   val rvs2_data = Output(UInt(dLen.W))
   val rvd_data = Output(UInt(dLen.W))
@@ -35,7 +50,8 @@ class ExecuteSequencerIO(maxDepth: Int, nFUs: Int)(implicit p: Parameters) exten
 }
 
 class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs: Int,
-    ordinaryOnly: Boolean = false, val reductionOnly: Boolean = false)(implicit p: Parameters) extends Sequencer[ExecuteMicroOp]()(p) {
+    ordinaryOnly: Boolean = false, val reductionOnly: Boolean = false,
+    resultForwarding: Boolean = false)(implicit p: Parameters) extends Sequencer[ExecuteMicroOp]()(p) {
   def usesPerm = supported_insns.count(_.props.contains(UsesGatherUnit.Y)) > 0
   def usesAcc = supported_insns.count(_.props.contains(Reduction.Y)) > 0
   def usesRvd = supported_insns.count(_.props.contains(ReadsVD.Y)) > 0
@@ -47,7 +63,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
       (!reductionOnly.B || ctrl.bool(Reduction))
   }
 
-  val io = IO(new ExecuteSequencerIO(maxPipeDepth, nFUs))
+  val io = IO(new ExecuteSequencerIO(maxPipeDepth, nFUs, resultForwarding))
 
   val valid = RegInit(false.B)
   val rvs1Captured = RegInit(false.B)
@@ -109,6 +125,14 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   val renvd    = inst.renvd && usesRvd.B
   val renvm    = inst.renvm
   val renacc   = inst.reduction && usesAcc.B
+  // Forward only FP32 E0 operands. A full EG, mask, gather, or reduction
+  // source must still read the preserved vector bytes from the SRAM.
+  val scalarOperation = inst.isOpf && eff_vl === 1.U && eidx === 0.U && !inst.reduction &&
+    !uses_perm && !renvm && !inst.writes_mask && vd_eew === 2.U
+  io.e0Read(0) := valid && inst.isOpf && renv1 && vs1_eew === 2.U &&
+    !inst.reads_vs1_mask && (inst.scalarVrfSource || scalarOperation)
+  io.e0Read(1) := valid && renv2 && vs2_eew === 2.U && scalarOperation && !inst.reads_vs2_mask
+  io.e0Read(2) := valid && renvd && vs3_eew === 2.U && scalarOperation
 
   val use_wmask = !inst.vm && sets_wmask
   val eidx_tail = next_eidx === eff_vl
@@ -242,15 +266,30 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   io.seq_hazard.bits.wintent := hazardMultiply(wvd_mask)
   io.seq_hazard.bits.vat := inst.vat
 
-  val vs1_read_oh = Mux(renv1   , UIntToOH(io.rvs1.req.bits.eg), 0.U)
-  val vs2_read_oh = Mux(renv2   , UIntToOH(io.rvs2.req.bits.eg), 0.U)
-  val vd_read_oh  = Mux(renvd   , UIntToOH(io.rvd.req.bits.eg ), 0.U)
-  val vm_read_oh  = Mux(renvm   , UIntToOH(io.rvm.req.bits.eg ), 0.U)
-  val vd_write_oh = Mux(inst.wvd, UIntToOH(io.iss.bits.wvd_eg), 0.U)
-
-  val raw_hazard = ((vs1_read_oh | vs2_read_oh | vd_read_oh | vm_read_oh) & io.older_writes) =/= 0.U
-  val waw_hazard = (vd_write_oh & io.older_writes) =/= 0.U
-  val war_hazard = (vd_write_oh & io.older_reads) =/= 0.U
+  // Check the addressed EG directly instead of expanding four full-width masks.
+  val sourceRaw = Seq((renv1, io.rvs1.req.bits.eg), (renv2, io.rvs2.req.bits.eg),
+    (renvd, io.rvd.req.bits.eg), (renvm, io.rvm.req.bits.eg))
+    .zipWithIndex.map { case ((enabled, eg), i) =>
+      val forwarded = if (resultForwarding && i < 3) io.forward.get(i).available else false.B
+      enabled && io.older_writes(eg) && !forwarded
+    }
+  io.forward.foreach { ports =>
+    val fullGroup = get_head_mask(~0.U(dLenB.W), eidx, incr_eew, dLen).andR &&
+      get_tail_mask(~0.U(dLenB.W), next_eidx, incr_eew, dLen).andR
+    val eligible = valid && inst.vm && !uses_perm && !inst.writes_mask && fullGroup &&
+      !elementwise && (!inst.reduction || !acc_fold && !acc_merge)
+    val enabled = Seq(renv1 && !inst.scalarVrfSource && !inst.reads_vs1_mask,
+      renv2 && !inst.reads_vs2_mask, renvd)
+    val captured = Seq(rvs1Captured, rvs2Captured, rvdCaptured)
+    for (i <- 0 until 3) { ports(i).eligible := eligible && enabled(i) && !captured(i) }
+  }
+  val raw_hazard = sourceRaw.reduce(_ || _)
+  io.rawDependencies := sourceRaw.zip(Seq(io.rvs1.req.bits.eg, io.rvs2.req.bits.eg,
+    io.rvd.req.bits.eg, io.rvm.req.bits.eg)).map { case (waiting, eg) =>
+    Mux(waiting, UIntToOH(eg, egsTotal), 0.U(egsTotal.W))
+  }.reduce(_ | _)
+  val waw_hazard = inst.wvd && io.older_writes(io.iss.bits.wvd_eg)
+  val war_hazard = inst.wvd && io.older_reads(io.iss.bits.wvd_eg)
   val data_hazard = raw_hazard || waw_hazard || war_hazard
 
   val rgatherv_e0_eidx = io.vgu.gather_eidx.bits
@@ -264,14 +303,17 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   io.rvd.req.bits.eg  := getEgId(inst.rd , eidx     , vs3_eew, false.B)
   io.rvm.req.bits.eg  := getEgId(0.U     , eidx     , 0.U    , true.B)
 
-  // Stored operands must be read after older writes have become visible.
-  // The previous combinational response could be discarded while stalled;
-  // a captured response would otherwise retain stale data across the hazard.
-  io.rvs1.req.valid := valid && !data_hazard && renv1 && !rvs1Captured
-  io.rvs2.req.valid := valid && !data_hazard && renv2 && !rvs2Captured &&
+  // Each operand may be collected after its own older writers have committed.
+  // A different source's RAW, or destination WAR/WAW, need not delay this read.
+  // Final issue still checks every hazard. Keep permutation reads conservative.
+  val readBlocked = sourceRaw.map(raw => raw || (uses_perm && data_hazard))
+  io.rvs1.req.valid := valid && !readBlocked(0) && renv1 && !rvs1Captured
+  io.rvs2.req.valid := valid && !readBlocked(1) && renv2 && !rvs2Captured &&
     (!(rgather_v || rgatherei16) || io.vgu.gather_eidx.valid)
-  io.rvd.req.valid  := valid && !data_hazard && renvd && !rvdCaptured
-  io.rvm.req.valid  := valid && !data_hazard && renvm && !rvmCaptured
+  io.rvd.req.valid  := valid && !readBlocked(2) && renvd && !rvdCaptured
+  io.rvm.req.valid  := valid && !readBlocked(3) && renvm && !rvmCaptured
+  io.earlyOperandReads := Mux(data_hazard, PopCount(VecInit(Seq(
+    io.rvs1.req.fire, io.rvs2.req.fire, io.rvd.req.fire, io.rvm.req.fire))), 0.U)
 
   // Oldest read requests get priority
   val oldest = inst.vat === io.vat_head
@@ -280,10 +322,9 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   io.rvd.req.bits.oldest  := oldest
   io.rvm.req.bits.oldest  := oldest
 
-  // A normal micro-op's successor is known before issue. Launch its reads
-  // while consuming the current responses, then retain returning operands in
-  // the collectors if execution backpressures. Do not speculate across
-  // reduction folds, permutations, sub-element steps or a self-aliasing EG.
+  // Launch normal successor reads on issue. FP unordered reductions may also
+  // prefetch one source EG during their streaming phase, never during the
+  // last input, accumulator merge, fold, masked or elementwise steps.
   val nextReads = Seq(
     getEgId(inst.rs1, next_eidx, vs1_eew, inst.reads_vs1_mask),
     getEgId(inst.rs2, next_eidx, vs2_eew, inst.reads_vs2_mask),
@@ -292,13 +333,20 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   val prefetchAllowed = io.iss.fire && !tail && !inst.reduction && !uses_perm && !elementwise &&
     vs1_eew === vd_eew && vs2_eew === vd_eew && vs3_eew === vd_eew &&
     !inst.reads_vs1_mask && !inst.reads_vs2_mask && !inst.writes_mask
+  val reductionStream = io.iss.fire && inst.isOpf && renacc && parallel_acc &&
+    !acc_fold && !acc_merge && !eidx_tail && next_eidx < eff_vl && !renvm &&
+    !uses_perm && !elementwise && vs2_eew === vd_eew && !inst.reads_vs2_mask && !inst.writes_mask
   for (i <- 0 until 3) {
-    val readMask = UIntToOH(nextReads(i), egsTotal)
-    io.prefetch(i).valid := prefetchAllowed && enabledReads(i) &&
-      !(readMask & io.older_writes).orR && !(readMask & vd_write_oh).orR
+    val nextEg = nextReads(i)
+    val nextInRange = nextEg < egsTotal.U
+    val nextIndex = nextEg(log2Ceil(egsTotal) - 1, 0)
+    val streamPrefetch = if (i == 1) reductionStream && renv2 else false.B
+    io.prefetch(i).valid := ((prefetchAllowed && enabledReads(i)) || streamPrefetch) &&
+      nextInRange && !io.older_writes(nextIndex) && !(inst.wvd && nextEg === io.iss.bits.wvd_eg)
     io.prefetch(i).bits.eg := nextReads(i)
     io.prefetch(i).bits.oldest := oldest
   }
+  io.reductionPrefetch := reductionStream && io.prefetch(1).valid
 
   // Legacy VRF ready acknowledges the returning SRAM data. Forward it in
   // that cycle; retain it only while the current micro-op is stalled.
@@ -335,6 +383,25 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     !(read_slide_buffer && !io.vgu.slide_req.ready) &&
     !(read_eidx_buffer && !io.vgu.gather_eidx.valid) &&
     !(renacc && !io.acc_valid)
+  val missingOperands = (renv1 && !(rvs1Captured || io.rvs1.req.fire)) ||
+    (renv2 && !(rvs2Captured || io.rvs2.req.fire)) ||
+    (renvd && !(rvdCaptured || io.rvd.req.fire)) ||
+    (renvm && !(rvmCaptured || io.rvm.req.fire))
+  val missingPermutation = (read_slide_buffer && !io.vgu.slide_req.ready) ||
+    (read_eidx_buffer && !io.vgu.gather_eidx.valid)
+  val missingFeedback = renacc && !io.acc_valid
+  // One primary reason per active sequencer; different sequencers may wait
+  // for different reasons in the same cycle.
+  io.waitReason := 0.U.asTypeOf(io.waitReason)
+  when(valid) {
+    when(data_hazard) { io.waitReason.dependency := true.B }
+      .elsewhen(missingFeedback) { io.waitReason.feedback := true.B }
+      .elsewhen(missingOperands) { io.waitReason.operands := true.B }
+      .elsewhen(missingPermutation) { io.waitReason.permutation := true.B }
+      .elsewhen(pipelined && (!io.pipe_write_req.available || !exu_scheduler.io.reqs(0).available)) {
+        io.waitReason.writeback := true.B
+      }.elsewhen(!io.iss.ready) { io.waitReason.execution := true.B }
+  }
   // A stalled consumer must not win a speculative bank reservation over the
   // reduction producing its operands, especially when both share one FU.
   io.pipe_write_req.request := operandsReady && pipelined && exu_scheduler.io.reqs(0).available

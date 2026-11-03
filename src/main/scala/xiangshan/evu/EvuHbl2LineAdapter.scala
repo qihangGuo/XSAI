@@ -10,6 +10,8 @@ class EvuLineMemoryRequest(p: EvuParams) extends Bundle {
   val addr = UInt(64.W)
   val data = UInt(512.W)
   val mask = UInt(64.W)
+  // Unmasked bytes are already preserved by a coalescer-owned line Get.
+  val fullLineData = Bool()
   val bytes = UInt(7.W)
   val write = Bool()
   val tag = UInt(p.memoryTagWidth.W)
@@ -80,6 +82,10 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
   io.client.req.ready := !io.flush && states(incoming.tag) === idle && !conflicts
   when(io.client.req.fire) {
     assert(incoming.bytes > 0.U && incoming.bytes <= 64.U, "Invalid EVU logical memory size")
+    when(incoming.fullLineData) {
+      assert(incoming.write && incoming.addr(5, 0) === 0.U && incoming.bytes === 64.U,
+        "Premerged EVU data must cover one aligned cache line")
+    }
     requests(incoming.tag) := incoming
     crosses(incoming.tag) := incomingCrosses
     second(incoming.tag) := false.B
@@ -91,7 +97,7 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
     val mask = (Cat(0.U(64.W), incoming.mask) << incoming.addr(5, 0))(63, 0)
     putData(incoming.tag) := (Cat(0.U(512.W), incoming.data) << (incoming.addr(5, 0) << 3))(511, 0)
     states(incoming.tag) := Mux(incoming.write && !incoming.mask.orR, respond,
-      Mux(incoming.write && mask.andR, writeReq, readReq))
+      Mux(incoming.write && (mask.andR || incoming.fullLineData), writeReq, readReq))
   }
 
   val arbiter = Module(new RRArbiter(new EvuLineMemoryRequest(p), n))
@@ -107,6 +113,7 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
     // Bus writes are still PutFullData. Retain the logical byte mask solely
     // for exact difftest attribution after cross-command store combining.
     arbiter.io.in(i).bits.mask := Mux(states(i) === writeReq, partMask(i), Fill(64, 1.U(1.W)))
+    arbiter.io.in(i).bits.fullLineData := states(i) === writeReq
     arbiter.io.in(i).bits.bytes := 64.U
     arbiter.io.in(i).bits.write := states(i) === writeReq
     arbiter.io.in(i).bits.tag := i.U

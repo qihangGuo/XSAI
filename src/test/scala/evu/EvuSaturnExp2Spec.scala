@@ -32,6 +32,7 @@ class EvuSaturnExp2ShellImp(outer: EvuSaturnExp2Shell)(implicit p: Parameters) e
     val flush = Input(Bool())
     val vstart = Input(UInt(log2Ceil(ep.vlenBits + 1).W))
     val cuteWrite = Output(Valid(new EvuCuteWrite(ep)))
+    val scalarForwards = Output(UInt(64.W))
   })
   val backend = Module(new EvuVectorBackend(ep)(p.alterPartial {
     case TileVisibilityNodeKey => outer.visibility
@@ -40,6 +41,7 @@ class EvuSaturnExp2ShellImp(outer: EvuSaturnExp2Shell)(implicit p: Parameters) e
   io.completion <> backend.io.completion
   io.memory <> backend.io.memory
   io.vrf := backend.io.debugVrf.get
+  io.scalarForwards := backend.io.vrfPerf.scalarForwards
   backend.io.flush := io.flush
   backend.io.vta := false.B
   backend.io.vma := false.B
@@ -77,7 +79,7 @@ class EvuSaturnExp2Spec extends AnyFlatSpec with ChiselScalatestTester with Matc
       case freechips.rocketchip.tile.MaxHartIdBits => 1
       case freechips.rocketchip.rocket.PgLevels => 3
     }
-    val ep = EvuParams(enable = true, enableDifftest = true, vlenBits = 512)
+    val ep = EvuParams(enable = true, enableDifftest = true, vlenBits = 1024)
     test(LazyModule(new EvuSaturnExp2Shell(ep)).module)
       .withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
         dut.clock.setTimeout(10000)
@@ -234,7 +236,7 @@ class EvuSaturnExp2Spec extends AnyFlatSpec with ChiselScalatestTester with Matc
           send(EvuOpcode.Exp2, 2, sew, count)
           send(EvuOpcode.FAdd, 3, sew, count, job = 1, source1 = 1)
           waitFor()
-          waitFor(job = 1, illegal = true)
+          waitFor(job = 1)
           expectReg(2, results, sew)
           val doubledHalves = Seq(0xc600, 0xc400, 0xc000, 0, 0x4000, 0x4400, 0x4600, 0x4800)
           expectReg(3, (0 until count).map(i =>
@@ -247,6 +249,23 @@ class EvuSaturnExp2Spec extends AnyFlatSpec with ChiselScalatestTester with Matc
           dut.io.vstart.poke(0.U)
           expectReg(2, results, sew)
         }
+        // Submit the dependent reduction -> in-place E0 arithmetic -> E0
+        // EXP2 -> broadcast chain without draining between commands.
+        val inputs = (0 until 16).map(i => single((i % 4).toFloat))
+        val inactive = BigInt("7f800001", 16)
+        load(1, inputs, 2)
+        load(3, Seq.fill(16)(inactive), 2)
+        load(29, Seq.fill(16)(BigInt(0)), 2)
+        val previousForwards = dut.io.scalarForwards.peek().litValue
+        send(EvuOpcode.FReduceMax, 3, 2, 16, source1 = 29)
+        send(EvuOpcode.FSub, 3, 2, 16, job = 1, source = 3, source1 = 3, aux = 64)
+        send(EvuOpcode.Exp2, 3, 2, 16, job = 2, source = 3, aux = 64)
+        send(EvuOpcode.FMul, 4, 2, 16, job = 3, source1 = 3, aux = 32)
+        for (job <- 0 until 4) waitFor(job)
+        expectReg(3, Seq(single(1f)) ++ Seq.fill(15)(inactive), 2)
+        expectReg(4, inputs, 2)
+        dut.io.scalarForwards.peek().litValue should be > previousForwards
+
         send(EvuOpcode.Exp2, 2, 0, 8)
         waitFor(illegal = true)
         send(EvuOpcode.Exp2, 2, 3, 8)

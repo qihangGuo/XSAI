@@ -78,12 +78,11 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     vsissqEntries = p.storeIssueDepth,
     vxissqEntries = p.executeIssueDepth,
     vpissqEntries = p.specialIssueDepth,
-    // The physical Ara-style organization has eight banks per 64-bit lane.
-    // Expose that bank count to the write reservation logic as well; using
-    // the old four-wide logical count would unnecessarily serialize banks
-    // b and b+4.
-    vrfBanking = 8,
+    // Reservation groups match the physical banks in each 64-bit lane.
+    // Read arbitration and write reservations must use the same mapping.
+    vrfBanking = p.vrfBanks,
     debugVrf = p.enableDifftest,
+    diagnosticCounters = p.enableDifftest,
     enableChaining = true,
     enableOOO = true,
     pipelinedVatClear = true,
@@ -503,7 +502,19 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   val freeMask = ((BigInt(1) << saturnSlots) - 1).U(p.maxMemOutstanding.W) & ~hblInFlight.asUInt
   val hasFreeTag = freeMask.orR
   val freeTag = PriorityEncoder(freeMask)
-  val chooseStore = !saturn.io.dmem.load_req.valid && saturn.io.dmem.store_req.valid
+  val loadPending = saturn.io.dmem.load_req.valid
+  val storePending = saturn.io.dmem.store_req.valid
+  // Saturn exposes independent load/store queues.  Prefer loads while the
+  // store queue is young, but force a pending store after a bounded wait so
+  // continuous loads cannot starve writeback.  WAIT/FENCE and command
+  // dependency protection remain in Saturn and the command scoreboard.
+  private val storeFairnessThreshold = 8
+  val storeWaitBits = log2Ceil(storeFairnessThreshold + 1)
+  // Count load grants rather than wall-clock cycles: downstream HBL2 back
+  // pressure should not consume the store's fairness budget.
+  val storeWaitGrants = RegInit(0.U(storeWaitBits.W))
+  val storeAged = storeWaitGrants >= storeFairnessThreshold.U
+  val chooseStore = storePending && (!loadPending || storeAged)
   val requestVat = Mux(chooseStore, saturn.io.dmem.store_req.bits.vat, saturn.io.dmem.load_req.bits.vat)
   val requestVirtualAddress = virtualBaseByVat(requestVat) +
     (Mux(chooseStore, saturn.io.dmem.store_req.bits.addr, saturn.io.dmem.load_req.bits.addr) &
@@ -525,6 +536,17 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   io.memory.req.bits.tag := freeTag
   saturn.io.dmem.load_req.ready := io.memory.req.ready && hasFreeTag && !chooseStore && !io.flush
   saturn.io.dmem.store_req.ready := io.memory.req.ready && hasFreeTag && chooseStore && !io.flush
+
+  when(io.flush) {
+    storeWaitGrants := 0.U
+  }.elsewhen(!storePending) {
+    storeWaitGrants := 0.U
+  }.elsewhen(io.memory.req.fire && chooseStore) {
+    storeWaitGrants := 0.U
+  }.elsewhen(io.memory.req.fire && loadPending &&
+    storeWaitGrants < storeFairnessThreshold.U) {
+    storeWaitGrants := storeWaitGrants + 1.U
+  }
 
   when(io.memory.req.fire) {
     hblAddress(freeTag) := requestVirtualAddress

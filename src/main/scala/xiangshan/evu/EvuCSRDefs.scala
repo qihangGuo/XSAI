@@ -30,7 +30,7 @@ object EvuCSRs {
 
   def capabilityValue(p: EvuParams): BigInt =
     BigInt(1) | (BigInt(descriptorCount) << 8) | (BigInt(7) << 16) |
-      (BigInt(1) << 24) | (BigInt(if (p.dlenBits == 256) 1 else 0) << 25) |
+      (BigInt(1) << 24) | (BigInt(if (p.fpQuantSupported) 1 else 0) << 25) |
       (BigInt(1) << 26) // fixed RNE, packed FP32 quantization to CUTE, immediate gather
 }
 

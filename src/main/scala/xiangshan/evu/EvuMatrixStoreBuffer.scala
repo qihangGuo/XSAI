@@ -88,6 +88,7 @@ class EvuMatrixStoreBuffer(p: EvuParams) extends Module {
     arbiter.io.in(i).bits.addr := addresses(i)
     arbiter.io.in(i).bits.data := data(i)
     arbiter.io.in(i).bits.mask := masks(i)
+    arbiter.io.in(i).bits.fullLineData := false.B
     arbiter.io.in(i).bits.bytes := 64.U
     arbiter.io.in(i).bits.write := true.B
     arbiter.io.in(i).bits.tag := tag

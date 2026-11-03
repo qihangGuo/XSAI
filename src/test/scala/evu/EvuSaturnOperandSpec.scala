@@ -10,7 +10,7 @@ import freechips.rocketchip.tile.{CoreModule, TileVisibilityNodeKey}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
 import xiangshan.evu.adapter.EvuVectorParameters
-import xiangshan.evu.backend.{ExecuteSequencer, RegisterFile, SpecialSequencer}
+import xiangshan.evu.backend.{ExecuteSequencer, ExecuteWaitSignals, RegisterFile, SpecialSequencer}
 import xiangshan.evu.common._
 import xiangshan.evu.exu._
 
@@ -31,6 +31,7 @@ class EvuSaturnOperandHarness(special: Boolean, pipelinedReads: Boolean = false)
     val issueIndex = Output(UInt(log2Ceil(maxVLMax).W))
     val writeBank = Output(UInt(vParams.vrfBanking.W))
     val writeRequest = Output(Bool())
+    val waitReason = Output(new ExecuteWaitSignals)
   })
   val inst = WireInit(0.U.asTypeOf(new BackendIssueInst))
   inst.vconfig.vl := io.vl
@@ -44,6 +45,7 @@ class EvuSaturnOperandHarness(special: Boolean, pipelinedReads: Boolean = false)
   io.issueIndex := 0.U
   io.writeBank := 0.U
   io.writeRequest := false.B
+  io.waitReason := 0.U.asTypeOf(io.waitReason)
   if (special) {
     val seq = Module(new SpecialSequencer(IntegerPipeFactory.insns ++ PermuteUnitFactory.insns))
     // Masked indexed load: index vector v8 and mask v0 both select bank 0.
@@ -114,6 +116,7 @@ class EvuSaturnOperandHarness(special: Boolean, pipelinedReads: Boolean = false)
     io.issueIndex := seq.io.iss.bits.eidx
     io.writeBank := seq.io.pipe_write_req.bank_sel
     io.writeRequest := seq.io.pipe_write_req.request
+    io.waitReason := seq.io.waitReason
   }
 }
 
@@ -241,8 +244,10 @@ class EvuSaturnOperandSpec extends AnyFlatSpec with ChiselScalatestTester {
         dut.io.prefetch(0).valid.expect(false.B)
         dut.clock.step()
         dut.io.issue.expect(false.B)
-        dut.io.req.foreach(_.expect(false.B))
+        dut.io.req(0).expect(false.B)
+        // Independent successor responses may be collected while v1 waits.
         dut.clock.step(2)
+        dut.io.req.foreach(_.expect(false.B))
         dut.io.olderWrites.poke(0.U)
         awaitIssue()
         check(1)
@@ -314,8 +319,16 @@ class EvuSaturnOperandSpec extends AnyFlatSpec with ChiselScalatestTester {
         dut.io.req.foreach(_.expect(false.B))
         dut.io.issue.expect(false.B)
         dut.io.writeRequest.expect(false.B)
+        if (!special) {
+          dut.io.waitReason.dependency.expect(true.B)
+          dut.io.waitReason.operands.expect(false.B)
+        }
         dut.io.ready.foreach(_.poke(false.B))
         dut.io.olderWrites.poke(0.U)
+        if (!special) {
+          dut.io.waitReason.dependency.expect(false.B)
+          dut.io.waitReason.operands.expect(true.B)
+        }
         val ports = if (special) Seq(1, 0) else Seq(3, 2, 0, 1)
         for ((port, index) <- ports.zipWithIndex) {
           dut.io.issue.expect(false.B)
@@ -334,6 +347,10 @@ class EvuSaturnOperandSpec extends AnyFlatSpec with ChiselScalatestTester {
         dut.clock.step(3)
         for (port <- ports) dut.io.data(port).expect((0x100 + port).U)
         dut.io.issue.expect(true.B)
+        if (!special) {
+          dut.io.waitReason.operands.expect(false.B)
+          dut.io.waitReason.execution.expect(true.B)
+        }
         dut.io.issueReady.poke(true.B)
         dut.clock.step()
         dut.io.issue.expect(false.B)

@@ -34,7 +34,7 @@ class EvuSharedReductionHarness(implicit p: Parameters) extends CoreModule with 
   val insns = VXSequencerParams("fp_fma", Seq(factory)).insns
   val execute = Seq.fill(2)(Module(new ExecuteSequencer(insns, 4, 1, reductionOnly = true)))
   val accumulators = (0 until 2).map(i => Module(new SpecialSequencer(insns, i, 2, true)))
-  val arb = Module(new SharedExecutionArbiter(2, 4, 1))
+  val arb = Module(new SharedExecutionArbiter(2, 4, 1, prioritizeCritical = true))
   val fu = Module(new ExecutionUnit(Seq(factory), "shared_reduction_test"))
   fu.io.iss <> arb.io.out
   fu.io.iter_write.ready := true.B

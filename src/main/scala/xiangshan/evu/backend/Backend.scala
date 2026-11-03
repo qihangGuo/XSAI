@@ -83,7 +83,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   val maxPipeDepth = flat_vxus.map(_.maxPipeDepth).max
 
   val vls = Module(new LoadSequencer)
-  val vss = Module(new StoreSequencer)
+  val vss = Module(new StoreSequencer(resultForwarding = true))
   val reductionSeqs = (0 until vParams.reductionContexts).map { i =>
     Module(new SpecialSequencer(all_supported_insns, i, vParams.reductionContexts, interleave)).suggestName(s"vps$i")
   }
@@ -92,7 +92,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     q.seqs.zip(counts).map { case (s, count) =>
       (0 until count).map { c =>
         Module(new ExecuteSequencer(s.insns, maxPipeDepth, s.fus.size,
-          ordinaryOnly = count > 1 && c == 0, reductionOnly = count > 1 && c > 0))
+          ordinaryOnly = count > 1 && c == 0, reductionOnly = count > 1 && c > 0,
+          resultForwarding = Set("fp_fma", "fp_cmp", "fp_exp").contains(s.name)))
           .suggestName(s"vxs${s.name}_$c")
       }
     }
@@ -111,6 +112,18 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     val counter = RegInit(0.U(64.W))
     when(condition) { counter := counter + 1.U }
     counter
+  }
+  def perfSum(increment: UInt): UInt = {
+    val counter = RegInit(0.U(64.W))
+    counter := counter + increment
+    counter
+  }
+  def diagnosticCount(name: String, increment: UInt): UInt = {
+    if (vParams.diagnosticCounters) {
+      val counter = RegInit(0.U(64.W)).suggestName(name)
+      counter := counter + increment
+      counter
+    } else 0.U(64.W)
   }
   val pendingWrites = Wire(Vec(vParams.vrfBanking, Valid(new VectorWriteHazard)))
   require(contextsByFu.size == flat_vxus.size)
@@ -332,10 +345,67 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   io.vrfPerf := vrf.io.perf
   io.special <> vrf.io.special
 
+  val forwardSeqs = flat_vxs.filter(_.io.forward.nonEmpty)
+  val forwardUnits = flat_vxus.zip(xissParams.flatMap(_.seqs)).collect {
+    case (unit, factory) if Set("fp_fma", "fp_cmp", "fp_exp").contains(factory.name) => unit
+  }
+  val forwardWriters = scala.collection.mutable.ArrayBuffer.empty[ValidIO[VectorForwardWriter]]
+  def forwardWriter(valid: Bool, vat: UInt, writes: UInt): Unit = {
+    val writer = Wire(Valid(new VectorForwardWriter))
+    writer.valid := valid
+    writer.bits.vat := vat
+    writer.bits.writes := writes
+    forwardWriters += writer
+  }
+  for (queue <- allIssQs; hazard <- queue.io.hazards) {
+    forwardWriter(hazard.valid, hazard.bits.vat, FillInterleaved(egsPerVReg, hazard.bits.wintent))
+  }
+  for (seq <- allSeqs) {
+    forwardWriter(seq.io.seq_hazard.valid, seq.io.seq_hazard.bits.vat, seq.io.seq_hazard.bits.wintent)
+  }
+  for (unit <- flat_vxus; hazard <- unit.io.pipe_hazards.toSeq ++ unit.io.iter_hazards.toSeq) {
+    forwardWriter(hazard.valid, hazard.bits.vat, hazard.bits.eg_oh)
+  }
+  for (hazard <- pendingWrites) { forwardWriter(hazard.valid, hazard.bits.vat, hazard.bits.eg_oh) }
+  val forwarding = Module(new VectorResultForwarding(forwardUnits.size, forwardSeqs.size * 3 + 1,
+    forwardWriters.size))
+  forwarding.io.tail := io.vat_tail
+  forwarding.io.writers := VecInit(forwardWriters.toSeq)
+  for ((unit, i) <- forwardUnits.zipWithIndex) {
+    val result = forwarding.io.results(i)
+    result.valid := unit.io.pipe_write.valid && unit.io.pipeWriteForwardable
+    result.bits.eg := unit.io.pipe_write.bits.eg
+    result.bits.data := unit.io.pipe_write.bits.data
+    result.bits.mask := unit.io.pipe_write.bits.mask
+    result.bits.vat := unit.io.pipeWriteVat
+  }
+  val forwardReads = forwardSeqs.flatMap(seq => Seq(seq.io.rvs1, seq.io.rvs2, seq.io.rvd)
+    .zip(seq.io.forward.get).map { case (read, port) => (read, port, seq.io.vat) })
+  for (((read, port, vat), i) <- forwardReads.zipWithIndex) {
+    forwarding.io.reads(i).valid := port.eligible
+    forwarding.io.reads(i).bits.eg := read.req.bits.eg
+    forwarding.io.reads(i).bits.vat := vat
+    port.available := forwarding.io.out(i).valid
+  }
+  val storeForwardIndex = forwardReads.size
+  forwarding.io.reads(storeForwardIndex).valid := vss.io.forward.get.eligible
+  forwarding.io.reads(storeForwardIndex).bits.eg := vss.io.rvd.bits.eg
+  forwarding.io.reads(storeForwardIndex).bits.vat := vss.io.vat
+  vss.io.forward.get.available := forwarding.io.out(storeForwardIndex).valid
+  io.executionPerf.vectorForwards := diagnosticCount("vectorForwards", PopCount(VecInit(
+    forwardReads.zipWithIndex.map { case ((read, _, _), i) => read.req.fire && forwarding.io.out(i).valid } :+
+      (vss.io.rvd.fire && forwarding.io.out(storeForwardIndex).valid))))
+  io.executionPerf.vectorForwardNewer := diagnosticCount("vectorForwardNewer",
+    forwarding.io.newerWriter.asUInt.orR.asUInt)
+
   vrf.io.vls.rvm.req <> vls.io.rvm
   vrf.io.vss.rvd.req <> vss.io.rvd
+  vrf.io.vss.rvd.req.valid := vss.io.rvd.valid && !forwarding.io.out(storeForwardIndex).valid
+  vss.io.rvd.ready := vrf.io.vss.rvd.req.ready || forwarding.io.out(storeForwardIndex).valid
   vrf.io.vss.rvm.req <> vss.io.rvm
-  vss.io.rvd_resp := vrf.io.vss.rvd.resp
+  vrf.io.vss.e0Read := vss.io.e0Read
+  vss.io.rvd_resp := Mux(forwarding.io.out(storeForwardIndex).valid,
+    forwarding.io.out(storeForwardIndex).bits, vrf.io.vss.rvd.resp)
   vss.io.rvm_resp := vrf.io.vss.rvm.resp
   for ((seq, i) <- reductionSeqs.zipWithIndex) {
     vrf.io.vps(i).rvs2.req <> seq.io.rvs2
@@ -357,8 +427,19 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     vxs.io.rvs1.resp := vrf.io.vxs(i).rvs1.resp
     vxs.io.rvs2.resp := vrf.io.vxs(i).rvs2.resp
     vxs.io.rvd.resp := vrf.io.vxs(i).rvd.resp
+    if (vxs.io.forward.nonEmpty) {
+      val base = forwardSeqs.indexOf(vxs) * 3
+      for (((read, memory), port) <- Seq((vxs.io.rvs1, vrf.io.vxs(i).rvs1),
+        (vxs.io.rvs2, vrf.io.vxs(i).rvs2), (vxs.io.rvd, vrf.io.vxs(i).rvd)).zipWithIndex) {
+        val result = forwarding.io.out(base + port)
+        memory.req.valid := read.req.valid && !result.valid
+        read.req.ready := result.valid || memory.req.ready
+        read.resp := Mux(result.valid, result.bits, memory.resp)
+      }
+    }
     vxs.io.rvm.resp := vrf.io.vxs(i).rvm.resp
     vrf.io.vxs(i).prefetch := vxs.io.prefetch
+    vrf.io.vxs(i).e0Read := vxs.io.e0Read
 
     val vxs_iss = vxs.io.iss.bits
     val candidate = Wire(Decoupled(new ExecuteMicroOpWithData(vxu.nFUs)))
@@ -445,12 +526,61 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     }
   }
 
+  io.executionPerf.dependencyWait := perfCount(flat_vxs.map(_.io.waitReason.dependency).reduce(_ || _))
+  io.executionPerf.operandWait := perfCount(flat_vxs.map(_.io.waitReason.operands).reduce(_ || _))
+  io.executionPerf.feedbackWait := perfCount(flat_vxs.map(_.io.waitReason.feedback).reduce(_ || _))
+  io.executionPerf.permutationWait := perfCount(flat_vxs.map(_.io.waitReason.permutation).reduce(_ || _))
+  io.executionPerf.writebackWait := perfCount(flat_vxs.map(_.io.waitReason.writeback).reduce(_ || _))
+  io.executionPerf.executionWait := perfCount(flat_vxs.map(_.io.waitReason.execution).reduce(_ || _))
+  io.executionPerf.earlyOperandReads := perfSum(flat_vxs.map(_.io.earlyOperandReads).reduce(_ +& _))
+  io.executionPerf.reductionPrefetches := perfSum(flat_vxs.map(_.io.reductionPrefetch.asUInt).reduce(_ +& _))
+
   // Contexts share one arithmetic unit and one physical result channel.
   // Reserve output time across all contexts, including different latencies.
   for (((seqs, xu), factory) <- contextsByFu.zip(flat_vxus).zip(xissParams.flatMap(_.seqs))) {
-    val arb = Module(new SharedExecutionArbiter(seqs.size, maxPipeDepth, xu.nFUs))
+    val criticalPriority = factory.name == "fp_fma" || factory.name == "fp_cmp"
+    val arb = Module(new SharedExecutionArbiter(seqs.size, maxPipeDepth, xu.nFUs, criticalPriority))
     for ((seq, c) <- seqs.zipWithIndex) { arb.io.in(c) <> executeCandidates(flat_vxs.indexOf(seq)) }
     xu.io.iss <> arb.io.out
+    val perfIndex = EvuFuPerf.names.indexOf(factory.name)
+    if (perfIndex >= 0) {
+      val counters = io.executionPerf.byFu(perfIndex)
+      val queueIndex = xissParams.indexWhere(_.seqs.exists(_.name == factory.name))
+      val queue = vxissqs(queueIndex)
+      counters.issue := perfCount(xu.io.iss.fire)
+      counters.dependencyWait := perfCount(seqs.map(_.io.waitReason.dependency).reduce(_ || _))
+      counters.operandWait := perfCount(seqs.map(_.io.waitReason.operands).reduce(_ || _))
+      counters.feedbackWait := perfCount(seqs.map(_.io.waitReason.feedback).reduce(_ || _))
+      counters.writebackWait := perfCount(seqs.map(_.io.waitReason.writeback).reduce(_ || _))
+      counters.executionWait := perfCount(seqs.map(_.io.waitReason.execution).reduce(_ || _))
+      counters.queueWait := perfCount(queue.io.deq.valid && !queue.io.deq.ready)
+      counters.dispatchBlocked := perfCount(vdq.io.deq.valid && issq_stall(3 + queueIndex))
+      val pendingWork = queue.io.deq.valid || seqs.map(_.io.busy).reduce(_ || _)
+      counters.noWork := diagnosticCount(s"${factory.name}_noWork", !pendingWork)
+      val loadWrites = vls.io.seq_hazard.bits.wintent & Fill(egsTotal, vls.io.seq_hazard.valid) |
+        vlissq.io.hazards.map(h => Mux(h.valid, FillInterleaved(egsPerVReg, h.bits.wintent), 0.U)).reduce(_ | _)
+      val operands = seqs.filter(_.io.forward.nonEmpty).flatMap { seq =>
+        val base = forwardSeqs.indexOf(seq) * 3
+        Seq(seq.io.rvs1, seq.io.rvs2, seq.io.rvd).zipWithIndex.map { case (read, port) =>
+          (seq.io.forward.get(port).eligible, read, base + port)
+        }
+      }
+      counters.loadWait := diagnosticCount(s"${factory.name}_loadWait",
+        seqs.map(s => s.io.busy && (s.io.rawDependencies & loadWrites).orR).reduce(_ || _))
+      counters.forwardWait := diagnosticCount(s"${factory.name}_forwardWait", operands.map {
+        case (eligible, read, index) => eligible && !forwarding.io.out(index).valid &&
+          forwardSeqs(index / 3).io.rawDependencies(read.req.bits.eg) && !loadWrites(read.req.bits.eg)
+      }.foldLeft(false.B)(_ || _))
+      counters.idleWithWork := diagnosticCount(s"${factory.name}_idleWithWork", pendingWork && !xu.io.iss.fire)
+      counters.readyArbitrationWait := diagnosticCount(s"${factory.name}_readyArbitrationWait", arb.io.contended)
+      counters.queueIdle := diagnosticCount(s"${factory.name}_queueIdle",
+        queue.io.deq.valid && !queue.io.deq.ready && !xu.io.iss.fire)
+      counters.resultSlotWait := diagnosticCount(s"${factory.name}_resultSlotWait",
+        seqs.zipWithIndex.map { case (seq, c) =>
+          seq.io.pipe_write_req.request && !arb.io.available(c)
+        }.reduce(_ || _))
+      counters.priorityIssues := diagnosticCount(s"${factory.name}_priorityIssues", arb.io.priorityIssue)
+    }
     if (factory.name == "fp_fma") {
       val previousVat = RegEnable(xu.io.iss.bits.vat, xu.io.iss.fire)
       val previousValid = RegNext(xu.io.iss.fire, false.B)

@@ -50,7 +50,7 @@ import xiangshan.mem.Bundles._
 import xiangshan.mem.prefetch.{BasePrefecher, L1Prefetcher, SMSParams, SMSPrefetcher}
 import xiangshan.cache._
 import xiangshan.cache.mmu._
-import xiangshan.evu.{EvuAddressCheck, EvuAddressFault, EvuAddressResponse, EvuRangeIO}
+import xiangshan.evu.{EvuAddressCheck, EvuAddressFault, EvuPreflightPipeline, EvuRangeIO}
 import xscache.coupledL2.{PrefetchCtrlFromCore, PrefetchRecv}
 import utility.mbist.{MbistInterface, MbistPipeline}
 import utility.sram.{SramBroadcastBundle, SramHelper}
@@ -838,21 +838,17 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
       tlbcsr.priv.imode === CSRConst.ModeM && tlbcsr.priv.dmode === CSRConst.ModeM
     val tlb = dtlb_evu.get.requestor.head
     val permission = pmp_check.last.resp
-    val idle :: send :: waitTlb :: waitPmp :: respond :: Nil = Enum(5)
-    val state = RegInit(idle)
-    val address = Reg(UInt(64.W))
+    val pipeline = Module(new EvuPreflightPipeline)
+    pipeline.io.request <> checker.io.lookup.req
+    checker.io.lookup.resp <> pipeline.io.response
+    pipeline.io.cancel := range.cancel
+    pipeline.io.permissionFault := permission.ld || permission.st || permission.mmio
     val firstAddress = RegEnable(range.req.bits.base, range.req.fire)
-    val write = Reg(Bool())
-    val answer = Reg(new EvuAddressResponse)
-    val missed = Reg(Bool())
-    val uncacheable = Reg(Bool())
-    checker.io.lookup.req.ready := state === idle && !range.cancel
-    when(checker.io.lookup.req.fire) {
-      address := checker.io.lookup.req.bits.vaddr
-      write := checker.io.lookup.req.bits.write
-      state := send
-    }
-    tlb.req.valid := state === send && !range.cancel
+    val lookup = pipeline.io.translation.request
+    val address = lookup.bits.check.vaddr
+    val write = lookup.bits.check.write
+    tlb.req.valid := lookup.valid
+    lookup.ready := tlb.req.ready
     tlb.req.bits := 0.U.asTypeOf(tlb.req.bits)
     tlb.req.bits.vaddr := address
     tlb.req.bits.fullva := Mux(address < firstAddress, firstAddress, address)
@@ -862,37 +858,46 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
     tlb.req.bits.debug.robIdx := io.ooo_to_mem.lsqio.pendingPtr
     tlb.req.bits.memidx.is_ld := !write
     tlb.req.bits.memidx.is_st := write
+    require(tlb.req.bits.memidx.idx.getWidth >= lookup.bits.tag.getWidth)
+    tlb.req.bits.memidx.idx := lookup.bits.tag
     tlb.req_kill := range.cancel
     tlb.resp.ready := true.B
-    when(tlb.req.fire) { state := waitTlb }
-    when(state === waitTlb && tlb.resp.fire) {
-      val exception = tlb.resp.bits.excp.head
-      val page = Mux(write, exception.pf.st, exception.pf.ld)
-      val guest = Mux(write, exception.gpf.st, exception.gpf.ld)
-      val access = Mux(write, exception.af.st, exception.af.ld)
-      answer.paddr := tlb.resp.bits.paddr.head
-      answer.gpaddr := tlb.resp.bits.gpaddr.head
-      answer.nonLeaf := tlb.resp.bits.isForVSnonLeafPTE
-      answer.fault := Mux(guest, EvuAddressFault.GuestPage,
-        Mux(page, EvuAddressFault.Page, Mux(access, EvuAddressFault.Access, EvuAddressFault.None)))
-      missed := tlb.resp.bits.miss
-      uncacheable := tlb.resp.bits.pbmt.head =/= 0.U
-      state := waitPmp
-    }
-    when(state === waitPmp) {
-      when(missed) {
-        state := send
-      }.otherwise {
-        when(answer.fault === EvuAddressFault.None &&
-          (permission.ld || permission.st || permission.mmio || uncacheable)) {
-          answer.fault := EvuAddressFault.Access
-        }
-        state := respond
+    val translated = pipeline.io.translation.response
+    val exception = tlb.resp.bits.excp.head
+    val responseWrite = tlb.resp.bits.memidx.is_st
+    val page = Mux(responseWrite, exception.pf.st, exception.pf.ld)
+    val guest = Mux(responseWrite, exception.gpf.st, exception.gpf.ld)
+    val access = Mux(responseWrite, exception.af.st, exception.af.ld)
+    translated.valid := tlb.resp.valid
+    translated.bits.tag := tlb.resp.bits.memidx.idx(lookup.bits.tag.getWidth - 1, 0)
+    translated.bits.answer.paddr := tlb.resp.bits.paddr.head
+    translated.bits.answer.gpaddr := tlb.resp.bits.gpaddr.head
+    translated.bits.answer.nonLeaf := tlb.resp.bits.isForVSnonLeafPTE
+    translated.bits.answer.fault := Mux(guest, EvuAddressFault.GuestPage,
+      Mux(page, EvuAddressFault.Page, Mux(access, EvuAddressFault.Access, EvuAddressFault.None)))
+    translated.bits.miss := tlb.resp.bits.miss
+    translated.bits.uncacheable := tlb.resp.bits.pbmt.head =/= 0.U
+
+    range.perf.foreach { perf =>
+      def count(event: Bool): UInt = {
+        val value = RegInit(0.U(64.W))
+        when(event) { value := value + 1.U }
+        value
       }
+      val active = RegInit(false.B)
+      when(range.req.fire) { active := true.B }
+      when(range.resp.fire || range.cancel) { active := false.B }
+      perf.commands := count(range.req.fire)
+      perf.busy := count(active)
+      perf.checks := count(checker.io.lookup.req.fire)
+      perf.reads := count(checker.io.lookup.req.fire && !checker.io.lookup.req.bits.write)
+      perf.writes := count(checker.io.lookup.req.fire && checker.io.lookup.req.bits.write)
+      perf.fullStores := count(range.req.fire && range.req.bits.fullLineWrite && range.req.bits.length =/= 0.U)
+      perf.lookupStall := count(checker.io.lookup.req.valid && !checker.io.lookup.req.ready)
+      perf.tlbRequests := count(tlb.req.fire)
+      perf.tlbMisses := count(translated.valid && translated.bits.miss)
+      perf.sbWait := count(range.req.valid && !io.mem_to_ooo.sbIsEmpty)
     }
-    checker.io.lookup.resp.valid := state === respond && !range.cancel
-    checker.io.lookup.resp.bits := answer
-    when(checker.io.lookup.resp.fire || range.cancel) { state := idle }
   }
 
   for (i <- 0 until LduCnt) {

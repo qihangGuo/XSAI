@@ -202,8 +202,10 @@ RTL 优先改善入口阻塞向无依赖命令的传播，并验证仲裁、公�
 `STATE_BATCH=1, REDUCE_VL=128`，不更换 32×256 负载；非 256 列默认仍
 关闭状态批处理，以保留 streaming fallback。原基线可通过编译参数选择。
 
-两端共同使用 `nexus-am/tests/exp2test/include/online_softmax_bench.h` 的输入、
-初始状态及数值阈值；两端都先生成模板，再通过 memcpy 完整重置。默认各测
+两端使用内容一致的 `online_softmax_bench.h` 定义输入、初始状态及数值阈值。
+EVU 将头文件随仓库放在 `software/evu/include/`，RVV 保留
+`nexus-am/tests/exp2test/include/` 下的副本，EVU 编译不再依赖该 RVV 测试目录；
+修改共享负载时须同步两份内容。两端都先生成模板，再通过 memcpy 完整重置。默认各测
 first=0/1，预热一次，正式计时包含配置、计算、访存及结束同步。EVU 使用
 XV_FENCE + CPU fence，RVV 使用 CPU fence。主周期字段为 `c`。默认 CHECK=0
 仍是快测，不运行 FP64；CHECK=1 检查预热、正式及诊断调用的数值与边界。

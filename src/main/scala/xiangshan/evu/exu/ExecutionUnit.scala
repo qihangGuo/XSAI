@@ -25,6 +25,8 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
     val iter_write = Decoupled(new VectorWrite(dLen))
     val iterWriteVat = Output(UInt(vParams.vatSz.W))
     val pipe_write = Output(Valid(new VectorWrite(dLen)))
+    val pipeWriteVat = Output(UInt(vParams.vatSz.W))
+    val pipeWriteForwardable = Output(Bool())
     val acc_write = Output(Valid(new VectorWrite(dLen)))
     val acc_write_slot = Output(UInt(2.W))
     val accWriteVat = Output(UInt(vParams.vatSz.W))
@@ -60,6 +62,8 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
   val pipe_write = WireInit(false.B)
 
   io.pipe_write.valid := false.B
+  io.pipeWriteVat := 0.U
+  io.pipeWriteForwardable := false.B
   io.pipe_write.bits := DontCare
   io.iter_write.valid := false.B
   io.iter_write.bits := DontCare
@@ -127,6 +131,9 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
       val acc = Mux1H(write_pipe_sel, pipe_bits.map(_.acc))
       val tail = Mux1H(write_pipe_sel, pipe_bits.map(_.tail))
       val vat = Mux1H(write_pipe_sel, pipe_bits.map(_.vat))
+      io.pipeWriteVat := vat
+      io.pipeWriteForwardable := !acc && Mux1H(write_pipe_sel, pipe_bits.map(op =>
+        op.vm && !op.use_wmask && op.eidx_mask.andR))
       io.pipe_write.valid := Mux1H(write_fu_sel, pipe_fus.map(_._1.io.write.valid)) && (!acc || tail)
       io.pipe_write.bits := Mux1H(write_fu_sel, pipe_fus.map(_._1.io.write.bits))
       io.acc_write.valid := acc && !tail

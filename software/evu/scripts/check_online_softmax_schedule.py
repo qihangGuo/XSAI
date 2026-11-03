@@ -17,8 +17,14 @@ SOURCE = ROOT / 'XSAI_external_vector/software/evu/online_softmax_evu_test.c'
 CLANG = ['clang', '--target=riscv64', '-march=rv64gc', '-std=gnu11',
          '-DARCH_H="arch/riscv64-xs.h"', '-I', 'nexus-am/am',
          '-I', 'nexus-am/am/include', '-I', 'nexus-am/libs/klib/include',
-         '-I', 'XSAI_external_vector/software/evu/include',
-         '-I', 'nexus-am/tests/exp2test/include']
+         '-I', 'XSAI_external_vector/software/evu/include']
+
+# Each repository ships its own copy; matched workloads must remain identical.
+for header in ('online_softmax_bench.h', 'vector_memory_path_bench.h'):
+    evu_header = SOURCE.parent / 'include' / header
+    rvv_header = ROOT / 'nexus-am/tests/exp2test/include' / header
+    if evu_header.read_bytes() != rvv_header.read_bytes():
+        raise AssertionError('EVU/RVV benchmark headers differ: ' + header)
 
 
 def f32(x):

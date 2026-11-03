@@ -22,7 +22,8 @@ class EvuVirtualMemorySpec extends AnyFlatSpec with ChiselScalatestTester with M
       case freechips.rocketchip.tile.MaxHartIdBits => 1
       case freechips.rocketchip.rocket.PgLevels => 3
     }
-    val ep = EvuParams(enable = true, vlenBits = 512)
+    val ep = EvuParams(enable = true, vlenBits = 512,
+      dlenBits = 256, mlenBits = 256, lanes = 4, vrfBanks = 8)
     test(LazyModule(new EvuTopHarness(ep)).module).withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
       dut.io.dispatch.valid.poke(false.B)
       dut.io.matrixInput.valid.poke(false.B)

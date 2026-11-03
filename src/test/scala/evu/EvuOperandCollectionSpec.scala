@@ -9,7 +9,8 @@ import xiangshan.evu._
 
 class EvuOperandCollectionSpec extends AnyFlatSpec with ChiselScalatestTester with Matchers {
   behavior of "EVU multi-cycle operand collection"
-  private val ep = EvuParams(enable = true, vlenBits = 4096)
+  private val ep = EvuParams(enable = true, vlenBits = 4096,
+    dlenBits = 256, mlenBits = 256, lanes = 4, vrfBanks = 8)
   private def words(value: Int): BigInt = (0 until 8).map(i => BigInt(value) << (32*i)).reduce(_ | _)
   private def clear(x: Data): Unit = x match {
     case b: Bool => b.poke(false.B)

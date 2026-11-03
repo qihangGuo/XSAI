@@ -100,7 +100,8 @@ class EvuSaturnAddressSpec extends AnyFlatSpec with ChiselScalatestTester with M
   behavior of "Saturn virtual address generation"
 
   it should "decode real LOAD/STORE encodings and retain the carry and byte masks across pages" in {
-    val ep = EvuParams(enable = true, vlenBits = 512)
+    val ep = EvuParams(enable = true, vlenBits = 512,
+      dlenBits = 256, mlenBits = 256, lanes = 4, vrfBanks = 8)
     val baseParams = Parameters.empty.alterPartial {
       case freechips.rocketchip.tile.XLen => 64
       case freechips.rocketchip.tile.MaxHartIdBits => 1

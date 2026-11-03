@@ -122,7 +122,7 @@ not measured bus traffic or a predicted cycle reduction. Multiply and add
 round separately; reduction order can differ from RVV. Inputs, outputs
 and accuracy limits match the RVV contract without requiring its schedule.
 
-The ordinary VMU now defaults to a two-command window with per-command
+The ordinary VMU now defaults to a four-command window with per-command
 translation/error ownership and disjoint-byte store combining across jobs.
 Rebuild both EMU and the NEMU reference library before testing these RTL
 changes; copying a new guest image alone does not enable them. Physical VRF
@@ -131,6 +131,19 @@ boundaries, append `-- +evu_mem_trace=1` after all EMU options. The `--` keeps
 the Verilator plusarg out of the emulator's option parser. See
 `docs/ONLINE_SOFTMAX_PERFORMANCE_ANALYSIS.md`, section 9, for counter meanings,
 limitations and the recommended correctness/performance comparison.
+
+To compare the two formal cases without padded fields, UART interleaving,
+warmup snapshots or global PERF output, summarize the complete log offline:
+
+```sh
+python3 software/evu/scripts/summarize_softmax_fences.py \
+  evu_softmax_512_before.log --format table
+```
+
+The default output remains compact key=value records for further processing.
+Missing counters are shown as `-` in the table; counter rows can overlap and
+must not be added. Neither format changes timing or requires an EMU/bin rebuild.
+Keep the raw log to inspect Difftest, GOOD TRAP and any errors.
 
 The default is performance-only (`EVU_SOFTMAX_CHECK=0`). No FP64 reference,
 numeric output scan, NMSE calculation or guard initialization/check is run.
@@ -204,10 +217,15 @@ The new `nexus-am/tests/exp2test/tests/performance/vfexp2_softmax_online_matched
 keeps the historical tests and their kernels unchanged. It runs the existing
 four-row LMUL=4 positive-scale/vector-alpha kernel, with an ending CPU fence,
 the same reset template, first=0/1, and the same optional diagnostic interval.
-Both tests use `nexus-am/tests/exp2test/include/online_softmax_bench.h` for input
-generation and accuracy bounds. Sync that header and both Makefiles to the
-server; use the same compiler and `-fno-fast-math -ffp-contract=off` for both
-images. Each matched RVV configuration has its own object directory, including
+The EVU test uses `software/evu/include/online_softmax_bench.h`; the RVV test
+uses an identical copy in `nexus-am/tests/exp2test/include/`. These headers
+define input generation and accuracy bounds. EVU carries both benchmark headers
+in this repository and does not require the RVV test headers under `AM_HOME`.
+Keep the copies identical when changing the shared workload; the source schedule
+check verifies both headers against the sibling nexus-am checkout. Sync each
+test's headers and Makefile to the server, and use the same compiler and
+`-fno-fast-math -ffp-contract=off` for both images. Each matched RVV configuration
+has its own object directory, including
 the vendor kernels, so older FMA-enabled objects are not reused.
 
 EVU now defaults to `wave4x2`, per-row E0 states and reduction VL=128 for the

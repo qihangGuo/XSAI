@@ -42,10 +42,12 @@ class MatrixVectorBridge(tileBits: Int, p: EvuParams) extends Module {
   require(tileDim * tileDim == tileElements, s"CUTE result must be a square INT32 tile, got ${tileBits} bits")
   private val elemsPerBeat = p.dlenBits / 32
   require(elemsPerBeat > 0)
-  private val beatsPerRow = (tileDim + elemsPerBeat - 1) / elemsPerBeat
   private val microDim = if (tileDim >= 8) 8 else tileDim
+  // A wider EVU beat must not combine two independently tagged microtiles.
+  private val activePerBeat = elemsPerBeat min microDim
+  private val beatsPerRow = (tileDim + activePerBeat - 1) / activePerBeat
   private val microCols = (tileDim + microDim - 1) / microDim
-  private val beatsPerMicroRow = (microDim + elemsPerBeat - 1) / elemsPerBeat
+  private val beatsPerMicroRow = (microDim + activePerBeat - 1) / activePerBeat
   private val totalBeats = tileDim * beatsPerRow
   private val beatBits = log2Ceil(totalBeats max 2)
   val io = IO(new MatrixVectorBridgeIO(tileBits, p))
@@ -70,17 +72,17 @@ class MatrixVectorBridge(tileBits: Int, p: EvuParams) extends Module {
   val tileElems = tile.asTypeOf(Vec(tileElements, UInt(32.W)))
 
   val row = beat / beatsPerRow.U
-  val col = (beat % beatsPerRow.U) * elemsPerBeat.U
+  val col = (beat % beatsPerRow.U) * activePerBeat.U
   val microblockRow = row / microDim.U
   val microblockCol = col / microDim.U
   val microblockId = microblockRow * microCols.U + microblockCol
   val microblockBeat = (row % microDim.U) * beatsPerMicroRow.U +
-    ((col % microDim.U) / elemsPerBeat.U)
+    ((col % microDim.U) / activePerBeat.U)
   val valid = Wire(Vec(elemsPerBeat, Bool()))
   val data = Wire(Vec(elemsPerBeat, UInt(32.W)))
   for (lane <- 0 until elemsPerBeat) {
     val element = row * tileDim.U + col + lane.U
-    valid(lane) := element < tileElements.U && col + lane.U < tileDim.U
+    valid(lane) := (lane < activePerBeat).B && element < tileElements.U && col + lane.U < tileDim.U
     val elementIndex = element(log2Ceil(tileElements max 2) - 1, 0)
     data(lane) := Mux(valid(lane), tileElems(elementIndex), 0.U)
   }

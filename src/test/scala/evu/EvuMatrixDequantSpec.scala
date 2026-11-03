@@ -2,7 +2,7 @@ package evu
 
 import chisel3._
 import chiseltest._
-import chiseltest.simulator.TreadleBackendAnnotation
+import chiseltest.simulator.VerilatorBackendAnnotation
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import xiangshan.evu._
@@ -11,6 +11,7 @@ class EvuMatrixDequantSpec extends AnyFlatSpec with ChiselScalatestTester with M
   behavior of "EvuMatrixDequant"
 
   private val ep = EvuParams(enable = true)
+  private val lanes = ep.dlenBits / 32
   private def bits(value: Float): BigInt = BigInt(java.lang.Float.floatToRawIntBits(value).toLong & 0xffffffffL)
   private def pack(values: Seq[BigInt]): BigInt = values.zipWithIndex.foldLeft(BigInt(0)) {
     case (sum, (value, lane)) => sum | ((value & 0xffffffffL) << (lane * 32))
@@ -93,22 +94,26 @@ class EvuMatrixDequantSpec extends AnyFlatSpec with ChiselScalatestTester with M
   }
 
   it should "select scales by matrix coordinates and preserve buffered beats under backpressure" in {
-    test(new EvuMatrixDequant(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+    test(new EvuMatrixDequant(ep)).withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
       val driver = new Driver(dut)
       val input = Seq(-16, -8, -1, 0, 1, 2, 64, 127)
       val cases = Seq((0, 0, 0, 8), (0x21, 3, 0, 8), (0x23, 9, 8, 16), (0xff, 7, 0, 8))
       for ((tile, row, col, dim) <- cases) {
+        dut.io.invalidate.poke(true.B)
+        dut.clock.step()
+        dut.io.invalidate.poke(false.B)
         val m = (tile & 15) * dim + col
         val n = (tile >> 4) * dim + row
-        val scaleA = (0 until 8).map(i => (m / 8 * 8 + i + 1) * 0.25f)
-        val scaleB = (0 until 8).map(i => (n / 8 * 8 + i + 1) * 0.125f)
+        val scaleA = (0 until lanes).map(i => (m / lanes * lanes + i + 1) * 0.25f)
+        val scaleB = (0 until lanes).map(i => (n / lanes * lanes + i + 1) * 0.125f)
         driver.send(input, tile, row, col, dim)
-        driver.operand(0, m / 8, scaleA.map(bits))
-        driver.operand(1, n / 8, scaleB.map(bits))
+        driver.operand(0, m / lanes, scaleA.map(bits))
+        driver.operand(1, n / lanes, scaleB.map(bits))
         // Change live producer metadata before the previous beat is consumed.
         dut.io.matrix.in.bits.tileId.poke(0.U)
         dut.io.matrix.in.bits.row.poke(0.U)
-        driver.result(input.zip(scaleA).map { case (a, scale) => bits((a.toFloat * scale) * scaleB(n % 8)) },
+        driver.result(input.zip(scaleA.drop(m % lanes)).map { case (a, scale) =>
+          bits((a.toFloat * scale) * scaleB(n % lanes)) },
           tile = tile, row = row, col = col)
       }
       dut.io.busy.expect(false.B)
@@ -116,7 +121,7 @@ class EvuMatrixDequantSpec extends AnyFlatSpec with ChiselScalatestTester with M
   }
 
   it should "report conversion and invalid-operation flags from the selected arithmetic" in {
-    test(new EvuMatrixDequant(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+    test(new EvuMatrixDequant(ep)).withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
       val driver = new Driver(dut)
       val input = Seq.fill(8)(16777217)
       driver.send(input)
@@ -148,7 +153,7 @@ class EvuMatrixDequantSpec extends AnyFlatSpec with ChiselScalatestTester with M
   }
 
   it should "reuse just the current chunks, stream hits every cycle and invalidate changed scales" in {
-    test(new EvuMatrixDequant(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+    test(new EvuMatrixDequant(ep)).withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
       val driver = new Driver(dut)
       val a = (1 to 8).map(_.toFloat)
       val b = (1 to 8).map(_ * 0.5f)
@@ -193,7 +198,7 @@ class EvuMatrixDequantSpec extends AnyFlatSpec with ChiselScalatestTester with M
   }
 
   it should "hold a full output pipeline and discard every buffered beat on flush" in {
-    test(new EvuMatrixDequant(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+    test(new EvuMatrixDequant(ep)).withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
       val driver = new Driver(dut)
       driver.send(Seq.fill(8)(2))
       driver.operand(0, 0, Seq.fill(8)(bits(1f)))
@@ -221,7 +226,7 @@ class EvuMatrixDequantSpec extends AnyFlatSpec with ChiselScalatestTester with M
   }
 
   it should "wait for shared-VRF ownership and cancel queued or partially read work on flush" in {
-    test(new EvuMatrixDequant(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+    test(new EvuMatrixDequant(ep)).withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
       val driver = new Driver(dut)
       dut.io.startAllowed.poke(false.B)
       driver.send(Seq.fill(8)(9))

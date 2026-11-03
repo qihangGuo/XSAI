@@ -17,6 +17,7 @@ class EvuRangeRequest extends Bundle {
   val length = UInt(32.W)
   val read = Bool()
   val write = Bool()
+  val fullLineWrite = Bool() // Caller-proven unmasked, aligned, full-line coverage.
   val alignment = UInt(3.W)
   val unbounded = Bool()
   val illegal = Bool()
@@ -38,10 +39,29 @@ class EvuRangeResult(p: EvuParams) extends Bundle {
   val write = Bool()
 }
 
+class EvuPreflightPerf extends Bundle {
+  val commands = UInt(64.W)
+  val busy = UInt(64.W)
+  val checks = UInt(64.W)
+  val reads = UInt(64.W)
+  val writes = UInt(64.W)
+  val fullStores = UInt(64.W)
+  val lookupStall = UInt(64.W)
+  val tlbRequests = UInt(64.W)
+  val tlbMisses = UInt(64.W)
+  val sbWait = UInt(64.W)
+}
+
 class EvuRangeIO(p: EvuParams) extends Bundle {
   val req = Decoupled(new EvuRangeRequest)
   val resp = Flipped(Decoupled(new EvuRangeResult(p)))
   val cancel = Output(Bool())
+  val perf = Option.when(p.enableDifftest)(Input(new EvuPreflightPerf))
+}
+
+class EvuAddressLookupRequest extends Bundle {
+  val vaddr = UInt(64.W)
+  val write = Bool()
 }
 
 /** Check every touched cache line, including RMW read permissions, before any
@@ -52,15 +72,12 @@ class EvuAddressCheck(p: EvuParams) extends Module {
   val io = IO(new Bundle {
     val range = Flipped(new EvuRangeIO(p))
     val lookup = new Bundle {
-      val req = Decoupled(new Bundle {
-        val vaddr = UInt(64.W)
-        val write = Bool()
-      })
+      val req = Decoupled(new EvuAddressLookupRequest)
       val resp = Flipped(Decoupled(new EvuAddressResponse))
     }
     val allowPhysicalLaunch = Input(Bool())
   })
-  val idle :: request :: response :: finish :: Nil = Enum(4)
+  val idle :: checking :: finish :: Nil = Enum(3)
   val state = RegInit(idle)
   val job = Reg(new EvuRangeRequest)
   val result = Reg(new EvuRangeResult(p))
@@ -68,14 +85,24 @@ class EvuAddressCheck(p: EvuParams) extends Module {
   val lastLine = Reg(UInt(64.W))
   val writePhase = RegInit(false.B)
   val mapped = RegInit(VecInit.fill(p.translationPages)(false.B))
+  val issuedAll = RegInit(false.B)
+  val failed = RegInit(false.B)
+  val responseFailed = WireDefault(false.B)
+  val pending = Module(new Queue(new EvuAddressLookupRequest, 8, pipe = true, hasFlush = true))
+  pending.io.flush.get := io.range.cancel
+  io.range.perf.foreach(_ := 0.U.asTypeOf(new EvuPreflightPerf))
 
   io.range.req.ready := state === idle && !io.range.cancel
   io.range.resp.valid := state === finish && !io.range.cancel
   io.range.resp.bits := result
-  io.lookup.req.valid := state === request && !io.range.cancel
+  io.lookup.req.valid := state === checking && !issuedAll && !failed &&
+    pending.io.enq.ready && !io.range.cancel
   io.lookup.req.bits.vaddr := cursor
   io.lookup.req.bits.write := writePhase
-  io.lookup.resp.ready := state === response && !io.range.cancel
+  pending.io.enq.valid := io.lookup.req.fire
+  pending.io.enq.bits := io.lookup.req.bits
+  io.lookup.resp.ready := state === checking && pending.io.deq.valid && !io.range.cancel
+  pending.io.deq.ready := io.lookup.resp.fire
 
   when(io.range.req.fire) {
     val in = io.range.req.bits
@@ -91,8 +118,14 @@ class EvuAddressCheck(p: EvuParams) extends Module {
     result.write := !in.read
     cursor := in.base & ~63.U(64.W)
     lastLine := end(63, 0) & ~63.U(64.W)
-    writePhase := false.B
+    writePhase := in.fullLineWrite && in.write && !in.read
+    issuedAll := false.B
+    failed := false.B
     mapped.foreach(_ := false.B)
+    when(in.fullLineWrite) {
+      assert(in.write && !in.read && !in.base(5, 0).orR && !in.length(5, 0).orR,
+        "Write-only preflight requires a proven full-line store")
+    }
     when(in.illegal) {
       result.fault := EvuAddressFault.Illegal
       result.pageMap.enabled := false.B
@@ -107,39 +140,48 @@ class EvuAddressCheck(p: EvuParams) extends Module {
       result.fault := Mux(misaligned, EvuAddressFault.Misaligned, EvuAddressFault.Access)
       state := finish
     }.otherwise {
-      state := request
+      state := checking
     }
   }
-  when(io.lookup.req.fire) { state := response }
+  when(io.lookup.req.fire) {
+    when(!writePhase && job.write) {
+      writePhase := true.B
+    }.elsewhen(cursor === lastLine) {
+      issuedAll := true.B
+    }.otherwise {
+      cursor := cursor + 64.U
+      writePhase := job.fullLineWrite && job.write && !job.read
+    }
+  }
   when(io.lookup.resp.fire) {
     val answer = io.lookup.resp.bits
-    val index = cursor(63, 12) - job.base(63, 12)
+    val checked = pending.io.deq.bits
+    val index = checked.vaddr(63, 12) - job.base(63, 12)
     val slot = index(log2Ceil(p.translationPages) - 1, 0)
     val changed = mapped(slot) && result.pageMap.ppn(slot) =/= answer.paddr(63, 12)
-    when(answer.fault =/= EvuAddressFault.None || changed) {
+    when(!failed && (answer.fault =/= EvuAddressFault.None || changed)) {
+      responseFailed := true.B
       result.fault := Mux(changed, EvuAddressFault.Access, answer.fault)
-      result.vaddr := Mux(cursor < job.base, job.base, cursor)
+      result.vaddr := Mux(checked.vaddr < job.base, job.base, checked.vaddr)
       result.gpaddr := answer.gpaddr
       result.nonLeaf := answer.nonLeaf
-      result.write := !job.read || writePhase
+      result.write := !job.read || checked.write
       result.pageMap.enabled := false.B
-      state := finish
-    }.otherwise {
+      failed := true.B
+    }.elsewhen(!failed) {
       result.pageMap.ppn(slot) := answer.paddr(63, 12)
       mapped(slot) := true.B
-      when(!writePhase && job.write) {
-        writePhase := true.B
-        state := request
-      }.elsewhen(cursor === lastLine) {
-        state := finish
-      }.otherwise {
-        cursor := cursor + 64.U
-        writePhase := false.B
-        state := request
-      }
     }
   }
-  when(io.range.resp.fire || io.range.cancel) { state := idle }
+  // Stop issuing after the first ordered fault, but drain every accepted lookup.
+  val lastResponse = pending.io.count === 1.U && io.lookup.resp.fire && !io.lookup.req.fire
+  when(state === checking && (issuedAll || failed || responseFailed) &&
+    (!pending.io.deq.valid || lastResponse)) { state := finish }
+  when(io.range.resp.fire || io.range.cancel) {
+    state := idle
+    issuedAll := false.B
+    failed := false.B
+  }
 }
 
 /** Mirror only commands already accepted after scalar retirement. The core

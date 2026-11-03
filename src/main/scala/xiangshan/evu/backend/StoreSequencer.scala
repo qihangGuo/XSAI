@@ -5,7 +5,7 @@ import chisel3.util._
 import org.chipsalliance.cde.config._
 import xiangshan.evu.common._
 
-class StoreSequencerIO(implicit p: Parameters) extends SequencerIO(new StoreDataMicroOp) {
+class StoreSequencerIO(forwarding: Boolean = false)(implicit p: Parameters) extends SequencerIO(new StoreDataMicroOp) {
   val rvd  = Decoupled(new VectorReadReq)
   val rvm  = Decoupled(new VectorReadReq)
   val rvd_resp = Input(UInt(dLen.W))
@@ -14,12 +14,14 @@ class StoreSequencerIO(implicit p: Parameters) extends SequencerIO(new StoreData
   // Keep the responses with the sequencer until the store micro-op is issued.
   val rvd_data = Output(UInt(dLen.W))
   val rvm_data = Output(UInt(dLen.W))
+  val forward = Option.when(forwarding)(new VectorForwardOperand)
+  val e0Read = Output(Bool())
 }
 
-class StoreSequencer(implicit p: Parameters) extends Sequencer[StoreDataMicroOp]()(p) {
+class StoreSequencer(resultForwarding: Boolean = false)(implicit p: Parameters) extends Sequencer[StoreDataMicroOp]()(p) {
   def accepts(inst: VectorIssueInst) = inst.vmu && inst.opcode(5)
 
-  val io = IO(new StoreSequencerIO)
+  val io = IO(new StoreSequencerIO(resultForwarding))
 
   val valid    = RegInit(false.B)
   val inst     = Reg(new VectorIssueInst)
@@ -79,10 +81,20 @@ class StoreSequencer(implicit p: Parameters) extends Sequencer[StoreDataMicroOp]
   val vd_read_oh = UIntToOH(io.rvd.bits.eg)
   val vm_read_oh = Mux(renvm, UIntToOH(io.rvm.bits.eg), 0.U)
 
-  val raw_hazard = ((vm_read_oh | vd_read_oh) & io.older_writes) =/= 0.U
+  val forwarded = io.forward.map(_.available).getOrElse(false.B)
+  val raw_hazard = (vm_read_oh & io.older_writes).orR ||
+    ((vd_read_oh & io.older_writes).orR && !forwarded)
+  io.forward.foreach { port =>
+    val fullGroup = get_head_mask(~0.U(mLenB.W), eidx, inst.mem_elem_size, mLen).andR &&
+      get_tail_mask(~0.U(mLenB.W), next_eidx, inst.mem_elem_size, mLen).andR
+    port.eligible := valid && inst.vm && inst.mop === mopUnit && inst.seg_nf === 0.U &&
+      !rvdCaptured && fullGroup && (mLen == dLen).B
+  }
   val data_hazard = raw_hazard
 
   val oldest = inst.vat === io.vat_head
+  io.e0Read := valid && inst.vm && inst.vconfig.vl === 1.U && eidx === 0.U &&
+    inst.mem_elem_size === 2.U && inst.seg_nf === 0.U
 
   io.rvd.valid := valid && !data_hazard && !rvdCaptured
   io.rvd.bits.eg := getEgId(inst.rd + (sidx << inst.emul), eidx, inst.mem_elem_size, false.B)
@@ -93,19 +105,20 @@ class StoreSequencer(implicit p: Parameters) extends Sequencer[StoreDataMicroOp]
 
   when (io.rvd.fire) {
     rvdData := io.rvd_resp
-    rvdCaptured := true.B
+    rvdCaptured := !io.iss.fire && !io.dis.fire
   }
   when (io.rvm.fire) {
     rvmData := io.rvm_resp
-    rvmCaptured := true.B
+    rvmCaptured := !io.iss.fire && !io.dis.fire
   }
 
-  io.rvd_data := rvdData
-  io.rvm_data := rvmData
+  io.rvd_data := Mux(rvdCaptured, rvdData, io.rvd_resp)
+  io.rvm_data := Mux(rvmCaptured, rvmData, io.rvm_resp)
 
   // A bank conflict may serialize data and mask reads.  Issue only after
   // both required responses have been captured.
-  io.iss.valid := valid && !data_hazard && rvdCaptured && (!renvm || rvmCaptured)
+  io.iss.valid := valid && !data_hazard && (rvdCaptured || io.rvd.fire) &&
+    (!renvm || rvmCaptured || io.rvm.fire)
   io.iss.bits.use_stmask := renvm
   io.iss.bits.eidx := eidx
   io.iss.bits.elem_size := inst.mem_elem_size

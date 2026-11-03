@@ -137,12 +137,13 @@ class EvuSpecialSequencer(p: EvuParams) extends Module {
   quant.io.out.ready := io.cuteWrite.ready && outputAllowed && !io.flush
   metadata.io.deq.ready := io.cuteWrite.fire
   io.cuteWrite.bits := 0.U.asTypeOf(new EvuCuteWrite(p))
-  if (p.dlenBits == 256) {
+  if (p.fpQuantSupported) {
     val row = beat.target(8, 2)
-    val offset = result.chunk.pad(2)(1, 0) << 3
+    val byteOffset = result.chunk * elements.U
+    val offset = byteOffset.pad(5)(4, 0)
     io.cuteWrite.bits.matrixReg := beat.target(1, 0)
     io.cuteWrite.bits.bank := row(2, 0)
-    io.cuteWrite.bits.entry := (row >> 3) * 2.U + (result.chunk >> 2)
+    io.cuteWrite.bits.entry := (row >> 3) * 2.U + (byteOffset >> 5)
     io.cuteWrite.bits.byteMask := (result.validLanes.pad(32) << offset)(31, 0)
     io.cuteWrite.bits.data := (result.data.pad(256) << (offset << 3))(255, 0)
   }
@@ -150,7 +151,7 @@ class EvuSpecialSequencer(p: EvuParams) extends Module {
   val rejected = incoming.opcode =/= EvuOpcode.FpQuantToCute ||
     !EvuIsa.supportsElementWidth(incoming.opcode, incoming.sew) ||
     incoming.base(63, 9).orR || incoming.vl > (64 min (p.vlenBits / 32)).U ||
-    (p.dlenBits != 256).B
+    (!p.fpQuantSupported).B
   val empty = incoming.vl === 0.U
   val immediate = rejected || empty
   val lastWrite = io.cuteWrite.fire && beat.last

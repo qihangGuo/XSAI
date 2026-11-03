@@ -5,7 +5,7 @@ import chisel3.util._
 
 /** Loads reuse only within a job. Disjoint stores may combine across jobs;
   * every logical owner is acknowledged only after the physical bus response. */
-class EvuVmuLineCoalescer(p: EvuParams) extends Module {
+class EvuVmuLineCoalescer(p: EvuParams, collectRmwStores: Boolean = true) extends Module {
   private val n = p.maxMemOutstanding
   val io = IO(new Bundle {
     val client = Flipped(new EvuLineMemoryIO(p))
@@ -18,6 +18,8 @@ class EvuVmuLineCoalescer(p: EvuParams) extends Module {
     val storeMerge = Output(Bool())
     val bufferFull = Output(Bool())
     val ackWait = Output(Bool())
+    val rmwGet = Output(Bool())
+    val rmwMerge = Output(Bool())
   })
 
   if (!p.vmuLineCoalescing) {
@@ -27,8 +29,10 @@ class EvuVmuLineCoalescer(p: EvuParams) extends Module {
     io.storeMerge := false.B
     io.bufferFull := false.B
     io.ackWait := false.B
+    io.rmwGet := false.B
+    io.rmwMerge := false.B
   } else {
-    val empty :: collecting :: waiting :: responded :: Nil = Enum(4)
+    val empty :: collecting :: waiting :: responded :: reading :: prepared :: Nil = Enum(6)
     val states = RegInit(VecInit.fill(n)(empty))
     val requests = Reg(Vec(n, new EvuLineMemoryRequest(p)))
     val owners = RegInit(VecInit.fill(n)(0.U(n.W)))
@@ -49,7 +53,8 @@ class EvuVmuLineCoalescer(p: EvuParams) extends Module {
       !passthrough(i) && fits && requests(i).addr === base))
     val mergeable = VecInit((0 until n).map(i => sameLine(i) &&
       requests(i).write === incoming.write && Mux(incoming.write,
-        states(i) === collecting && requests(i).epoch === incoming.epoch &&
+        (states(i) === collecting || collectRmwStores.B && (states(i) === reading || states(i) === prepared)) &&
+          requests(i).epoch === incoming.epoch &&
           !(requests(i).mask & shiftedMask).orR,
         sameJob(i))))
     val free = VecInit((0 until n).map(i => states(i) === empty ||
@@ -90,14 +95,20 @@ class EvuVmuLineCoalescer(p: EvuParams) extends Module {
       // Only collect while an actual store can advance through the VMU.
       // A configured command window alone does not provide a merge candidate.
       // Timeout still bounds waiting on a candidate whose data is delayed.
-      val seal = !requests(i).write || passthrough(i) || requests(i).mask.andR ||
+      val needsRmw = collectRmwStores.B && requests(i).write && !passthrough(i) &&
+        requests(i).mask.orR && !requests(i).mask.andR
+      val startRmw = states(i) === collecting && needsRmw
+      val seal = needsRmw || !requests(i).write || passthrough(i) || requests(i).mask.andR ||
         !io.storePending || (io.client.req.valid && !mergeable(i)) ||
         io.drain || pressure || (io.client.req.valid && locked) || age(i).andR
-      arbiter.io.in(i).valid := states(i) === collecting && seal &&
+      arbiter.io.in(i).valid := (states(i) === collecting && seal || states(i) === prepared) &&
         !(completingLine && incoming.write) && !io.flush && !draining
       arbiter.io.in(i).bits := requests(i)
+      arbiter.io.in(i).bits.write := requests(i).write && !startRmw
+      arbiter.io.in(i).bits.mask := Mux(startRmw, Fill(64, 1.U(1.W)), requests(i).mask)
+      arbiter.io.in(i).bits.fullLineData := states(i) === prepared
       arbiter.io.in(i).bits.tag := i.U
-      when(arbiter.io.in(i).fire) { states(i) := waiting }
+      when(arbiter.io.in(i).fire) { states(i) := Mux(startRmw, reading, waiting) }
       when(states(i) === collecting && !age(i).andR) { age(i) := age(i) + 1.U }
 
       val additions = Mux(accept && index === i.U, acceptedTag, 0.U(n.W))
@@ -109,6 +120,10 @@ class EvuVmuLineCoalescer(p: EvuParams) extends Module {
       }
     }
     io.memory.req <> arbiter.io.out
+    io.rmwGet := io.memory.req.fire && states(arbiter.io.chosen) === collecting &&
+      requests(arbiter.io.chosen).write && !io.memory.req.bits.write
+    io.rmwMerge := accept && merging && incoming.write &&
+      (states(index) === reading || states(index) === prepared)
 
     when(accept) {
       assert(incoming.bytes > 0.U && incoming.bytes <= 64.U)
@@ -129,22 +144,34 @@ class EvuVmuLineCoalescer(p: EvuParams) extends Module {
       }
     }
     val busTag = io.memory.resp.bits.tag
-    io.memory.resp.ready := states(busTag) === waiting
-    when(io.memory.resp.valid) { assert(states(busTag) === waiting, "VMU line response has no owner") }
+    io.memory.resp.ready := states(busTag) === waiting || states(busTag) === reading
+    when(io.memory.resp.valid) {
+      assert(states(busTag) === waiting || states(busTag) === reading, "VMU line response has no owner")
+    }
     when(io.memory.resp.fire) {
       faults(busTag) := io.memory.resp.bits
       when(draining || io.flush) {
         faults(busTag).error := false.B
         faults(busTag).fault := EvuFault.None
       }
-      states(busTag) := responded
+      when(states(busTag) === reading && !io.memory.resp.bits.error && !draining && !io.flush) {
+        // A new owner may join in the same cycle that the old line returns.
+        val joining = accept && merging && index === busTag && incoming.write
+        val mask = requests(busTag).mask | Mux(joining, shiftedMask, 0.U)
+        val byteBits = FillInterleaved(8, mask)
+        val joinBits = FillInterleaved(8, shiftedMask)
+        val data = Mux(joining,
+          (requests(busTag).data & ~joinBits) | (shiftedData & joinBits), requests(busTag).data)
+        requests(busTag).data := (io.memory.resp.bits.data & ~byteBits) | (data & byteBits)
+        states(busTag) := prepared
+      }.otherwise { states(busTag) := responded }
     }
 
     when(draining && !states.map(_ =/= empty).reduce(_ || _) && !io.flush) { draining := false.B }
     when(io.flush) {
       draining := true.B
       for (i <- 0 until n) {
-        when(states(i) === collecting) {
+        when(states(i) === collecting || states(i) === prepared) {
           states(i) := responded
           faults(i) := 0.U.asTypeOf(faults(i))
         }
@@ -155,6 +182,6 @@ class EvuVmuLineCoalescer(p: EvuParams) extends Module {
     io.loadMerge := accept && merging && !incoming.write
     io.storeMerge := accept && merging && incoming.write
     io.bufferFull := io.client.req.valid && !merging && !free.asUInt.orR
-    io.ackWait := states.map(_ === waiting).reduce(_ || _)
+    io.ackWait := states.map(s => s === waiting || s === reading).reduce(_ || _)
   }
 }

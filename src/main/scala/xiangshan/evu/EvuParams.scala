@@ -8,12 +8,12 @@ case class EvuParams(
     enable:          Boolean = false,
     enableDifftest:   Boolean = false,
     vlenBits:        Int = 4096,
-    dlenBits:        Int = 256,
-    mlenBits:        Int = 256,
+    dlenBits:        Int = 512,
+    mlenBits:        Int = 512,
     vectorRegs:      Int = 32,
-    lanes:              Int = 4,
-    // Ara-style VRF: eight 64-bit banks in each lane.
-    vrfBanks:           Int = 8,
+    lanes:              Int = 8,
+    // Eight lanes of four 64-bit, 1RW banks retain the 16 KiB VRF.
+    vrfBanks:           Int = 4,
     dispatchDepth:      Int = 4,
     loadIssueDepth:     Int = 8,
     storeIssueDepth:    Int = 8,
@@ -22,7 +22,7 @@ case class EvuParams(
     loadInflightDepth:  Int = 32,
     loadResponseDepth:  Int = 32,
     maxMemOutstanding:  Int = 8,
-    memoryCommandDepth: Int = 2,
+    memoryCommandDepth: Int = 4,
     commandDepth:       Int = 16,
     completionDepth:    Int = 16,
     matrixStoreEntries: Int = 16,
@@ -45,7 +45,10 @@ case class EvuParams(
   // Each 64-bit lane slice packs byte, halfword or word elements.
   // Lane width is independent of the maximum 32-bit element width.
   require(dlenBits / lanes == 64, "EVU currently requires 64-bit lane slices")
-  require(vrfBanks == 8, "EVU uses eight 64-bit VRF banks per lane")
+  require(vrfBanks >= 2 && (vrfBanks & (vrfBanks - 1)) == 0,
+    "EVU requires a power-of-two number of VRF banks per lane")
+  require((vlenBits / dlenBits) * vectorRegs % vrfBanks == 0,
+    "EVU element groups must divide evenly across VRF banks")
   require(dispatchDepth > 0 && loadIssueDepth > 0 && storeIssueDepth > 0)
   require(executeIssueDepth > 0 && specialIssueDepth > 0)
   require(loadInflightDepth >= maxMemOutstanding)
@@ -68,6 +71,7 @@ case class EvuParams(
   val regIndexWidth: Int = log2Ceil(vectorRegs)
   val laneBits:      Int = dlenBits / lanes
   val translationPages: Int = (8 * vlenBytes + 4095) / 4096 + 1
+  val fpQuantSupported: Boolean = dlenBits == 256 || dlenBits == 512
 }
 
 /** Translations checked before retirement, retained separately for each command. */
@@ -127,11 +131,11 @@ class EvuCompletion(p: EvuParams) extends Bundle {
 }
 
 
-/** One quantized DLEN beat destined for a CUTE ABMatrixReg entry. */
+/** A masked quantized beat in CUTE's fixed 32-byte ABMatrixReg entry. */
 class EvuCuteWrite(p: EvuParams) extends Bundle {
   val matrixReg = UInt(2.W)
   val bank = UInt(8.W)
   val entry = UInt(16.W)
-  val data = UInt(p.dlenBits.W)
-  val byteMask = UInt((p.dlenBits / 8).W)
+  val data = UInt(256.W)
+  val byteMask = UInt(32.W)
 }

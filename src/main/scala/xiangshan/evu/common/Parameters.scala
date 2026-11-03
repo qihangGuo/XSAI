@@ -364,6 +364,7 @@ case class VectorParams(
 
   vrfBanking: Int = 8,
   debugVrf: Boolean = false,
+  diagnosticCounters: Boolean = false,
   reductionContexts: Int = 1,
   interleaveReductions: Boolean = false,
 
@@ -403,7 +404,10 @@ trait HasVectorParams extends HasVectorConsts { this: HasCoreParameters =>
   def vrfBank(eg: UInt): UInt = {
     if (vrfBankBits == 0) 0.U else if (egsPerVReg == 1) eg(vrfBankBits - 1, 0) else {
       val reg = eg >> log2Ceil(egsPerVReg)
-      eg(vrfBankBits - 1, 0) ^ reg.pad(vrfBankBits)(vrfBankBits - 1, 0)
+      // Fold all five register bits in the 512-bit/four-bank layout so
+      // registers spaced by four do not systematically collide. Rows stay unchanged.
+      val bankReg = if (dLen == 512 && vParams.vrfBanking == 4) reg ^ (reg >> 2) ^ (reg >> 4) else reg
+      eg(vrfBankBits - 1, 0) ^ bankReg.pad(vrfBankBits)(vrfBankBits - 1, 0)
     }
   }
   def lsiqIdBits = log2Ceil(vParams.vliqEntries.max(vParams.vsiqEntries))

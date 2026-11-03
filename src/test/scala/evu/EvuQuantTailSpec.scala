@@ -19,7 +19,7 @@ class EvuQuantTailSpec extends AnyFlatSpec with ChiselScalatestTester with Match
       case freechips.rocketchip.tile.MaxHartIdBits => 1
       case freechips.rocketchip.rocket.PgLevels => 3
     }
-    // SRAM definitions are cached across elaborations; use a different depth from the Exp2 test.
+    // Run SRAM-backed suites in separate JVMs because definitions are cached.
     val ep = EvuParams(enable = true, enableDifftest = true, vlenBits = 1024)
     test(LazyModule(new EvuSaturnExp2Shell(ep)).module)
       .withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
@@ -130,19 +130,21 @@ class EvuQuantTailSpec extends AnyFlatSpec with ChiselScalatestTester with Match
         load(2, scales)
         load(4, sentinel)
         val converted = inputs.map(x => BigInt(math.max(0, math.min(127, (x * 2f + 0.5f).toInt))))
+        val lanes = ep.dlenBits / 32
         for (vl <- Seq(0, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32)) {
           cuteWrites.clear()
           send(EvuOpcode.FpQuantToCute, 2, vl, vd = 2)
           // RTZ loses 0.5 for every active positive probability.
           finish(flags = (if (vl > 7) 1 else 0))
           withClue(s"vl=$vl: ") {
-            cuteWrites.size shouldBe ((vl + 7) / 8)
+            cuteWrites.size shouldBe ((vl + lanes - 1) / lanes)
             for (((entry, data, mask), index) <- cuteWrites.zipWithIndex) {
-              val n = math.min(8, vl - index * 8)
-              val offset = (index % 4) * 8
-              entry shouldBe BigInt(index / 4)
+              val start = index * lanes
+              val n = math.min(lanes, vl - start)
+              val offset = start % 32
+              entry shouldBe BigInt(start / 32)
               mask shouldBe (((BigInt(1) << n) - 1) << offset)
-              data shouldBe (pack(converted.slice(index * 8, index * 8 + n), 8) << (offset * 8))
+              data shouldBe (pack(converted.slice(start, start + n), 8) << (offset * 8))
             }
             expectReg(4, sentinel)
             expectReg(1, inputWords)

@@ -147,6 +147,8 @@ class EvuSynchronousVrfSpec extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.client.req.valid.poke(true.B)
       dut.io.client.req.ready.expect(false.B)
       dut.io.memory.req.valid.expect(true.B)
+      dut.io.grantWait.expect(false.B)
+      dut.io.responseWait.expect(true.B)
       dut.clock.step()
       dut.io.memory.req.valid.expect(false.B)
       dut.io.memory.resp.valid.poke(true.B)

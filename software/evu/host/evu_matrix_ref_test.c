@@ -162,11 +162,13 @@ int main(int argc, char **argv) {
           const unsigned n = nb * 8 + r, m = mb * 8;
           const bool last = nb == DIM / 8 - 1 && mb == DIM / 8 - 1 && r == 7;
           uint32_t *result = &expected[n * DIM + m];
+          uint32_t event_data[CONFIG_CUSTOM_EVU_DLEN / 32] = {0};
+          memcpy(event_data, result, 8 * sizeof(uint32_t));
           uint8_t beat_flags = 0;
           for (unsigned lane = 0; lane < 8; ++lane) beat_flags |= expected_flags[n * DIM + m + lane];
           if (!beats) {
-            uint32_t wrong[8];
-            memcpy(wrong, result, sizeof(wrong));
+            uint32_t wrong[CONFIG_CUSTOM_EVU_DLEN / 32];
+            memcpy(wrong, event_data, sizeof(wrong));
             wrong[0] ^= 1;
             CHECK(matrix_event(n, m, NULL, 32, 255, 0, false) != 0);
             CHECK(matrix_event(n, m, result, 0, 255, 0, false) != 0);
@@ -177,13 +179,13 @@ int main(int argc, char **argv) {
             CHECK(matrix_event(n, m + 1, result, 32, 255, 0, false) != 0);
             CHECK(matrix_event(n, m, result, 12, 7, 0, false) != 0);
             CHECK(matrix_event(n, m, result, 32, 15, 0, false) != 0);
-            CHECK(matrix_event(n, m, wrong, 32, 255, 0, false) != 0);
+            CHECK(matrix_event(n, m, wrong, sizeof(wrong), 255, 0, false) != 0);
             CHECK(matrix_event(n, m, result, 32, 255, 1, false) != 0);
             CHECK(matrix_event(n, m, result, 32, 255, 0, true) != 0);
           }
-          CHECK(matrix_event(n, m, result, 32, 255, beat_flags, last) == 0);
+          CHECK(matrix_event(n, m, event_data, sizeof(event_data), 255, beat_flags, last) == 0);
           // Check duplicate rejection at stream boundaries without logging every beat.
-          if (!beats || last) CHECK(matrix_event(n, m, result, 32, 255, beat_flags, last) != 0);
+          if (!beats || last) CHECK(matrix_event(n, m, event_data, sizeof(event_data), 255, beat_flags, last) != 0);
           sticky_flags |= beat_flags;
           if (varied == 2 && nb == 0 && mb == 0 && r == 0) {
             CHECK(sticky_flags == 1);

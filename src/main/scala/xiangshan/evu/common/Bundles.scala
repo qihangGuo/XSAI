@@ -302,7 +302,32 @@ class PipeHazard(pipe_depth: Int)(implicit p: Parameters) extends CoreBundle()(p
   def eg_oh = UIntToOH(eg)
 }
 
+object EvuFuPerf {
+  val names = Seq("fp_fma", "fp_cmp", "fp_exp")
+}
+
+class EvuFuPerf extends Bundle {
+  val issue = UInt(64.W)
+  val dependencyWait = UInt(64.W)
+  val operandWait = UInt(64.W)
+  val feedbackWait = UInt(64.W)
+  val writebackWait = UInt(64.W)
+  val executionWait = UInt(64.W)
+  val queueWait = UInt(64.W)
+  val dispatchBlocked = UInt(64.W)
+  val idleWithWork = UInt(64.W)
+  val readyArbitrationWait = UInt(64.W)
+  val queueIdle = UInt(64.W)
+  val resultSlotWait = UInt(64.W)
+  val priorityIssues = UInt(64.W)
+  val noWork = UInt(64.W)
+  val loadWait = UInt(64.W)
+  val forwardWait = UInt(64.W)
+}
+
 class EvuExecutionPerf extends Bundle {
+  val vectorForwards = UInt(64.W)
+  val vectorForwardNewer = UInt(64.W)
   val fmaIssue = UInt(64.W)
   val fmaNoWork = UInt(64.W)
   val fmaOperandWait = UInt(64.W)
@@ -311,6 +336,15 @@ class EvuExecutionPerf extends Bundle {
   val reductionFull = UInt(64.W)
   val expIssue = UInt(64.W)
   val divIssue = UInt(64.W)
+  val dependencyWait = UInt(64.W)
+  val operandWait = UInt(64.W)
+  val feedbackWait = UInt(64.W)
+  val permutationWait = UInt(64.W)
+  val writebackWait = UInt(64.W)
+  val executionWait = UInt(64.W)
+  val earlyOperandReads = UInt(64.W)
+  val reductionPrefetches = UInt(64.W)
+  val byFu = Vec(EvuFuPerf.names.size, new EvuFuPerf)
 }
 
 class SequencerHazard(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams {

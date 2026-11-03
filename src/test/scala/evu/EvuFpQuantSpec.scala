@@ -2,13 +2,15 @@ package evu
 
 import chisel3._
 import chiseltest._
-import chiseltest.simulator.TreadleBackendAnnotation
+import chiseltest.simulator.VerilatorBackendAnnotation
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import xiangshan.evu._
 
-/** FIRRTL interpreter tests; no Verilog generation or EMU execution. */
+/** Standalone quantization regression, without a full-core EMU. */
 class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matchers {
+  private val ep = EvuParams(enable = true)
+  private val lanes = ep.dlenBits / 32
   private def pack(values: Seq[BigInt], width: Int): BigInt = values.zipWithIndex.foldLeft(BigInt(0)) {
     case (a, (v, i)) => a | ((v & ((BigInt(1) << width) - 1)) << (i * width))
   }
@@ -16,7 +18,7 @@ class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matcher
   behavior of "Attention FP32 quantization"
 
   it should "queue rows before CUTE drains and retain each row target and flags through the shared pipeline" in {
-    test(new EvuSpecialSequencer(EvuParams(enable = true))).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+    test(new EvuSpecialSequencer(ep)).withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
       def clear(x: Data): Unit = x match {
         case b: Bool => b.poke(false.B)
         case u: UInt => u.poke(0.U)
@@ -44,7 +46,7 @@ class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matcher
             case 3 => BigInt("7f800001", 16)
             case _ => raw(1f)
           }
-          dut.io.vrf.readData(i).poke(pack(Seq.fill(8)(value), 32).U)
+          dut.io.vrf.readData(i).poke(pack(Seq.fill(lanes)(value), 32).U)
         }
       }
       for (job <- 0 until 4) {
@@ -64,7 +66,7 @@ class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matcher
         dut.clock.step()
       }
       dut.io.command.valid.poke(false.B)
-      val widths = Seq(8, 8, 8, 2)
+      val widths = Seq(64, 64, 64, 9).map(vl => (vl + lanes - 1) / lanes)
       val bytes = Seq(1, 0, 127, 1)
       val flags = Seq(0, 1, 16, 1) // 1.0 + 0.5 truncates with NX too.
       var row = 0
@@ -79,11 +81,12 @@ class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matcher
         dut.io.completion.ready.poke(completionReady.B)
         if (writeReady && dut.io.cuteWrite.valid.peek().litToBoolean) {
           val w = dut.io.cuteWrite.bits
-          val n = if (row == 3 && chunk == 1) 1 else 8
-          val offset = chunk % 4 * 8
+          val start = chunk * lanes
+          val n = math.min(lanes, (if (row == 3) 9 else 64) - start)
+          val offset = start % 32
           w.matrixReg.expect(2.U)
           w.bank.expect(((row + 5) % 8).U)
-          w.entry.expect((((row + 5) / 8) * 2 + chunk / 4).U)
+          w.entry.expect((((row + 5) / 8) * 2 + start / 32).U)
           w.byteMask.expect((((BigInt(1) << n) - 1) << offset).U)
           w.data.expect((pack(Seq.fill(n)(BigInt(bytes(row))), 8) << (offset * 8)).U)
           chunk += 1
@@ -118,7 +121,7 @@ class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matcher
   }
 
   it should "capture one scalar scale per command and ignore inactive scale lanes under CUTE backpressure" in {
-    test(new EvuSpecialSequencer(EvuParams(enable = true))).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+    test(new EvuSpecialSequencer(ep)).withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
       def clear(x: Data): Unit = x match {
         case b: Bool => b.poke(false.B)
         case u: UInt => u.poke(0.U)
@@ -153,8 +156,8 @@ class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matcher
         var writes = 0
         var cycles = 0
         while (!dut.io.completion.valid.peek().litToBoolean && cycles < 150) {
-          dut.io.vrf.readData(0).poke(pack(Seq.fill(8)(raw(0.5f)), 32).U)
-          dut.io.vrf.readData(1).poke(pack(raw(scale) +: Seq.fill(7)(BigInt("7f800001", 16)), 32).U)
+          dut.io.vrf.readData(0).poke(pack(Seq.fill(lanes)(raw(0.5f)), 32).U)
+          dut.io.vrf.readData(1).poke(pack(raw(scale) +: Seq.fill(lanes - 1)(BigInt("7f800001", 16)), 32).U)
           if (dut.io.vrf.read(1).valid.peek().litToBoolean) {
             dut.io.vrf.read(1).bits.chunk.expect(0.U)
             reads += 1
@@ -162,9 +165,9 @@ class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matcher
           val ready = cycles % 3 == 2
           dut.io.cuteWrite.ready.poke(ready.B)
           if (ready && dut.io.cuteWrite.valid.peek().litToBoolean) {
-            val offset = writes % 4 * 8
+            val offset = (writes * lanes) % 32
             val byte = if (scale == 1f) 1 else 2
-            dut.io.cuteWrite.bits.data.expect((pack(Seq.fill(8)(BigInt(byte)), 8) << (offset * 8)).U)
+            dut.io.cuteWrite.bits.data.expect((pack(Seq.fill(lanes)(BigInt(byte)), 8) << (offset * 8)).U)
             writes += 1
           }
           dut.clock.step()
@@ -174,7 +177,7 @@ class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matcher
         dut.io.completion.bits.fflags.expect(0.U)
         dut.io.completion.bits.exception.expect(false.B)
         reads shouldBe 1
-        writes shouldBe 8
+        writes shouldBe (64 / lanes)
         dut.io.completion.ready.poke(true.B)
         dut.clock.step()
         dut.io.completion.ready.poke(false.B)
@@ -183,7 +186,7 @@ class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matcher
   }
 
   it should "round multiply/add separately, clamp and report only active IEEE flags" in {
-    test(new EvuFpQuant(EvuParams(enable = true))).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+    test(new EvuFpQuant(ep)).withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
       val input = Seq(0f, 0.49f, 0.5f, 1.5f, 63.25f, 127f, 128f, -1f)
       dut.io.flush.poke(false.B)
       dut.io.in.valid.poke(false.B)
@@ -217,20 +220,20 @@ class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matcher
   }
 
   it should "accept consecutive groups and flush every occupied stage under backpressure" in {
-    test(new EvuFpQuant(EvuParams(enable = true))).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+    test(new EvuFpQuant(ep)).withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
       dut.io.flush.poke(false.B)
       dut.io.out.ready.poke(true.B)
-      dut.io.in.bits.scale.poke(pack(Seq.fill(8)(raw(1f)), 32).U)
-      dut.io.in.bits.validLanes.poke(255.U)
+      dut.io.in.bits.scale.poke(pack(Seq.fill(lanes)(raw(1f)), 32).U)
+      dut.io.in.bits.validLanes.poke(((BigInt(1) << lanes) - 1).U)
       for (cycle <- 0 until 11) {
         dut.io.in.valid.poke((cycle < 8).B)
-        dut.io.in.bits.input.poke(pack(Seq.fill(8)(raw(cycle.toFloat)), 32).U)
+        dut.io.in.bits.input.poke(pack(Seq.fill(lanes)(raw(cycle.toFloat)), 32).U)
         dut.io.in.bits.chunk.poke((cycle % 8).U)
         if (cycle < 8) dut.io.in.ready.expect(true.B)
         if (cycle >= 3) {
           dut.io.out.valid.expect(true.B)
           dut.io.out.bits.chunk.expect((cycle - 3).U)
-          dut.io.out.bits.data.expect(pack(Seq.fill(8)(BigInt(cycle - 3)), 8).U)
+          dut.io.out.bits.data.expect(pack(Seq.fill(lanes)(BigInt(cycle - 3)), 8).U)
         }
         dut.clock.step()
       }
@@ -252,7 +255,7 @@ class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matcher
   }
 
   it should "map packed bytes across banks and entries and hold under CUTE backpressure" in {
-    test(new EvuSpecialSequencer(EvuParams(enable = true))).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+    test(new EvuSpecialSequencer(ep)).withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
       def clear(x: Data): Unit = x match {
         case b: Bool => b.poke(false.B)
         case u: UInt => u.poke(0.U)
@@ -271,7 +274,7 @@ class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matcher
       dut.io.vrf.read.foreach(_.ready.poke(true.B))
       dut.io.vrf.readData.foreach(_.poke(0.U))
       dut.io.cuteWrite.ready.poke(false.B)
-      for (vl <- Seq(0, 1, 7, 8, 9, 31, 32, 33, 63, 64)) {
+      for (vl <- Seq(0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64)) {
         val c = dut.io.command.bits
         c.opcode.poke(EvuOpcode.FpQuantToCute)
         c.sew.poke(2.U)
@@ -295,8 +298,8 @@ class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matcher
           for (i <- 0 until 3) {
             val addr = dut.io.vrf.read(i).bits.addr.peek().litValue
             val chunk = dut.io.vrf.read(i).bits.chunk.peek().litValue.toInt
-            val data = if (addr == 3) (0 until 8).map(j => raw((chunk * 8 + j).toFloat + 0.25f))
-              else Seq.fill(8)(raw(1f))
+            val data = if (addr == 3) (0 until lanes).map(j => raw((chunk * lanes + j).toFloat + 0.25f))
+              else Seq.fill(lanes)(raw(1f))
             dut.io.vrf.readData(i).poke(pack(data, 32).U)
           }
           val ready = cycles % 3 == 2
@@ -306,8 +309,8 @@ class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matcher
             val state = (w.entry.peek().litValue, w.data.peek().litValue, w.byteMask.peek().litValue)
             held.foreach(old => state shouldBe old)
             if (ready) {
-              val start = writes * 8
-              val n = math.min(8, vl - start)
+              val start = writes * lanes
+              val n = math.min(lanes, vl - start)
               w.matrixReg.expect(2.U)
               w.bank.expect(7.U)
               w.entry.expect((30 + start / 32).U)
@@ -322,7 +325,7 @@ class EvuFpQuantSpec extends AnyFlatSpec with ChiselScalatestTester with Matcher
         }
         withClue(s"vl=$vl cycles=$cycles: ") {
           dut.io.completion.valid.expect(true.B)
-          writes shouldBe ((vl + 7) / 8)
+          writes shouldBe ((vl + lanes - 1) / lanes)
           dut.io.completion.bits.exception.expect(false.B)
           dut.io.completion.bits.vxsat.expect(false.B)
           dut.io.completion.bits.fflags.expect((if (vl == 0) 0 else 1).U)

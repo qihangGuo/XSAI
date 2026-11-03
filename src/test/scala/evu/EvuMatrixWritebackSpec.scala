@@ -92,12 +92,14 @@ class EvuMatrixWritebackSpec extends AnyFlatSpec with ChiselScalatestTester with
         if (dut.io.memory.req.valid.peek().litToBoolean && dut.io.memory.req.ready.peek().litToBoolean) {
           val req = dut.io.memory.req.bits
           req.bytes.expect(64.U)
-          req.mask.expect(fullMask.U)
           val tag = req.tag.peek().litValue.toInt
           (pending.map(_.tag) ++ response.map(_.tag)) should not contain tag
           val addr = req.addr.peek().litValue.toInt
           addr % 64 shouldBe 0
           val write = req.write.peek().litToBoolean
+          val expectedMask = if (write && addr == 0x4000) BigInt(5) << 60
+            else if (write && addr == 0x4040) BigInt(5) else fullMask
+          req.mask.expect(expectedMask.U)
           if (write) { writes += 1; memory(addr) = req.data.peek().litValue }
           else { reads += 1 }
           pending += Response(tag, if (write) BigInt(0) else memory(addr), cycles + 20 + (7 - tag) * 3)
@@ -273,7 +275,7 @@ class EvuMatrixWritebackSpec extends AnyFlatSpec with ChiselScalatestTester with
     }
   }
 
-  for (vlen <- Seq(512, 4096)) {
+  for (vlen <- Seq(1024, 4096)) {
     it should s"elaborate VLEN=$vlen EvuTop connections to in-memory CHIRRTL without generating Verilog" in {
       implicit val p: Parameters = Parameters.empty.alterPartial {
         case freechips.rocketchip.tile.XLen => 64

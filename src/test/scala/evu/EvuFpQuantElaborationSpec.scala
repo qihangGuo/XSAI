@@ -8,7 +8,7 @@ import xiangshan.evu._
 /** In-memory CHIRRTL only: no firtool, simulator, or Verilog output. */
 class EvuFpQuantElaborationSpec extends AnyFlatSpec with Matchers {
   behavior of "FP32 quantization and the retained special sequencer"
-  for (vlen <- Seq(512, 4096)) {
+  for (vlen <- Seq(1024, 4096)) {
     it should s"elaborate the packed write path with VLEN=$vlen" in {
       val ir = ChiselStage.emitCHIRRTL(new EvuSpecialSequencer(EvuParams(enable = true, vlenBits = vlen)))
       ir should include ("module EvuFpQuant")

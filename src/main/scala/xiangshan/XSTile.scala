@@ -565,21 +565,13 @@ class XSTile()(implicit p: Parameters) extends LazyModule
           cuteAbWrite.bits.bank.getWidth - 1, 0)
         cuteAbWrite.bits.addr := evu.module.io.cuteWrite.bits.entry(
           cuteAbWrite.bits.addr.getWidth - 1, 0)
-        if (cuteAbWrite.bits.data.getWidth >= p(ExternalVectorKey).dlenBits) {
-          cuteAbWrite.bits.data := Cat(
-            0.U((cuteAbWrite.bits.data.getWidth - p(ExternalVectorKey).dlenBits).W),
-            evu.module.io.cuteWrite.bits.data)
-          cuteAbWrite.bits.byteMask := Cat(
-            0.U((cuteAbWrite.bits.byteMask.getWidth - p(ExternalVectorKey).dlenBits / 8).W),
-            evu.module.io.cuteWrite.bits.byteMask)
-        } else {
-          cuteAbWrite.bits.data := evu.module.io.cuteWrite.bits.data(
-            cuteAbWrite.bits.data.getWidth - 1, 0)
-          cuteAbWrite.bits.byteMask := evu.module.io.cuteWrite.bits.byteMask(
-            cuteAbWrite.bits.byteMask.getWidth - 1, 0)
-        }
+        require(cuteAbWrite.bits.data.getWidth == evu.module.io.cuteWrite.bits.data.getWidth &&
+          cuteAbWrite.bits.byteMask.getWidth == evu.module.io.cuteWrite.bits.byteMask.getWidth,
+          "EVU and CUTE must agree on the fixed ABMatrixReg entry width")
+        cuteAbWrite.bits.data := evu.module.io.cuteWrite.bits.data
+        cuteAbWrite.bits.byteMask := evu.module.io.cuteWrite.bits.byteMask
         evu.module.io.cuteWrite.ready := cuteAbWrite.ready
-        if (p(ExternalVectorKey).dlenBits == 256) {
+        if (p(ExternalVectorKey).fpQuantSupported) {
           require(cuteAbWrite.bits.data.getWidth == 256 &&
             cuteAbWrite.bits.bank.getWidth == 3 && cuteAbWrite.bits.addr.getWidth == 5,
             "EVU FP quantization requires CUTE 128x64 with eight banks and 32-byte entries")
@@ -617,6 +609,9 @@ class XSTile()(implicit p: Parameters) extends LazyModule
         XSPerfReference("evu_vrf_write_blocks_read_cycles", perf.vrfWriteBlocksRead, XSPerfLevel.NORMAL)
         XSPerfReference("evu_vrf_operand_wait_cycles", perf.vrfOperandWait, XSPerfLevel.NORMAL)
         XSPerfReference("evu_vrf_prefetches", perf.vrfPrefetches, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_vrf_read_grant_wait_cycles", perf.vrfReadGrantWait, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_vrf_read_response_wait_cycles", perf.vrfReadResponseWait, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_scalar_result_forwards", perf.scalarForwards, XSPerfLevel.NORMAL)
         XSPerfReference("evu_memory_order_stall_cycles", perf.memoryOrderStalls, XSPerfLevel.NORMAL)
         XSPerfReference("evu_register_hazard_stall_cycles", perf.registerHazardStalls, XSPerfLevel.NORMAL)
         XSPerfReference("evu_memory_compute_overlap_cycles", perf.memoryComputeOverlap, XSPerfLevel.NORMAL)
@@ -641,6 +636,34 @@ class XSTile()(implicit p: Parameters) extends LazyModule
         XSPerfReference("evu_reduction_full_cycles", perf.execution.reductionFull, XSPerfLevel.NORMAL)
         XSPerfReference("evu_exp_issue_cycles", perf.execution.expIssue, XSPerfLevel.NORMAL)
         XSPerfReference("evu_div_issue_cycles", perf.execution.divIssue, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_execute_dependency_wait_cycles", perf.execution.dependencyWait, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_execute_operand_wait_cycles", perf.execution.operandWait, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_execute_feedback_wait_cycles", perf.execution.feedbackWait, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_execute_permutation_wait_cycles", perf.execution.permutationWait, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_execute_writeback_wait_cycles", perf.execution.writebackWait, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_execute_fu_wait_cycles", perf.execution.executionWait, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_early_operand_reads", perf.execution.earlyOperandReads, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_reduction_prefetch_hints", perf.execution.reductionPrefetches, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_vrf_demand_prefetch_wait", perf.vrfDemandPrefetchWait, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_vrf_prefetch_deferred", perf.vrfPrefetchDeferred, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_vrf_prefetch_used", perf.vrfPrefetchUsed, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_vrf_prefetch_discarded", perf.vrfPrefetchDiscarded, XSPerfLevel.NORMAL)
+        for ((name, index) <- xiangshan.evu.common.EvuFuPerf.names.zipWithIndex) {
+          val fu = perf.execution.byFu(index)
+          XSPerfReference(s"evu_${name}_issue", fu.issue, XSPerfLevel.NORMAL)
+          XSPerfReference(s"evu_${name}_dependency_wait", fu.dependencyWait, XSPerfLevel.NORMAL)
+          XSPerfReference(s"evu_${name}_operand_wait", fu.operandWait, XSPerfLevel.NORMAL)
+          XSPerfReference(s"evu_${name}_feedback_wait", fu.feedbackWait, XSPerfLevel.NORMAL)
+          XSPerfReference(s"evu_${name}_writeback_wait", fu.writebackWait, XSPerfLevel.NORMAL)
+          XSPerfReference(s"evu_${name}_fu_wait", fu.executionWait, XSPerfLevel.NORMAL)
+          XSPerfReference(s"evu_${name}_queue_wait", fu.queueWait, XSPerfLevel.NORMAL)
+          XSPerfReference(s"evu_${name}_dispatch_blocked", fu.dispatchBlocked, XSPerfLevel.NORMAL)
+          XSPerfReference(s"evu_${name}_idle_with_work", fu.idleWithWork, XSPerfLevel.NORMAL)
+          XSPerfReference(s"evu_${name}_ready_arbitration_wait", fu.readyArbitrationWait, XSPerfLevel.NORMAL)
+          XSPerfReference(s"evu_${name}_queue_idle", fu.queueIdle, XSPerfLevel.NORMAL)
+          XSPerfReference(s"evu_${name}_result_slot_wait", fu.resultSlotWait, XSPerfLevel.NORMAL)
+          XSPerfReference(s"evu_${name}_priority_issues", fu.priorityIssues, XSPerfLevel.NORMAL)
+        }
       }
       if (env.EnableDifftest) {
         require(!useAcceleratorCDC, "EVU difftest currently requires a common core/accelerator clock")

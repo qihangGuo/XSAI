@@ -67,6 +67,13 @@ class EvuPerf extends Bundle {
   val vrfWriteBlocksRead = UInt(64.W)
   val vrfOperandWait = UInt(64.W)
   val vrfPrefetches = UInt(64.W)
+  val vrfReadGrantWait = UInt(64.W)
+  val vrfReadResponseWait = UInt(64.W)
+  val vrfDemandPrefetchWait = UInt(64.W)
+  val vrfPrefetchDeferred = UInt(64.W)
+  val vrfPrefetchUsed = UInt(64.W)
+  val vrfPrefetchDiscarded = UInt(64.W)
+  val scalarForwards = UInt(64.W)
   val memoryOrderStalls = UInt(64.W)
   val registerHazardStalls = UInt(64.W)
   val memoryComputeOverlap = UInt(64.W)
@@ -448,6 +455,7 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   vectorReq.bits.addr := vectorBackend.io.memory.req.bits.addr
   vectorReq.bits.data := vectorBackend.io.memory.req.bits.data
   vectorReq.bits.mask := vectorBackend.io.memory.req.bits.mask
+  vectorReq.bits.fullLineData := false.B
   vectorReq.bits.bytes := ep.mlenBytes.U
   vectorReq.bits.write := vectorBackend.io.memory.req.bits.write
   vectorReq.bits.tag := vectorBackend.io.memory.req.bits.tag
@@ -618,6 +626,13 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   io.perf.vrfWriteBlocksRead := vectorBackend.io.vrfPerf.writeBlocksRead
   io.perf.vrfOperandWait := vectorBackend.io.vrfPerf.operandWait
   io.perf.vrfPrefetches := vectorBackend.io.vrfPerf.prefetches
+  io.perf.vrfReadGrantWait := vectorBackend.io.vrfPerf.readGrantWait
+  io.perf.vrfReadResponseWait := vectorBackend.io.vrfPerf.readResponseWait
+  io.perf.vrfDemandPrefetchWait := vectorBackend.io.vrfPerf.demandPrefetchWait
+  io.perf.vrfPrefetchDeferred := vectorBackend.io.vrfPerf.prefetchDeferred
+  io.perf.vrfPrefetchUsed := vectorBackend.io.vrfPerf.prefetchUsed
+  io.perf.vrfPrefetchDiscarded := vectorBackend.io.vrfPerf.prefetchDiscarded
+  io.perf.scalarForwards := vectorBackend.io.vrfPerf.scalarForwards
   io.perf.memoryOrderStalls := vectorBackend.io.memoryOrderStalls
   io.perf.registerHazardStalls := vectorBackend.io.registerHazardStalls
   io.perf.memoryComputeOverlap := vectorBackend.io.memoryComputeOverlap
@@ -665,11 +680,22 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
     // Optional simulation-only snapshots at a completed FENCE. Subtract
     // adjacent snapshots around a kernel; no performance CSR/ISA change.
     val trace = freechips.rocketchip.util.PlusArg("evu_mem_trace", width = 1)
+    val rmwGets = RegInit(0.U(64.W)).suggestName("vmuRmwGets")
+    val rmwMerges = RegInit(0.U(64.W)).suggestName("vmuRmwMerges")
+    when(vmuLines.io.rmwGet) { rmwGets := rmwGets + 1.U }
+    when(vmuLines.io.rmwMerge) { rmwMerges := rmwMerges + 1.U }
     val fenceIndex = RegInit(0.U(32.W))
     when(io.completion.fire && io.completion.bits.opcode === EvuOpcode.Fence) {
       fenceIndex := fenceIndex + 1.U
       when(trace.asBool) {
-        printf(p"[EVU-VMU] fence=${fenceIndex} t=${perfCycles} cmd=${memoryCounters(0)} tag=${memoryCounters(1)} get=${memoryCounters(2)} put=${memoryCounters(3)} partial=${memoryCounters(4)} full=${memoryCounters(5)} ack=${memoryCounters(6)} entry=${memoryCounters(7)} win=${vectorBackend.io.memoryOrderStalls} merge=${perfVmuStoreMerges}\n")
+        printf(p"[EVU-VMU] fence=${fenceIndex} t=${perfCycles} cmd=${memoryCounters(0)} tag=${memoryCounters(1)} get=${memoryCounters(2)} put=${memoryCounters(3)} partial=${memoryCounters(4)} full=${memoryCounters(5)} ack=${memoryCounters(6)} entry=${memoryCounters(7)} win=${vectorBackend.io.memoryOrderStalls} merge=${perfVmuStoreMerges} rmwget=${rmwGets} rmwmerge=${rmwMerges}\n")
+        val exe = vectorBackend.io.executionPerf
+        val vrf = vectorBackend.io.vrfPerf
+        printf(p"[EVU-EXE] fence=${fenceIndex} dep=${exe.dependencyWait} operand=${exe.operandWait} feedback=${exe.feedbackWait} perm=${exe.permutationWait} wb=${exe.writebackWait} fu=${exe.executionWait} grant=${vrf.readGrantWait} resp=${vrf.readResponseWait} e0=${vrf.scalarForwards} early=${exe.earlyOperandReads} rpf=${exe.reductionPrefetches} dpw=${vrf.demandPrefetchWait} defer=${vrf.prefetchDeferred} used=${vrf.prefetchUsed} drop=${vrf.prefetchDiscarded} bank=${vrf.bankConflicts} wrblk=${vrf.writeBlocksRead} vfw=${exe.vectorForwards} vnew=${exe.vectorForwardNewer}\n")
+        for ((name, index) <- xiangshan.evu.common.EvuFuPerf.names.zipWithIndex) {
+          val fu = exe.byFu(index)
+          printf(p"[EVU-FU] fence=${fenceIndex} path=${name} issue=${fu.issue} dep=${fu.dependencyWait} operand=${fu.operandWait} feedback=${fu.feedbackWait} wb=${fu.writebackWait} fu=${fu.executionWait} queue=${fu.queueWait} dispatch=${fu.dispatchBlocked} idle=${fu.idleWithWork} arb=${fu.readyArbitrationWait} qi=${fu.queueIdle} slot=${fu.resultSlotWait} pri=${fu.priorityIssues} nowork=${fu.noWork} loadwait=${fu.loadWait} fwait=${fu.forwardWait}\n")
+        }
       }
     }
   }
