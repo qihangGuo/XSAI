@@ -157,3 +157,39 @@ No full-core emulator timing run or standard-cell area/timing synthesis was
 performed locally for this expansion. Measure online softmax and FlashAttention
 on the rebuilt server emulator with the same guest binaries and completion
 boundaries as the 256-bit baseline.
+
+## CPU quantization legality fix: 2026-11-03
+
+The server FlashAttention run built at 14:05:50 stops at PC `0x800008ec`,
+instruction `0xbc07a60b` (`XV_FPQUANT_SCALAR_TO_CUTE`), with illegal-instruction
+cause 2. It has checked 2,048 matrix beats and no CUTE quant writes. The
+following mstatus/mepc/mcause differences result from RTL raising an exception
+while NEMU accepts the instruction; they are not a reported numeric mismatch.
+
+The CPU backend still had a pre-expansion `dlenBits != 256` rejection even
+though the special sequencer, capability CSR and NEMU support both 256 and
+512 bits. The CPU now calls `EvuIsa.supportsFpQuantTarget`, which uses the
+existing `fpQuantSupported` parameter. Both vector-scale and scalar-scale
+quantization retain the 9-bit target and VL<=64 checks. Existing permission,
+SEW, LMUL, exception and retirement checks remain in place.
+
+`EvuFpQuantLegalitySpec` exercises the actual helper called by the CPU backend:
+the failing instruction, both quant forms at DLEN=256/512, boundary VLs and
+targets, unsupported widths, and the existing SEW/LMUL protections. The test
+does not instantiate the full CPU or the FP quantizer.
+
+This fix requires rebuilding the server emulator with the existing command.
+The matching 512-bit NEMU library and current guest binaries remain applicable.
+No XSAICache/CUTE source change is required. The earlier checkpoint tag
+`checkpoint/evu-softmax-7624-6126-20261103` predates this fix and remains fixed.
+
+No Scala/Java process, RTL generation, emulator run or binary build is started
+locally for this follow-up. The new regression still needs server execution:
+
+```sh
+mill -i xiangshan.test.testOnly evu.EvuFpQuantLegalitySpec
+```
+
+After rebuilding, rerun the existing cold FlashAttention image with Difftest.
+Acceptance requires CUTE writes to progress, GOOD TRAP and no pending events;
+separate numerical checking is still required for a CHECK=0 performance image.

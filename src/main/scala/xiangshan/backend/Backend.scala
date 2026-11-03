@@ -873,9 +873,8 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
       !EvuIsa.supportsElementWidth(decoded, effectiveSew))
     val effectiveLmul = Mux(csrio.evu.configured, csrio.evu.config.vtype(2, 0), 0.U)
     val invalidGroup = !EvuIsa.supportsRegisterGroups(payload.instr, effectiveLmul)
-    val invalidFpQuantTarget = EvuIsa.canonical(f7) === EvuIsa.fpQuantToCute &&
-      ((p(ExternalVectorKey).dlenBits != 256).B || payload.base(63, 9).orR ||
-        Mux(csrio.evu.configured, csrio.evu.config.vl, payload.vl) > 64.U)
+    val invalidFpQuantTarget = !EvuIsa.supportsFpQuantTarget(p(ExternalVectorKey), payload.instr,
+      payload.base, Mux(csrio.evu.configured, csrio.evu.config.vl, payload.vl))
     val permissionFault = !csrio.evu.permitted || illegalConfig || invalidGroup || invalidFpQuantTarget
     val memory = source.bits.amuCtrl.get.evu && (load || store || launch) && !permissionFault
     val killed = source.bits.robIdx.needFlush(ctrlBlock.io.redirect)

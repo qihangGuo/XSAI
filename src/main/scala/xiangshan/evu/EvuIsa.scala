@@ -79,6 +79,11 @@ object EvuIsa {
       (opcode =/= EvuOpcode.FpQuantToCute || sew === 2.U)
   }
 
+  def supportsFpQuantTarget(p: EvuParams, instr: UInt, base: UInt, vl: UInt): Bool = {
+    val quant = canonical(instr(31, 25)) === fpQuantToCute
+    !quant || (p.fpQuantSupported.B && !base(63, 9).orR && vl <= 64.U)
+  }
+
   /** Register groups must be checked before the custom command retires. */
   def supportsRegisterGroups(instr: UInt, lmul: UInt): Bool = {
     val rawOp = instr(31, 25)

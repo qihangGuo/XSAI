@@ -24,4 +24,6 @@ check_pin difftest 9206c5ee3d2a3da049c800b1e2a293e552117094
 git -C "$repository_root" config submodule.CUTE.url https://github.com/qihangGuo/CUTE.git
 git -C "$repository_root" config submodule.XSAICache.url https://github.com/qihangGuo/XSAI.git
 git -C "$repository_root" config submodule.utility.url https://github.com/qihangGuo/XSAI.git
-git -C "$repository_root" submodule update --init --recursive
+git -C "$repository_root" submodule update --init
+
+printf 'Top-level submodules are initialized. Run `make init` to fetch the nested dependencies required by this XSAI checkout.\n'
