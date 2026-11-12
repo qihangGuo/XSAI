@@ -74,6 +74,7 @@ class EvuAraRegisterFileElaborationSpec extends AnyFlatSpec with Matchers with C
 
         dut.io.read(0)(0).req.bits.eg.poke(5.U)
         dut.io.read(0)(0).req.bits.oldest.poke(true.B)
+        dut.io.read(0)(0).req.bits.lastOperand.poke(false.B)
         dut.io.read(0)(0).req.valid.poke(true.B)
         dut.io.read(0)(0).req.ready.expect(false.B)
         dut.clock.step()
@@ -116,6 +117,7 @@ class EvuAraRegisterFileElaborationSpec extends AnyFlatSpec with Matchers with C
           read.req.valid.poke(true.B)
           read.req.bits.eg.poke((i*16).U)
           read.req.bits.oldest.poke(true.B)
+          read.req.bits.lastOperand.poke(false.B)
         }
         val pending = scala.collection.mutable.Set(0, 1, 2)
         for (_ <- 0 until 8 if pending.nonEmpty) {
@@ -169,6 +171,7 @@ class EvuAraRegisterFileElaborationSpec extends AnyFlatSpec with Matchers with C
         for (read <- dut.io.read.map(_(0))) {
           read.req.bits.eg.poke(3.U)
           read.req.bits.oldest.poke(false.B)
+          read.req.bits.lastOperand.poke(false.B)
           read.req.valid.poke(true.B)
           read.req.ready.expect(false.B)
         }
@@ -214,6 +217,7 @@ class EvuAraRegisterFileElaborationSpec extends AnyFlatSpec with Matchers with C
         val read = dut.io.read(0)(0)
         read.req.bits.eg.poke(5.U)
         read.req.bits.oldest.poke(true.B)
+        read.req.bits.lastOperand.poke(false.B)
         read.req.valid.poke(true.B)
         read.req.ready.expect(false.B)
         dut.clock.step()

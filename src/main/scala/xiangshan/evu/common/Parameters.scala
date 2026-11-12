@@ -153,15 +153,18 @@ object VXFunctionalUnitGroups {
   def fpFMA(pipeDepth: Int, segmentedFPFMA: Boolean) = Seq(
     SIMDFPFMAFactory(pipeDepth, segmentedFPFMA)
   )
-  def fpMisc = Seq(
-    FPDivSqrtFactory,
+  def fpMisc(parallelFp32Div: Boolean = false) = Seq(
+    if (parallelFp32Div) SIMDFPDivSqrtFactory else FPDivSqrtFactory,
     FPCmpFactory,
     FPConvFactory,
-    VFExp2Factory
+    VFExp2Factory,
+    FPXX8Factory,
+    FPMXFPFactory
   )
 
-  def allFPFUs(fmaPipeDepth: Int, useScalarFPFMA: Boolean, segmentedFPFMA: Boolean) = (
-    fpFMA(fmaPipeDepth, segmentedFPFMA) ++ fpMisc
+  def allFPFUs(fmaPipeDepth: Int, useScalarFPFMA: Boolean, segmentedFPFMA: Boolean,
+      parallelFp32Div: Boolean = false) = (
+    fpFMA(fmaPipeDepth, segmentedFPFMA) ++ fpMisc(parallelFp32Div)
   )
 }
 
@@ -182,8 +185,11 @@ object VectorIssueStructure {
         Seq(VXSequencerParams("fp_fma", fpFMA(params.fmaPipeDepth, params.useSegmentedFPFMA)))),
       VXIssuePathParams("fp_cmp", params.vxissqEntries, Seq(VXSequencerParams("fp_cmp", Seq(FPCmpFactory)))),
       VXIssuePathParams("fp_exp", params.vxissqEntries, Seq(VXSequencerParams("fp_exp", Seq(VFExp2Factory)))),
-      VXIssuePathParams("fp_div", params.vxissqEntries, Seq(VXSequencerParams("fp_div", Seq(FPDivSqrtFactory)))),
-      VXIssuePathParams("fp_conv", params.vxissqEntries, Seq(VXSequencerParams("fp_conv", Seq(FPConvFactory))))
+      VXIssuePathParams("fp_div", params.vxissqEntries, Seq(VXSequencerParams("fp_div",
+        Seq(if (params.parallelFp32Div) SIMDFPDivSqrtFactory else FPDivSqrtFactory)))),
+      VXIssuePathParams("fp_conv", params.vxissqEntries, Seq(VXSequencerParams("fp_conv", Seq(FPConvFactory)))),
+      VXIssuePathParams("fp_xx8", params.vxissqEntries, Seq(VXSequencerParams("fp_xx8", Seq(FPXX8Factory)))),
+      VXIssuePathParams("fp_mxfp", params.vxissqEntries, Seq(VXSequencerParams("fp_mxfp", Seq(FPMXFPFactory))))
     )
   }
 
@@ -196,7 +202,7 @@ object VectorIssueStructure {
           VXSequencerParams("fp_int", (
             integerFUs(params.useIterativeIMul) ++
             (if (params.useIterativeIMul) Nil else integerMAC(params.imaPipeDepth, params.useSegmentedIMul)) ++
-            allFPFUs(params.fmaPipeDepth, params.useScalarFPFMA, params.useSegmentedFPFMA)
+            allFPFUs(params.fmaPipeDepth, params.useScalarFPFMA, params.useSegmentedFPFMA, params.parallelFp32Div)
           ))
         )
       )
@@ -212,7 +218,7 @@ object VectorIssueStructure {
         seqs = Seq(
           VXSequencerParams("int", integerFUs(params.useIterativeIMul)),
           VXSequencerParams("fp",
-            allFPFUs(params.fmaPipeDepth, params.useScalarFPFMA, params.useSegmentedFPFMA) ++
+            allFPFUs(params.fmaPipeDepth, params.useScalarFPFMA, params.useSegmentedFPFMA, params.parallelFp32Div) ++
             (if (params.useIterativeIMul) Nil else integerMAC(params.imaPipeDepth, params.useSegmentedIMul))
           )
         )
@@ -235,7 +241,7 @@ object VectorIssueStructure {
         depth = params.vxissqEntries,
         seqs = Seq(
           VXSequencerParams("fp",
-          allFPFUs(params.fmaPipeDepth, params.useScalarFPFMA, params.useSegmentedFPFMA) ++
+          allFPFUs(params.fmaPipeDepth, params.useScalarFPFMA, params.useSegmentedFPFMA, params.parallelFp32Div) ++
             (if (params.useIterativeIMul) Nil else integerMAC(params.imaPipeDepth, params.useSegmentedIMul))
           )
         )
@@ -259,7 +265,7 @@ object VectorIssueStructure {
         depth = params.vxissqEntries,
         seqs = Seq(
           VXSequencerParams("fp0",
-          allFPFUs(params.fmaPipeDepth, params.useScalarFPFMA, params.useSegmentedFPFMA) ++
+          allFPFUs(params.fmaPipeDepth, params.useScalarFPFMA, params.useSegmentedFPFMA, params.parallelFp32Div) ++
             (if (params.useIterativeIMul) Nil else integerMAC(params.imaPipeDepth, params.useSegmentedIMul))
           ),
           VXSequencerParams("fp1", fpFMA(params.fmaPipeDepth, params.useSegmentedFPFMA))
@@ -284,7 +290,7 @@ object VectorIssueStructure {
         name = "fp",
         depth = params.vxissqEntries,
         seqs = Seq(
-          VXSequencerParams("fp", allFPFUs(params.fmaPipeDepth, params.useScalarFPFMA, params.useSegmentedFPFMA))
+          VXSequencerParams("fp", allFPFUs(params.fmaPipeDepth, params.useScalarFPFMA, params.useSegmentedFPFMA, params.parallelFp32Div))
         )
       )
       Seq(int_path, fp_path)
@@ -306,7 +312,7 @@ object VectorIssueStructure {
         name = "fp",
         depth = params.vxissqEntries,
         seqs = Seq(
-          VXSequencerParams("fp", allFPFUs(params.fmaPipeDepth, params.useScalarFPFMA, params.useSegmentedFPFMA))
+          VXSequencerParams("fp", allFPFUs(params.fmaPipeDepth, params.useScalarFPFMA, params.useSegmentedFPFMA, params.parallelFp32Div))
         )
       )
       Seq(int_path, fp_path)
@@ -366,6 +372,8 @@ case class VectorParams(
   debugVrf: Boolean = false,
   diagnosticCounters: Boolean = false,
   reductionContexts: Int = 1,
+  fmaOrdinaryContexts: Int = 1,
+  parallelFp32Div: Boolean = false,
   interleaveReductions: Boolean = false,
 
   issStructure: VectorIssueStructure = VectorIssueStructure.Unified,
@@ -375,6 +383,7 @@ case class VectorParams(
   def supported_ex_insns = issStructure.generate(this).map(_.insns).flatten
 
   require(dLen >= 64, "dLen must be >= 64")
+  require(fmaOrdinaryContexts >= 1 && fmaOrdinaryContexts <= 2)
   require((dLen & (dLen - 1)) == 0, "dLen must be power of 2")
   require(mLen >= 64 && mLen <= 512, "mLen must be >= 64 and <= 512")
   require((mLen & (mLen - 1)) == 0, "mLen must be power of 2")

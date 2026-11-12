@@ -425,6 +425,24 @@ class ExeUnitImp(
   // RegNext for better timing and it should be fine
   io.instrAddrTransType.foreach(exuio => funcUnits.foreach(fu => fu.io.instrAddrTransType.foreach(fuio => fuio := RegNext(exuio))))
 
+  if (env.EnableDifftest && coreParams.EnableExternalVector && fuCfgs.exists(_.fuType == FuType.mcfg)) {
+    val trace = freechips.rocketchip.util.PlusArg("evu_mcfg_trace", width = 1)
+    val interesting = FuType.isMcfg(io.in.bits.fuType) ||
+      FuType.isFence(io.in.bits.fuType) &&
+        io.in.bits.fuOpType === xiangshan.FenceOpType.msyncregreset
+    val matrixOutput = funcUnits.filter(fu => fu.cfg.fuType == FuType.mcfg ||
+      fu.cfg.fuType == FuType.fence).map(_.io.out.valid).reduce(_ || _)
+    val firstAttempt = io.in.valid && interesting &&
+      (!RegNext(io.in.valid, false.B) || RegNext(io.in.bits.robIdx.asUInt) =/= io.in.bits.robIdx.asUInt)
+    val csrDrained = io.csrio.map(_.evu.drained).getOrElse(false.B)
+    val reports = RegInit(0.U(8.W))
+    when(trace.asBool && reports < 128.U &&
+      (firstAttempt || io.in.fire && interesting || io.out.fire && matrixOutput)) {
+      reports := reports + 1.U
+      printf(p"[EVU-BJU3] in_v=${io.in.valid} in_r=${io.in.ready} in_rob=${io.in.bits.robIdx.asUInt} op=0x${Hexadecimal(io.in.bits.fuOpType)} busy=${busy} drained=${csrDrained} fu_in_v=0x${Hexadecimal(VecInit(funcUnits.map(_.io.in.valid)).asUInt)} fu_in_r=0x${Hexadecimal(VecInit(funcUnits.map(_.io.in.ready)).asUInt)} fu_out_v=0x${Hexadecimal(VecInit(fuOutValidOH).asUInt)} out_v=${io.out.valid} out_r=${io.out.ready} out_rob=${io.out.bits.robIdx.asUInt}\n")
+    }
+  }
+
   // debug info
   io.out.bits.debug     := 0.U.asTypeOf(io.out.bits.debug)
   io.out.bits.debug.isPerfCnt := funcUnits.map(_.io.csrio.map(_.isPerfCnt)).map(_.getOrElse(false.B)).reduce(_ || _)
@@ -454,7 +472,11 @@ class Dispatcher[T <: Data](private val gen: T, n: Int, acceptCond: T => Seq[Boo
     out.bits := io.in.bits
   }
 
-  io.in.ready := Cat(io.out.map(_.ready)).andR
+  // Only the selected FU participates in this transaction. ANDing every ready
+  // can let that FU consume an instruction while the issue queue retries it.
+  io.in.ready := Mux1H(acceptVec, io.out.map(_.ready))
+  assert(io.in.fire === VecInit(io.out.map(_.fire)).asUInt.orR,
+    "EXU dispatcher input and selected FU must accept the same transaction")
 }
 
 class MemExeUnitIO (implicit p: Parameters) extends XSBundle {

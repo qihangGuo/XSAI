@@ -27,6 +27,8 @@ class EvuRegisterFileSpec extends AnyFlatSpec with ChiselScalatestTester {
       .withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
         dut.io.read(0)(0).req.valid.poke(false.B)
         dut.io.mask_read(0)(0).req.valid.poke(false.B)
+        dut.io.read(0)(0).req.bits.lastOperand.poke(false.B)
+        dut.io.mask_read(0)(0).req.bits.lastOperand.poke(false.B)
         val req = dut.io.pipe_write_reqs(0)
         req.request.poke(false.B)
         req.fire.poke(false.B)

@@ -20,6 +20,7 @@ import org.chipsalliance.cde.config
 import org.chipsalliance.cde.config.Parameters
 import chisel3._
 import chisel3.util._
+import difftest.{DiffAmuCtrlEvent, DifftestModule}
 import xscache.coupledL2.PrefetchCtrlFromCore
 import freechips.rocketchip.diplomacy.{BundleBridgeSource, LazyModule, LazyModuleImp}
 import freechips.rocketchip.tile.HasFPUParameters
@@ -238,6 +239,52 @@ class XSCoreImp(outer: XSCoreBase) extends LazyModuleImp(outer)
     val amuCtrlArbiter = Module(new Arbiter(new AmuCtrlIO, CommitWidth))
     amuCtrlArbiter.io.in <> backend.io.toAmu.get
     io.amuCtrl.get <> amuCtrlArbiter.io.out
+
+    // Observe matrix commands in the order CUTE accepts them, excluding EVU.
+    if (env.EnableDifftest) {
+      val amuCtrl = amuCtrlArbiter.io.out
+      val mmaio = amuCtrl.bits.data.asTypeOf(new AmuMmaIO)
+      val mlsio = amuCtrl.bits.data.asTypeOf(new AmuLsuIO)
+      val mreleaseio = amuCtrl.bits.data.asTypeOf(new AmuReleaseIO2CUTE)
+      val arithio = amuCtrl.bits.data.asTypeOf(new AmuArithIO)
+      val event = DifftestModule(new DiffAmuCtrlEvent, delay = 3, dontCare = true)
+      event.valid := amuCtrl.fire && !amuCtrl.bits.evu
+      event.op := amuCtrl.bits.op
+      event.pc := amuCtrl.bits.pc.get
+      event.coreid := amuCtrl.bits.coreid.get
+      event.index := 0.U
+      when(amuCtrl.bits.isMma()) {
+        event.rm := mmaio.rm
+        event.md := mmaio.md
+        event.sat := mmaio.sat
+        event.ms1 := mmaio.ms1
+        event.ms2 := mmaio.ms2
+        event.mtilem := mmaio.mtilem
+        event.mtilen := mmaio.mtilen
+        event.mtilek := mmaio.mtilek
+        event.types1 := mmaio.types1
+        event.types2 := mmaio.types2
+        event.typed := mmaio.typed
+        event.isfp := mmaio.isfp
+      }
+      when(amuCtrl.bits.isMls()) {
+        event.ms := mlsio.ms
+        event.ls := mlsio.ls
+        event.transpose := mlsio.transpose
+        event.types1 := mlsio.isacc
+        event.types2 := mlsio.isA
+        event.base := mlsio.baseAddr
+        event.stride := mlsio.stride
+        event.row := mlsio.row
+        event.column := mlsio.column
+        event.widths := mlsio.widths
+      }
+      when(amuCtrl.bits.isRelease()) { event.msyncRd := mreleaseio.msyncRd }
+      when(amuCtrl.bits.isArith()) {
+        event.ms := arithio.md
+        event.opType := arithio.opType
+      }
+    }
   }
 
   // top -> memBlock

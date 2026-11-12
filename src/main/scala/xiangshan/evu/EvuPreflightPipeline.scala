@@ -54,10 +54,14 @@ class EvuPreflightPipeline(entries: Int = 8) extends Module {
     states(slot) === ready
   })
   val selected = (head + PriorityEncoder(candidates))(tagBits - 1, 0)
-  io.translation.request.valid := active && candidates.asUInt.orR
-  io.translation.request.bits.check := requests(selected)
-  io.translation.request.bits.tag := selected
-  when(io.translation.request.fire) { states(selected) := translating }
+  // An empty scheduler need not register a new check before sending it to the
+  // TLB. Retain the allocated record even when the TLB applies backpressure.
+  val queued = candidates.asUInt.orR
+  val issueSlot = Mux(queued, selected, tail)
+  io.translation.request.valid := active && (queued || io.request.fire)
+  io.translation.request.bits.check := Mux(queued, requests(selected), io.request.bits)
+  io.translation.request.bits.tag := issueSlot
+  when(io.translation.request.fire) { states(issueSlot) := translating }
 
   val translated = io.translation.response
   val checking = RegNext(active && translated.valid && !translated.bits.miss, false.B)
@@ -68,16 +72,20 @@ class EvuPreflightPipeline(entries: Int = 8) extends Module {
     assert(states(translated.bits.tag) === translating, "EVU preflight response has no owner")
     states(translated.bits.tag) := Mux(translated.bits.miss, ready, permission)
   }
+  val permissionResult = WireDefault(permissionAnswer)
+  when(permissionAnswer.fault === EvuAddressFault.None && (io.permissionFault || uncacheable)) {
+    permissionResult.fault := EvuAddressFault.Access
+  }
   when(active && checking) {
     assert(states(permissionTag) === permission, "EVU preflight PMP result has no owner")
-    answers(permissionTag) := permissionAnswer
-    when(permissionAnswer.fault === EvuAddressFault.None && (io.permissionFault || uncacheable)) {
-      answers(permissionTag).fault := EvuAddressFault.Access
-    }
+    answers(permissionTag) := permissionResult
     states(permissionTag) := complete
   }
-  io.response.valid := active && states(head) === complete
-  io.response.bits := answers(head)
+  // Only the oldest check may bypass the answer register. A stalled result
+  // is captured above, so later PMP answers cannot change its response.
+  val permissionAtHead = checking && states(head) === permission && permissionTag === head
+  io.response.valid := active && (states(head) === complete || permissionAtHead)
+  io.response.bits := Mux(permissionAtHead, permissionResult, answers(head))
   when(io.response.fire) {
     states(head) := empty
     head := head + 1.U

@@ -48,6 +48,8 @@ class EvuScalarSourceHarness(implicit p: Parameters) extends CoreModule with Has
   seq.io.vat_head := 0.U
   seq.io.pipe_write_req.available := true.B
   seq.io.acc_valid := false.B
+  seq.io.acc_return := false.B
+  seq.io.lookahead := 0.U.asTypeOf(seq.io.lookahead)
   seq.io.vgu.slide_req.ready := true.B
   seq.io.vgu.slide_data := 0.U
   seq.io.vgu.gather_eidx.valid := false.B

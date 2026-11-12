@@ -9,6 +9,7 @@ import freechips.rocketchip.util._
 import freechips.rocketchip.tile._
 import xiangshan.evu.common._
 import xiangshan.evu.insns._
+import xiangshan.evu.EvuLowPrecision
 
 class ExecuteWaitSignals extends Bundle {
   val dependency = Bool()
@@ -31,8 +32,11 @@ class ExecuteSequencerIO(maxDepth: Int, nFUs: Int, forwarding: Boolean = false)(
   val prefetch = Output(Vec(3, Valid(new VectorReadReq)))
   val e0Read = Output(Vec(3, Bool()))
   val waitReason = Output(new ExecuteWaitSignals)
+  val operandsReady = Output(Bool())
   val earlyOperandReads = Output(UInt(3.W))
   val reductionPrefetch = Output(Bool())
+  val lookahead = Input(Valid(new VectorReadReq))
+  val atTail = Output(Bool())
   val rawDependencies = Output(UInt(egsTotal.W))
   val forward = Option.when(forwarding)(Vec(3, new VectorForwardOperand))
   val rvs1_data = Output(UInt(dLen.W))
@@ -43,6 +47,7 @@ class ExecuteSequencerIO(maxDepth: Int, nFUs: Int, forwarding: Boolean = false)(
   val vgu = Flipped(new GatherToExecuteIO)
 
   val acc_valid = Input(Bool())
+  val acc_return = Input(Bool())
   val acc_ready = Output(Bool())
   val acc_slot = Output(UInt(2.W))
   val acc_other_slot = Output(UInt(2.W))
@@ -75,6 +80,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   val rvdData = Reg(UInt(dLen.W))
   val rvmData = Reg(UInt(dLen.W))
   val inst  = Reg(new BackendIssueInst)
+  val lowPrecision = EvuLowPrecision.backend(inst.funct3, inst.funct6)
   val head  = Reg(Bool())
   val wvd_mask  = Reg(UInt(egsTotal.W))
   val rvs1_mask = Reg(UInt(egsTotal.W))
@@ -111,6 +117,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   val acc_stream_slot = Reg(UInt(2.W))
   val acc_merge = Reg(Bool())
   val acc_merge_id = Reg(UInt(2.W))
+  val acc_stream_groups = Reg(UInt(3.W))
 
   val compress = inst.opmf6 === OPMFunct6.compress && usesCompress.B
   val acc_copy = elementwise
@@ -137,6 +144,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   val use_wmask = !inst.vm && sets_wmask
   val eidx_tail = next_eidx === eff_vl
   val tail      = Mux(inst.reduction && usesAcc.B, acc_fold && acc_last, eidx_tail)
+  io.atTail := valid && tail && !inst.reduction
 
   io.dis.ready := (!valid || (tail && io.iss.fire)) && !io.dis_stall
 
@@ -167,9 +175,11 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     val dis_rgatherei16  = dis_inst.funct3 === OPIVV && dis_inst.opif6 === OPIFunct6.rgatherei16 && usesPerm.B
     val dis_rgather_eew  = Mux(dis_inst.opif6 === OPIFunct6.rgatherei16, 1.U, dis_sew)
     val dis_mvnrr         = dis_inst.funct3 === OPIVI && dis_inst.opif6 === OPIFunct6.mvnrr
-    val dis_vd_arch_mask  = get_arch_mask(dis_inst.rd , dis_inst.emul +& dis_inst.wide_vd)
-    val dis_vs1_arch_mask = get_arch_mask(dis_inst.rs1, Mux(dis_inst.reads_vs1_mask, 0.U, dis_inst.emul))
-    val dis_vs2_arch_mask = get_arch_mask(dis_inst.rs2, Mux(dis_inst.reads_vs2_mask, 0.U, dis_inst.emul +& dis_inst.wide_vs2))
+    val dis_vd_arch_mask = get_arch_mask(dis_inst.rd, dis_inst.registerEmul(dis_inst.wide_vd))
+    val dis_vs1_arch_mask = get_arch_mask(dis_inst.rs1,
+      Mux(dis_inst.reads_vs1_mask, 0.U, dis_inst.registerEmul(false.B)))
+    val dis_vs2_arch_mask = get_arch_mask(dis_inst.rs2,
+      Mux(dis_inst.reads_vs2_mask, 0.U, dis_inst.registerEmul(dis_inst.wide_vs2, dis_inst.extendsSource2)))
     val dis_eff_vl        = WireInit(dis_inst.vconfig.vl)
     val dis_increments_as_mask = (
       (!dis_inst.renv1 || dis_inst.reads_vs1_mask) &&
@@ -180,6 +190,10 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     val dis_vs2_eew = WireInit((dis_inst.vconfig.vtype.vsew + dis_inst.wide_vs2)(1,0))
     val dis_vs3_eew = WireInit((dis_inst.vconfig.vtype.vsew + dis_inst.wide_vd)(1,0))
     val dis_vd_eew  = WireInit((dis_inst.vconfig.vtype.vsew + dis_inst.wide_vd)(1,0))
+    when(EvuLowPrecision.backend(dis_inst.funct3, dis_inst.funct6)) {
+      dis_vs2_eew := Mux(EvuLowPrecision.decode(dis_inst.funct6), 0.U, 2.U)
+      dis_vd_eew := Mux(EvuLowPrecision.decode(dis_inst.funct6), 2.U, 0.U)
+    }
     val dis_incr_eew = Seq(
       Mux(dis_inst.renv1, dis_vs1_eew, 0.U),
       Mux(dis_inst.renv2, dis_vs2_eew, 0.U),
@@ -203,6 +217,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     acc_fold_id   := 0.U
     parallel_acc  := dis_inst.opff6.isOneOf(OPFFunct6.fredusum, OPFFunct6.fredmin, OPFFunct6.fredmax)
     acc_stream_slot := 0.U
+    acc_stream_groups := 0.U
     acc_merge     := false.B
     acc_merge_id  := 1.U
     sets_wmask    := dis_ctrl.bool(SetsWMask)
@@ -321,6 +336,15 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   io.rvs2.req.bits.oldest := oldest
   io.rvd.req.bits.oldest  := oldest
   io.rvm.req.bits.oldest  := oldest
+  // Use registered capture state, not returning ready/fire, to avoid a
+  // request-priority -> read-grant -> request-priority combinational loop.
+  val uncaptured = VecInit(Seq(renv1 && !rvs1Captured, renv2 && !rvs2Captured,
+    renvd && !rvdCaptured, renvm && !rvmCaptured))
+  val finishingRead = valid && !data_hazard && !uses_perm &&
+    (!renacc || io.acc_valid) && PopCount(uncaptured) === 1.U
+  for ((read, i) <- Seq(io.rvs1, io.rvs2, io.rvd, io.rvm).zipWithIndex) {
+    read.req.bits.lastOperand := finishingRead && uncaptured(i)
+  }
 
   // Launch normal successor reads on issue. FP unordered reductions may also
   // prefetch one source EG during their streaming phase, never during the
@@ -345,8 +369,12 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
       nextInRange && !io.older_writes(nextIndex) && !(inst.wvd && nextEg === io.iss.bits.wvd_eg)
     io.prefetch(i).bits.eg := nextReads(i)
     io.prefetch(i).bits.oldest := oldest
+    io.prefetch(i).bits.lastOperand := false.B
   }
   io.reductionPrefetch := reductionStream && io.prefetch(1).valid
+  // At the current tail, the ordinary next-EG hint is unused. Reuse that
+  // collector slot for an independently checked queue-head EXP2 source.
+  when(io.atTail && io.lookahead.valid) { io.prefetch(1) := io.lookahead }
 
   // Legacy VRF ready acknowledges the returning SRAM data. Forward it in
   // that cycle; retain it only while the current micro-op is stalled.
@@ -370,7 +398,8 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   exu_scheduler.io.reqs(0).fire := io.iss.fire
   exu_scheduler.io.reqs(0).depth := pipe_stages
 
-  val wvd_eg = getEgId(inst.rd, Mux(inst.reduction, 0.U, eidx), vd_eew, inst.writes_mask)
+  val destIndex = Mux(lowPrecision && EvuLowPrecision.packed(inst.funct6), eidx >> 1, eidx)
+  val wvd_eg = getEgId(inst.rd, Mux(inst.reduction, 0.U, destIndex), vd_eew, inst.writes_mask)
   val read_slide_buffer = slide && Mux(slide_up,
     next_eidx > slide_offset,
     eidx +& slide_offset < inst.vconfig.vtype.vlMax)
@@ -383,6 +412,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     !(read_slide_buffer && !io.vgu.slide_req.ready) &&
     !(read_eidx_buffer && !io.vgu.gather_eidx.valid) &&
     !(renacc && !io.acc_valid)
+  io.operandsReady := operandsReady
   val missingOperands = (renv1 && !(rvs1Captured || io.rvs1.req.fire)) ||
     (renv2 && !(rvs2Captured || io.rvs2.req.fire)) ||
     (renvd && !(rvdCaptured || io.rvd.req.fire)) ||
@@ -493,7 +523,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
 
   when (io.iss.fire && !tail) {
     when (renacc && acc_merge) {
-      when (acc_merge_id === 3.U) {
+      when (acc_merge_id +& 1.U === acc_stream_groups) {
         acc_merge := false.B
         acc_fold := true.B
       } .otherwise {
@@ -503,7 +533,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
       acc_fold_id := acc_fold_id + 1.U
     } .otherwise {
       if (vParams.enableChaining) {
-        when (next_is_new_eg(eidx, next_eidx, vd_eew, inst.writes_mask) && !inst.reduction && !compress) {
+        when (next_is_new_eg(eidx, next_eidx, vd_eew, inst.writes_mask) && !inst.reduction && !compress && !lowPrecision) {
           val wvd_clr_mask = UIntToOH(io.iss.bits.wvd_eg)
           wvd_mask  := wvd_mask  & ~wvd_clr_mask
         }
@@ -513,7 +543,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
         when (rgather_ix) {
           rvs2_mask := 0.U
         }
-        when (next_is_new_eg(eidx, next_eidx, vs1_eew, inst.reads_vs1_mask)) {
+        when (next_is_new_eg(eidx, next_eidx, vs1_eew, inst.reads_vs1_mask) && !(lowPrecision && inst.scalarVrfSource)) {
           rvs1_mask := rvs1_mask & ~UIntToOH(io.rvs1.req.bits.eg)
         }
         when (next_is_new_eg(eidx, next_eidx, vs3_eew, false.B)) {
@@ -531,8 +561,9 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
       if (usesAcc) {
         when (renacc) {
           acc_stream_slot := acc_stream_slot + 1.U
+          when(acc_stream_groups < 4.U) { acc_stream_groups := acc_stream_groups + 1.U }
           when (eidx_tail) {
-            when (parallel_acc) {
+            when (parallel_acc && acc_stream_groups =/= 0.U) {
               acc_merge := true.B
               acc_merge_id := 1.U
             } .otherwise {

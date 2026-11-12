@@ -19,7 +19,6 @@ class EvuAddressCheckSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
     val ep = EvuParams(enable = true)
     test(new EvuAddressCheck(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
       dut.io.range.cancel.poke(false.B)
-      dut.io.allowPhysicalLaunch.poke(false.B)
       dut.io.range.req.valid.poke(false.B)
       dut.io.range.resp.ready.poke(false.B)
       dut.io.lookup.req.ready.poke(false.B)
@@ -35,7 +34,6 @@ class EvuAddressCheckSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
       dut.io.range.req.bits.write.poke(true.B)
       dut.io.range.req.bits.fullLineWrite.poke(false.B)
       dut.io.range.req.bits.alignment.poke(2.U)
-      dut.io.range.req.bits.unbounded.poke(false.B)
       dut.io.range.req.bits.illegal.poke(false.B)
       dut.io.range.req.valid.poke(true.B)
       dut.io.range.req.ready.expect(true.B)
@@ -76,7 +74,6 @@ class EvuAddressCheckSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
     val ep = EvuParams(enable = true)
     test(new EvuAddressCheck(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
       dut.io.range.cancel.poke(false.B)
-      dut.io.allowPhysicalLaunch.poke(false.B)
       dut.io.range.resp.ready.poke(false.B)
       dut.io.lookup.req.ready.poke(false.B)
       dut.io.lookup.resp.valid.poke(false.B)
@@ -91,7 +88,6 @@ class EvuAddressCheckSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
         dut.io.range.req.bits.write.poke(true.B)
         dut.io.range.req.bits.fullLineWrite.poke(false.B)
         dut.io.range.req.bits.alignment.poke(2.U)
-        dut.io.range.req.bits.unbounded.poke(false.B)
         dut.io.range.req.bits.illegal.poke(false.B)
         dut.io.range.req.valid.poke(true.B)
         dut.io.range.req.ready.expect(true.B)
@@ -144,11 +140,10 @@ class EvuAddressCheckSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
     }
   }
 
-  it should "reject malformed ranges and unbounded virtual output without issuing translations" in {
+  it should "reject malformed and illegal ranges without issuing translations" in {
     val ep = EvuParams(enable = true)
     test(new EvuAddressCheck(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
       dut.io.range.cancel.poke(false.B)
-      dut.io.allowPhysicalLaunch.poke(false.B)
       dut.io.range.resp.ready.poke(true.B)
       dut.io.lookup.req.ready.poke(true.B)
       dut.io.lookup.resp.valid.poke(false.B)
@@ -163,10 +158,10 @@ class EvuAddressCheckSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
         (BigInt(0), 8 * ep.vlenBytes + 1, false, EvuAddressFault.Access),
         (BigInt(0), 512, true, EvuAddressFault.Illegal)
       )
-      for ((base, length, unbounded, fault) <- cases) {
+      for ((base, length, illegal, fault) <- cases) {
         dut.io.range.req.bits.base.poke(base.U)
         dut.io.range.req.bits.length.poke(length.U)
-        dut.io.range.req.bits.unbounded.poke(unbounded.B)
+        dut.io.range.req.bits.illegal.poke(illegal.B)
         dut.io.range.req.valid.poke(true.B)
         dut.clock.step()
         dut.io.range.req.valid.poke(false.B)
@@ -177,7 +172,6 @@ class EvuAddressCheckSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
       }
       dut.io.range.req.bits.base.poke(0.U)
       dut.io.range.req.bits.length.poke(0.U)
-      dut.io.range.req.bits.unbounded.poke(false.B)
       dut.io.range.req.bits.illegal.poke(true.B)
       dut.io.range.req.valid.poke(true.B)
       dut.clock.step()
@@ -192,7 +186,6 @@ class EvuAddressCheckSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
     it should s"pipeline all line checks and preserve RMW permissions (full store=$full)" in {
       test(new EvuAddressCheck(EvuParams(enable = true))).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
         dut.io.range.cancel.poke(false.B)
-        dut.io.allowPhysicalLaunch.poke(false.B)
         dut.io.range.resp.ready.poke(false.B)
         dut.io.lookup.req.ready.poke(true.B)
         dut.io.lookup.resp.valid.poke(false.B)
@@ -207,11 +200,8 @@ class EvuAddressCheckSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
         req.bits.write.poke(true.B)
         req.bits.fullLineWrite.poke(full.B)
         req.bits.alignment.poke(2.U)
-        req.bits.unbounded.poke(false.B)
         req.bits.illegal.poke(false.B)
         req.valid.poke(true.B)
-        dut.clock.step()
-        req.valid.poke(false.B)
         val checks = if (full) 4 else 8
         for (index <- 0 until checks) {
           val line = if (full) index else index / 2
@@ -219,6 +209,7 @@ class EvuAddressCheckSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
           dut.io.lookup.req.bits.vaddr.expect((BigInt("40000000", 16) + line * 64).U)
           dut.io.lookup.req.bits.write.expect((full || index % 2 == 1).B)
           dut.clock.step()
+          req.valid.poke(false.B)
         }
         dut.io.lookup.req.valid.expect(false.B)
         dut.io.range.resp.valid.expect(false.B)
@@ -241,7 +232,6 @@ class EvuAddressCheckSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
   it should "drain younger checks and retain the earliest fault before publishing a range result" in {
     test(new EvuAddressCheck(EvuParams(enable = true))).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
       dut.io.range.cancel.poke(false.B)
-      dut.io.allowPhysicalLaunch.poke(false.B)
       dut.io.range.resp.ready.poke(false.B)
       dut.io.lookup.req.ready.poke(true.B)
       dut.io.lookup.resp.valid.poke(false.B)
@@ -256,7 +246,6 @@ class EvuAddressCheckSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
       req.bits.write.poke(false.B)
       req.bits.fullLineWrite.poke(false.B)
       req.bits.alignment.poke(2.U)
-      req.bits.unbounded.poke(false.B)
       req.bits.illegal.poke(false.B)
       req.valid.poke(true.B)
       dut.clock.step()
@@ -267,7 +256,7 @@ class EvuAddressCheckSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
         dut.io.lookup.resp.bits.paddr.poke((BigInt("80000000", 16) + index * 64).U)
         dut.io.lookup.resp.bits.fault.poke(if (index == 1) EvuAddressFault.Page else
           if (index >= 2) EvuAddressFault.Access else EvuAddressFault.None)
-        dut.io.range.resp.valid.expect(false.B)
+        dut.io.range.resp.valid.expect((index == 7).B)
         dut.clock.step()
       }
       dut.io.lookup.resp.valid.poke(false.B)

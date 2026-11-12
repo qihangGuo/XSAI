@@ -19,7 +19,6 @@ class EvuRangeRequest extends Bundle {
   val write = Bool()
   val fullLineWrite = Bool() // Caller-proven unmasked, aligned, full-line coverage.
   val alignment = UInt(3.W)
-  val unbounded = Bool()
   val illegal = Bool()
 }
 
@@ -75,12 +74,12 @@ class EvuAddressCheck(p: EvuParams) extends Module {
       val req = Decoupled(new EvuAddressLookupRequest)
       val resp = Flipped(Decoupled(new EvuAddressResponse))
     }
-    val allowPhysicalLaunch = Input(Bool())
   })
   val idle :: checking :: finish :: Nil = Enum(3)
   val state = RegInit(idle)
   val job = Reg(new EvuRangeRequest)
   val result = Reg(new EvuRangeResult(p))
+  val updatedResult = WireDefault(result)
   val cursor = Reg(UInt(64.W))
   val lastLine = Reg(UInt(64.W))
   val writePhase = RegInit(false.B)
@@ -93,25 +92,31 @@ class EvuAddressCheck(p: EvuParams) extends Module {
   io.range.perf.foreach(_ := 0.U.asTypeOf(new EvuPreflightPerf))
 
   io.range.req.ready := state === idle && !io.range.cancel
-  io.range.resp.valid := state === finish && !io.range.cancel
-  io.range.resp.bits := result
-  io.lookup.req.valid := state === checking && !issuedAll && !failed &&
+  val in = io.range.req.bits
+  val end = in.base +& in.length - 1.U
+  val pages = (end(63, 12) - in.base(63, 12)) +& 1.U
+  val misaligned = (in.base & ((1.U(64.W) << in.alignment) - 1.U)).orR
+  val invalidRange = misaligned || end(64) || pages > p.translationPages.U || in.length > (8 * p.vlenBytes).U
+  val startChecks = io.range.req.fire && !in.illegal && in.length =/= 0.U && !invalidRange
+  val currentJob = Mux(startChecks, in, job)
+  val currentCursor = Mux(startChecks, in.base & ~63.U(64.W), cursor)
+  val currentLastLine = Mux(startChecks, end(63, 0) & ~63.U(64.W), lastLine)
+  val currentWrite = Mux(startChecks, in.fullLineWrite && in.write && !in.read, writePhase)
+  // The first check can enter the lookup pipeline with the range command.
+  // If blocked, the normal cursor registers retain it for the next cycle.
+  io.lookup.req.valid := (startChecks || (state === checking && !issuedAll && !failed)) &&
     pending.io.enq.ready && !io.range.cancel
-  io.lookup.req.bits.vaddr := cursor
-  io.lookup.req.bits.write := writePhase
+  io.lookup.req.bits.vaddr := currentCursor
+  io.lookup.req.bits.write := currentWrite
   pending.io.enq.valid := io.lookup.req.fire
   pending.io.enq.bits := io.lookup.req.bits
   io.lookup.resp.ready := state === checking && pending.io.deq.valid && !io.range.cancel
   pending.io.deq.ready := io.lookup.resp.fire
 
   when(io.range.req.fire) {
-    val in = io.range.req.bits
-    val end = in.base +& in.length - 1.U
-    val pages = (end(63, 12) - in.base(63, 12)) +& 1.U
-    val misaligned = (in.base & ((1.U(64.W) << in.alignment) - 1.U)).orR
     job := in
     result := 0.U.asTypeOf(result)
-    result.pageMap.enabled := !in.unbounded && in.length =/= 0.U
+    result.pageMap.enabled := in.length =/= 0.U
     result.pageMap.base := in.base
     result.pageMap.length := in.length
     result.vaddr := in.base
@@ -130,13 +135,9 @@ class EvuAddressCheck(p: EvuParams) extends Module {
       result.fault := EvuAddressFault.Illegal
       result.pageMap.enabled := false.B
       state := finish
-    }.elsewhen(in.unbounded) {
-      // xv.launch describes a row stride, not the complete CUTE output span.
-      result.fault := Mux(io.allowPhysicalLaunch, EvuAddressFault.None, EvuAddressFault.Illegal)
-      state := finish
     }.elsewhen(in.length === 0.U) {
       state := finish
-    }.elsewhen(misaligned || end(64) || pages > p.translationPages.U || in.length > (8 * p.vlenBytes).U) {
+    }.elsewhen(invalidRange) {
       result.fault := Mux(misaligned, EvuAddressFault.Misaligned, EvuAddressFault.Access)
       state := finish
     }.otherwise {
@@ -144,13 +145,13 @@ class EvuAddressCheck(p: EvuParams) extends Module {
     }
   }
   when(io.lookup.req.fire) {
-    when(!writePhase && job.write) {
+    when(!currentWrite && currentJob.write) {
       writePhase := true.B
-    }.elsewhen(cursor === lastLine) {
+    }.elsewhen(currentCursor === currentLastLine) {
       issuedAll := true.B
     }.otherwise {
-      cursor := cursor + 64.U
-      writePhase := job.fullLineWrite && job.write && !job.read
+      cursor := currentCursor + 64.U
+      writePhase := currentJob.fullLineWrite && currentJob.write && !currentJob.read
     }
   }
   when(io.lookup.resp.fire) {
@@ -161,22 +162,26 @@ class EvuAddressCheck(p: EvuParams) extends Module {
     val changed = mapped(slot) && result.pageMap.ppn(slot) =/= answer.paddr(63, 12)
     when(!failed && (answer.fault =/= EvuAddressFault.None || changed)) {
       responseFailed := true.B
-      result.fault := Mux(changed, EvuAddressFault.Access, answer.fault)
-      result.vaddr := Mux(checked.vaddr < job.base, job.base, checked.vaddr)
-      result.gpaddr := answer.gpaddr
-      result.nonLeaf := answer.nonLeaf
-      result.write := !job.read || checked.write
-      result.pageMap.enabled := false.B
+      updatedResult.fault := Mux(changed, EvuAddressFault.Access, answer.fault)
+      updatedResult.vaddr := Mux(checked.vaddr < job.base, job.base, checked.vaddr)
+      updatedResult.gpaddr := answer.gpaddr
+      updatedResult.nonLeaf := answer.nonLeaf
+      updatedResult.write := !job.read || checked.write
+      updatedResult.pageMap.enabled := false.B
       failed := true.B
     }.elsewhen(!failed) {
-      result.pageMap.ppn(slot) := answer.paddr(63, 12)
+      updatedResult.pageMap.ppn(slot) := answer.paddr(63, 12)
       mapped(slot) := true.B
     }
+    result := updatedResult
   }
   // Stop issuing after the first ordered fault, but drain every accepted lookup.
   val lastResponse = pending.io.count === 1.U && io.lookup.resp.fire && !io.lookup.req.fire
-  when(state === checking && (issuedAll || failed || responseFailed) &&
-    (!pending.io.deq.valid || lastResponse)) { state := finish }
+  val checksDone = state === checking && (issuedAll || failed || responseFailed) &&
+    (!pending.io.deq.valid || lastResponse)
+  io.range.resp.valid := (state === finish || checksDone) && !io.range.cancel
+  io.range.resp.bits := Mux(checksDone, updatedResult, result)
+  when(checksDone) { state := finish }
   when(io.range.resp.fire || io.range.cancel) {
     state := idle
     issuedAll := false.B
@@ -202,12 +207,11 @@ class EvuMemoryConfig(p: EvuParams) extends Module {
   val accepted = io.accepted.bits
   val f7 = accepted.instr(31, 25)
   when(io.accepted.valid && (f7 === EvuIsa.setvli || f7 === EvuIsa.setvl)) {
-    val (newVl, newSew, illegal) = EvuVtype.configure(p,
-      f7 === EvuIsa.setvli, accepted.instr(14, 12), accepted.vl, accepted.aux)
+    val (newVl, newSew, illegal) = EvuVtype.configure(p, accepted.vl, accepted.aux)
     configured := true.B
-    vl := newVl
-    sew := newSew
-    vill := illegal
+    vl := Mux(accepted.config.valid, accepted.config.vl, newVl)
+    sew := Mux(accepted.config.valid, accepted.config.vtype(5, 3), newSew)
+    vill := Mux(accepted.config.valid, accepted.config.vill, illegal)
   }
   val commandF7 = io.command.instr(31, 25)
   val memory = EvuIsa.isLoad(commandF7) || EvuIsa.isStore(commandF7)

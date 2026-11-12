@@ -69,6 +69,7 @@ class EvuScalarResultForwardingSpec extends AnyFlatSpec with ChiselScalatestTest
           r.req.valid.poke(false.B)
           r.req.bits.eg.poke(0.U)
           r.req.bits.oldest.poke(false.B)
+          r.req.bits.lastOperand.poke(false.B)
         }
         dut.io.e0Read.foreach(_.poke(false.B))
         val reservation = dut.io.pipe_write_reqs(0)

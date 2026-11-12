@@ -12,10 +12,11 @@ import xiangshan.backend.exu.ExeUnit
 class EvuExeUnitElaborationSpec extends AnyFlatSpec with Matchers {
   behavior of "EVU execution unit input wiring"
 
-  private def parameters(enableEvu: Boolean): Parameters = {
+  private def parameters(enableEvu: Boolean, enableDifftest: Boolean = false): Parameters = {
     val config = if (enableEvu) "DefaultExternalVectorMatrixConfig" else "DefaultMatrixConfig"
     val (base, _, _) = ArgParser.parse(Array("--config", config,
-      "--disable-perf", "--disable-alwaysdb"))
+      "--disable-perf", "--disable-alwaysdb") ++
+      (if (enableDifftest) Array("--enable-difftest") else Array.empty[String]))
     val core = base(XSTileKey).head
     val p = base.alterPartial { case XSCoreParamsKey => core }
     val backend = p(XSCoreParamsKey).backendParams
@@ -34,6 +35,15 @@ class EvuExeUnitElaborationSpec extends AnyFlatSpec with Matchers {
       val exu = p(XSCoreParamsKey).backendParams.allExuParams.find(_.name == "MRELEASE").get
       val circuit = ChiselStage.emitCHIRRTL(LazyModule(new ExeUnit(exu)).module)
       circuit should include ("module ExeUnit")
+    }
+
+    it should s"elaborate the shared BJU3 diagnostics with EVU enabled=$enableEvu" in {
+      implicit val p: Parameters = parameters(enableEvu, enableDifftest = true)
+      val exu = p(XSCoreParamsKey).backendParams.allExuParams.find(_.name == "BJU3").get
+      val circuit = ChiselStage.emitCHIRRTL(LazyModule(new ExeUnit(exu)).module)
+      circuit should include ("module ExeUnit")
+      if (enableEvu) circuit should include ("[EVU-BJU3]")
+      else circuit should not include ("[EVU-BJU3]")
     }
   }
 

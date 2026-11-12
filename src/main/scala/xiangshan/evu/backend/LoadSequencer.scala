@@ -66,6 +66,7 @@ class LoadSequencer(implicit p: Parameters) extends Sequencer[LoadRespMicroOp]()
   io.rvm.valid := valid && renvm && !data_hazard
   io.rvm.bits.eg := getEgId(0.U, eidx, 0.U, true.B)
   io.rvm.bits.oldest := inst.vat === io.vat_head
+  io.rvm.bits.lastOperand := false.B
 
   io.iss.valid := valid && !data_hazard && (!renvm || io.rvm.ready)
   io.iss.bits.wvd_eg    := getEgId(inst.rd + (sidx << inst.emul), eidx, inst.mem_elem_size, false.B)

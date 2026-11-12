@@ -371,6 +371,7 @@ class NewCSR(implicit val p: Parameters) extends Module
     addr === xiangshan.evu.EvuCSRs.capability.U
   private val evuIllegal = (ren || wen) && evuAddress && (
     !p(ExternalVectorKey).enable.B || privState.isVirtual ||
+      (wen && addr === xiangshan.evu.EvuCSRs.cfg.U && !isModeM) ||
       Mux(addr === xiangshan.evu.EvuCSRs.state.U, !isModeM,
         !evuCapabilityAccess && !io.evu.permitted))
   private val wenLegal = permitMod.io.out.hasLegalWen && !evuIllegal

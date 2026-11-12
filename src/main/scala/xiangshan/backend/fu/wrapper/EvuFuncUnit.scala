@@ -6,7 +6,7 @@ import org.chipsalliance.cde.config.Parameters
 import xiangshan._
 import xiangshan.backend.fu.{FuConfig, PipedFuncUnit}
 import xiangshan.backend.fu.matrix.Bundles.AmuCtrlIO
-import xiangshan.evu.{EvuCoreCommand, EvuIsa}
+import xiangshan.evu.{EvuConfigRules, EvuCoreCommand, EvuIsa}
 
 class EvuFuncUnit(cfg: FuConfig)(implicit p: Parameters) extends PipedFuncUnit(cfg) {
   protected val in = io.in.bits
@@ -35,16 +35,17 @@ class EvuFuncUnit(cfg: FuConfig)(implicit p: Parameters) extends PipedFuncUnit(c
     2.U -> (ep.vlenBits / 32).U,
     3.U -> (ep.vlenBits / 64).U
   ))
-  when(in.ctrl.fuOpType(6, 0) === EvuIsa.setvli || in.ctrl.fuOpType(6, 0) === EvuIsa.setvl) {
-    payload.vl := in.data.src(0)(payload.vl.getWidth - 1, 0)
+  val configInstruction = in.ctrl.fuOpType(6, 0) === EvuIsa.setvli || in.ctrl.fuOpType(6, 0) === EvuIsa.setvl
+  val requestedType = EvuConfigRules.requestedType(payload.instr, in.data.src(1))
+  val normalized = EvuConfigRules.normalize(ep, in.data.src(0), requestedType)
+  when(configInstruction) {
+    payload.config := normalized
+    payload.vl := normalized.vl
   }
   payload.length := ep.vlenBytes.U
-  payload.aux := Mux(in.ctrl.fuOpType(6, 0) === EvuIsa.launch,
-    Cat(imm(17), 0.U(3.W), 0.U(2.W), imm(16, 15)),
-    Mux(in.ctrl.fuOpType(6, 0) === EvuIsa.setvli || in.ctrl.fuOpType(6, 0) === EvuIsa.setvl,
-      imm(7, 0), 0.U))
+  payload.aux := Mux(configInstruction, requestedType(7, 0), 0.U)
 
-  out.res.data := 0.U
+  out.res.data := Mux(configInstruction, normalized.vl, 0.U)
   out.ctrl.exceptionVec.foreach(_ := 0.U.asTypeOf(out.ctrl.exceptionVec.get))
   out.ctrl.amuCtrl.get.evu := true.B
   out.ctrl.amuCtrl.get.op := AmuCtrlIO.arithOp()

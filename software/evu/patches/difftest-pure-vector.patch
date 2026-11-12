@@ -1,0 +1,429 @@
+diff --git a/src/main/scala/Bundles.scala b/src/main/scala/Bundles.scala
+index 834a0f4f0..e8b05fd70 100644
+--- a/src/main/scala/Bundles.scala
++++ b/src/main/scala/Bundles.scala
+@@ -260,6 +260,38 @@ class SbufferEvent extends DifftestBaseBundle with HasValid {
+   val mask = UInt(64.W)
+ }
+ 
++class EvuStoreEvent extends DifftestBaseBundle with HasValid {
++  val addr = UInt(64.W)
++  val data = Vec(64, UInt(8.W))
++  val mask = UInt(64.W)
++}
++
++class EvuCompletionEvent extends DifftestBaseBundle with HasValid {
++  val vxsat = Bool()
++  val pc = UInt(64.W)
++  val instr = UInt(32.W)
++  val fflags = UInt(5.W)
++  val exception = Bool()
++  val cause = UInt(4.W)
++}
++
++class EvuDrainEvent extends DifftestBaseBundle with HasValid {
++  val fflags = UInt(5.W)
++  val exception = Bool()
++  val cause = UInt(4.W)
++  val pc = UInt(64.W)
++  val tval = UInt(64.W)
++  val tvalValid = Bool()
++}
++
++class EvuVrfState(val words: Int) extends DifftestBaseBundle with HasValid {
++  val value = Vec(words, UInt(64.W))
++}
++
++class EvuCSRState extends DifftestBaseBundle with HasValid {
++  val value = Vec(13, UInt(64.W))
++}
++
+ class MatrixStoreEvent(val storeBytes: Int = 64) extends DifftestBaseBundle with HasValid {
+   require(storeBytes > 0 && storeBytes <= 64, s"Matrix store width must be within [1, 64] bytes, got $storeBytes")
+ 
+diff --git a/src/main/scala/Difftest.scala b/src/main/scala/Difftest.scala
+index a414a7e5c..57b21acaf 100644
+--- a/src/main/scala/Difftest.scala
++++ b/src/main/scala/Difftest.scala
+@@ -289,7 +289,7 @@ class DiffTrapEvent extends TrapEvent with DifftestBundle {
+ class DiffCSRState extends CSRState with DifftestBundle {
+   override val desiredCppName: String = "csr"
+   override val desiredRegOffset: Option[Int] = Some(2)
+-  override val updateDependency: Seq[String] = Seq("commit", "event")
++  override val updateDependency: Seq[String] = Seq("commit", "event", "evu_completion", "evu_drain")
+   override val supportsDelta: Boolean = true
+ }
+ 
+@@ -431,6 +431,33 @@ class DiffSbufferEvent extends SbufferEvent with DifftestBundle with DifftestWit
+   override val squashGroup: Seq[String] = Seq("GOLDENMEM")
+ }
+ 
++class DiffEvuStoreEvent extends EvuStoreEvent with DifftestBundle {
++  override val desiredCppName: String = "evu_store"
++  override val squashGroup: Seq[String] = Seq("REF", "GOLDENMEM", "EVU")
++}
++
++class DiffEvuCompletionEvent extends EvuCompletionEvent with DifftestBundle {
++  override val desiredCppName: String = "evu_completion"
++  override val squashGroup: Seq[String] = Seq("REF", "EVU")
++}
++
++class DiffEvuVrfState(words: Int) extends EvuVrfState(words) with DifftestBundle with DifftestWithIndex {
++  override val desiredCppName: String = "evu_vrf"
++  override val squashGroup: Seq[String] = Seq("REF", "EVU")
++  override def classArgs: Map[String, Any] = Map("words" -> words)
++}
++
++class DiffEvuDrainEvent extends EvuDrainEvent with DifftestBundle {
++  override val desiredCppName: String = "evu_drain"
++  override val squashGroup: Seq[String] = Seq("REF", "EVU")
++}
++
++class DiffEvuCSRState extends EvuCSRState with DifftestBundle {
++  override val desiredCppName: String = "evu_csr"
++  override val updateDependency: Seq[String] = Seq("commit", "event", "evu_completion", "evu_drain")
++  override val squashGroup: Seq[String] = Seq("REF", "EVU")
++}
++
+ class DiffMatrixStoreEvent(storeBytes: Int = 64)
+   extends MatrixStoreEvent(storeBytes)
+   with DifftestBundle
+@@ -684,6 +711,15 @@ object DifftestModule {
+       difftest := DontCare
+       difftest.bits.getValidOption.foreach(_ := false.B)
+     }
++    // Legacy producers do not provide these newer ordering fields. Explicit
++    // defaults retain their event timing; producers may override them below.
++    difftest match {
++      case event: ArchEvent => event.isLatter := false.B
++      case event: StoreEvent =>
++        event.preCommit := false.B
++        event.storeOffset := 0.U
++      case _ =>
++    }
+     difftest
+   }
+ 
+diff --git a/src/test/csrc/difftest/checkers.h b/src/test/csrc/difftest/checkers.h
+index bb1dd3812..d1fe7a254 100644
+--- a/src/test/csrc/difftest/checkers.h
++++ b/src/test/csrc/difftest/checkers.h
+@@ -638,4 +638,18 @@ public:
+ };
+ #endif // CONFIG_DIFFTEST_MSYNCEVENT
+ 
++#if defined(CONFIG_DIFFTEST_EVUSTOREEVENT) && defined(CONFIG_DIFFTEST_EVUCOMPLETIONEVENT)
++class EvuChecker : public DiffTestChecker {
++public:
++  EvuChecker(DiffState *state, RefProxy *proxy, std::function<DiffTestState &()> get_dut);
++  ~EvuChecker() override;
++  int check_csr();
++  int do_step() override;
++
++private:
++  std::function<DiffTestState &()> get_dut;
++  uint64_t stores = 0, completions = 0;
++};
++#endif
++
+ #endif // __DIFFTEST_CHECKER_H__
+diff --git a/src/test/csrc/difftest/checkers/evu.cpp b/src/test/csrc/difftest/checkers/evu.cpp
+new file mode 100644
+index 000000000..6f840bb28
+--- /dev/null
++++ b/src/test/csrc/difftest/checkers/evu.cpp
+@@ -0,0 +1,100 @@
++#include "checkers.h"
++#include "goldenmem.h"
++
++#if defined(CONFIG_DIFFTEST_EVUSTOREEVENT) && defined(CONFIG_DIFFTEST_EVUCOMPLETIONEVENT)
++EvuChecker::EvuChecker(DiffState *state, RefProxy *proxy, std::function<DiffTestState &()> get_dut)
++    : DiffTestChecker(state, proxy), get_dut(std::move(get_dut)) {
++  Assert(proxy->evu_available(),
++         "EVU difftest requires a CONFIG_CUSTOM_EVU=y reference with store/completion_v2/drain/VRF/CSR support");
++  proxy->evu_set_async(true);
++}
++
++EvuChecker::~EvuChecker() {
++  Info("[DiffTest][EVU] core=%d checked_stores=%lu checked_completions=%lu pending=%d\n",
++       state->coreid, stores, completions, proxy->evu_pending());
++}
++
++int EvuChecker::do_step() {
++  auto &dut = get_dut();
++  auto &store = dut.evu_store;
++  if (store.valid) {
++    if (proxy->evu_store(store.addr, store.data, store.mask)) {
++      eprintf("[DiffTest][EVU] store mismatch core=%d cycle=%lu addr=0x%lx\n",
++              state->coreid, state->cycle_count, store.addr);
++      return STATE_DIFF;
++    }
++#ifdef DEBUG_GOLDENMEM
++    update_goldenmem(store.addr, (void *)store.data, store.mask, 64);
++#endif
++    store.valid = 0;
++    ++stores;
++  }
++  auto &completion = dut.evu_completion;
++  if (completion.valid) {
++    if (proxy->evu_complete(completion.pc, completion.instr, completion.fflags,
++                                completion.exception, completion.cause, completion.vxsat)) {
++      eprintf("[DiffTest][EVU] completion mismatch core=%d cycle=%lu pc=0x%lx\n",
++              state->coreid, state->cycle_count, completion.pc);
++      return STATE_DIFF;
++    }
++    completion.valid = 0;
++    ++completions;
++    state->has_progress = true;
++  }
++#ifdef CONFIG_DIFFTEST_EVUDRAINEVENT
++  auto &drain = dut.evu_drain;
++  if (drain.valid) {
++    if (proxy->evu_drain(drain.fflags, drain.exception, drain.cause, drain.pc, drain.tval, drain.tvalValid)) {
++      eprintf("[DiffTest][EVU] drain mismatch core=%d cycle=%lu\n", state->coreid, state->cycle_count);
++      return STATE_DIFF;
++    }
++    drain.valid = 0;
++    state->has_progress = true;
++  }
++#endif
++  if (dut.trap.hasTrap && proxy->evu_pending()) {
++    eprintf("[DiffTest][EVU] program terminated with outstanding commands\n");
++    return STATE_DIFF;
++  }
++#ifdef CONFIG_DIFFTEST_EVUVRFSTATE
++  const uint32_t defined = proxy->evu_reg_valid();
++  for (unsigned reg = 0; reg < CONFIG_DIFF_EVU_VRF_WIDTH; ++reg) {
++    auto &snapshot = dut.evu_vrf[reg];
++    if (!snapshot.valid) continue;
++    if (!(defined & (UINT32_C(1) << reg))) { snapshot.valid = 0; continue; }
++    uint64_t expected[sizeof(snapshot.value) / sizeof(uint64_t)] = {};
++    if (proxy->evu_get_reg(reg, expected, sizeof(expected))) return STATE_ERROR;
++    for (size_t word = 0; word < sizeof(expected) / sizeof(uint64_t); ++word) {
++      if (snapshot.value[word] != expected[word]) {
++        eprintf("[DiffTest][EVU] vr%u word=%zu DUT=0x%016lx REF=0x%016lx\n",
++                reg, word, snapshot.value[word], expected[word]);
++        return STATE_DIFF;
++      }
++    }
++    snapshot.valid = 0;
++  }
++#endif
++  return STATE_OK;
++}
++
++int EvuChecker::check_csr() {
++  auto &dut = get_dut();
++#ifdef CONFIG_DIFFTEST_EVUCSRSTATE
++  if (dut.evu_csr.valid) {
++    uint64_t expected[13] = {};
++    const char *names[] = {"vl", "vtype", "vstart", "vlenb", "configured", "efflags", "evxsat", "mevstate",
++      "evstatus", "evcause", "evepc", "evtval", "evcfg"};
++    if (proxy->evu_get_csr(expected, sizeof(expected))) return STATE_ERROR;
++    for (size_t field = 0; field < 13; ++field) {
++      if (dut.evu_csr.value[field] != expected[field]) {
++        eprintf("[DiffTest][EVU] %s DUT=0x%lx REF=0x%lx\n", names[field],
++                dut.evu_csr.value[field], expected[field]);
++        return STATE_DIFF;
++      }
++    }
++    dut.evu_csr.valid = 0;
++  }
++#endif
++  return STATE_OK;
++}
++#endif
+diff --git a/src/test/csrc/difftest/difftest.cpp b/src/test/csrc/difftest/difftest.cpp
+index 6719df848..3b9497050 100644
+--- a/src/test/csrc/difftest/difftest.cpp
++++ b/src/test/csrc/difftest/difftest.cpp
+@@ -340,6 +340,10 @@ Difftest::~Difftest() {
+ }
+ 
+ void Difftest::init_checkers() {
++#if defined(CONFIG_DIFFTEST_EVUSTOREEVENT) && defined(CONFIG_DIFFTEST_EVUCOMPLETIONEVENT)
++  evu_checker = new EvuChecker(state, proxy, [this]() -> DiffTestState & { return *dut; });
++  checkers.push_back(evu_checker);
++#endif
+   checkers.push_back(new TimeoutChecker([this]() -> DifftestTrapEvent & { return dut->trap; }, state, proxy));
+ 
+   add_sync_checker(new FirstInstrCommitChecker([this]() -> DifftestInstrCommit & { return dut->commit[0]; }, state,
+@@ -555,11 +559,20 @@ bool Difftest::in_replay_range() {
+ }
+ 
+ void Difftest::replay_snapshot() {
++#if defined(CONFIG_DIFFTEST_EVUSTOREEVENT) && defined(CONFIG_DIFFTEST_EVUCOMPLETIONEVENT)
++  uint64_t evu_context[13] = {};
++  Assert(proxy->evu_get_csr(evu_context, sizeof(evu_context)) == 0 &&
++           evu_context[7] == 0 && proxy->evu_reg_valid() == 0 && proxy->evu_pending() == 0,
++         "EVU context/VRF/job replay is not supported by the legacy snapshot format");
++#endif
+   state->replay_snapshot();
+   memcpy(proxy_reg_ss, &proxy->state, sizeof(ref_state_t));
+   proxy->ref_csrcpy(squash_csr_buf, REF_TO_DUT);
+ #ifdef CONFIG_DIFFTEST_AMUCTRLEVENT
+   replay_status.matrix_commit_boundary = state->matrix_commit_sequence;
++#if defined(CONFIG_DIFFTEST_EVUSTOREEVENT) || defined(CONFIG_DIFFTEST_EVUCOMPLETIONEVENT)
++  Assert(proxy->ame_replay_available(), "AME replay requires matching reference snapshot exports");
++#endif
+   const size_t ame_replay_state_size = proxy->ame_replay_state_size();
+   ame_replay_state_ss.resize(ame_replay_state_size);
+   if (!ame_replay_state_ss.empty()) {
+@@ -751,6 +764,11 @@ inline int Difftest::check_all() {
+     return ret;
+   }
+ 
++#if defined(CONFIG_DIFFTEST_EVUSTOREEVENT) && defined(CONFIG_DIFFTEST_EVUCOMPLETIONEVENT)
++  if (state->has_progress) {
++    if (int ret = evu_checker->check_csr()) return ret;
++  }
++#endif
+   if (!state->has_progress) {
+     return DiffTestChecker::STATE_OK;
+   }
+diff --git a/src/test/csrc/difftest/difftest.h b/src/test/csrc/difftest/difftest.h
+index 370768637..2b2f0a290 100644
+--- a/src/test/csrc/difftest/difftest.h
++++ b/src/test/csrc/difftest/difftest.h
+@@ -191,6 +191,9 @@ protected:
+   uint64_t dut_commit_batch_pc = 0;
+ 
+   std::vector<DiffTestChecker *> checkers;
++#if defined(CONFIG_DIFFTEST_EVUSTOREEVENT) && defined(CONFIG_DIFFTEST_EVUCOMPLETIONEVENT)
++  EvuChecker *evu_checker = nullptr;
++#endif
+   ArchEventChecker *arch_event_checker = nullptr;
+   InstrCommitChecker *instr_commit_checker[CONFIG_DIFF_COMMIT_WIDTH] = {nullptr};
+ #ifdef CONFIG_DIFFTEST_STOREEVENT
+diff --git a/src/test/csrc/difftest/fork_ref/fast_ref.cpp b/src/test/csrc/difftest/fork_ref/fast_ref.cpp
+index d65d88b3a..9e9070662 100644
+--- a/src/test/csrc/difftest/fork_ref/fast_ref.cpp
++++ b/src/test/csrc/difftest/fork_ref/fast_ref.cpp
+@@ -21,6 +21,12 @@
+ 
+ #ifdef CONFIG_DIFFTEST_FAST_REF
+ bool Difftest::set_ref_mode(RefExecMode mode) {
++#if defined(CONFIG_DIFFTEST_EVUSTOREEVENT) || defined(CONFIG_DIFFTEST_EVUCOMPLETIONEVENT)
++  if (mode == REF_EXEC_FAST) {
++    fprintf(stderr, "Asynchronous EVU checking requires SLOW reference mode\n");
++    return false;
++  }
++#endif
+   bool with_fork = false;
+ #ifdef CONFIG_DIFFTEST_FORK_REF
+   with_fork = difftest_ref_fork_enabled();
+diff --git a/src/test/csrc/difftest/fork_ref/fork_ref.cpp b/src/test/csrc/difftest/fork_ref/fork_ref.cpp
+index a2669ecbf..9b4cc0fa0 100644
+--- a/src/test/csrc/difftest/fork_ref/fork_ref.cpp
++++ b/src/test/csrc/difftest/fork_ref/fork_ref.cpp
+@@ -341,7 +341,8 @@ int difftest_ref_fork_start(uint64_t fork_interval_ms) {
+   if (!difftest[0]->proxy->require_exec_mode_interfaces(true))
+     return -1;
+   interval_ms = fork_interval_ms;
+-#if defined(CONFIG_DIFFTEST_LOADEVENT) || defined(CONFIG_DIFFTEST_STOREEVENT) ||                \
++#if defined(CONFIG_DIFFTEST_EVUSTOREEVENT) || defined(CONFIG_DIFFTEST_EVUCOMPLETIONEVENT) ||   \
++    defined(CONFIG_DIFFTEST_LOADEVENT) || defined(CONFIG_DIFFTEST_STOREEVENT) ||                \
+     defined(CONFIG_DIFFTEST_STOREHASHEVENT) || defined(CONFIG_DIFFTEST_ARCHINTDELAYEDUPDATE) || \
+     defined(CONFIG_DIFFTEST_ARCHFPDELAYEDUPDATE) || defined(CONFIG_DIFFTEST_AMUCTRLEVENT) ||    \
+     defined(CONFIG_DIFFTEST_CMOINVALEVENT) || defined(CONFIG_DIFFTEST_MSYNCEVENT) ||            \
+diff --git a/src/test/csrc/difftest/refproxy.h b/src/test/csrc/difftest/refproxy.h
+index a128a6e28..4d937e905 100644
+--- a/src/test/csrc/difftest/refproxy.h
++++ b/src/test/csrc/difftest/refproxy.h
+@@ -169,10 +169,19 @@ public:
+ #define REF_FORK(f)
+ #endif
+ 
+-#define REF_OPTIONAL(f) \
+-  f(ref_store_commit_hash, difftest_store_commit_hash, int, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) \
++#define REF_OPTIONAL(f)                                                                                     \
+   REF_EXEC_MODE(f) \
+-  REF_FORK(f)                                                                                     \
++  REF_FORK(f) \
++  f(ref_evu_set_async, difftest_evu_set_async, void, bool)                                                 \
++  f(ref_evu_store, difftest_evu_store, int, uint64_t, const void*, uint64_t)                               \
++  f(ref_evu_complete, difftest_evu_complete_v2, int, uint64_t, uint32_t, uint8_t, bool, uint8_t, bool)                \
++  f(ref_evu_pending, difftest_evu_pending, int, )                                                         \
++  f(ref_evu_get_reg, difftest_evu_get_reg, int, uint32_t, void*, size_t)                                    \
++  f(ref_evu_reg_valid, difftest_evu_reg_valid, uint32_t, )                                                 \
++  f(ref_evu_drain, difftest_evu_drain, int, uint8_t, bool, uint8_t, uint64_t, uint64_t, bool)              \
++  f(ref_evu_get_csr, difftest_evu_get_csr, int, void*, size_t)                                              \
++  f(ref_store_commit_hash, difftest_store_commit_hash, int, uint64_t, uint64_t, uint64_t,                \
++    uint64_t, uint64_t)                                                                                  \
+   f(ref_init_v2, difftest_init_v2, void, unsigned)                                                          \
+   f(load_flash_bin, difftest_load_flash, void, const char*, size_t)                                         \
+   f(load_flash_bin_v2, difftest_load_flash_v2, void, const uint8_t*, size_t)                                \
+@@ -219,6 +228,30 @@ public:
+   AbstractRefProxy(int coreid, size_t ram_size, const char *env, const char *file_path);
+   ~AbstractRefProxy();
+ 
++  bool evu_available() const {
++    return ref_evu_set_async && ref_evu_store && ref_evu_complete && ref_evu_pending &&
++           ref_evu_get_reg && ref_evu_reg_valid && ref_evu_get_csr && ref_evu_drain;
++  }
++  bool ame_replay_available() const {
++    return ref_ame_replay_state_size && ref_ame_replay_state_save && ref_ame_replay_state_restore;
++  }
++  void evu_set_async(bool enable) { ref_evu_set_async(enable); }
++  int evu_store(uint64_t addr, const void *data, uint64_t mask) {
++    return ref_evu_store(addr, data, mask);
++  }
++  int evu_complete(uint64_t pc, uint32_t instr, uint8_t flags, bool exception, uint8_t cause, bool vxsat) {
++    return ref_evu_complete(pc, instr, flags, exception, cause, vxsat);
++  }
++  int evu_pending() const { return ref_evu_pending(); }
++  int evu_get_reg(uint32_t reg, void *data, size_t bytes) {
++    return ref_evu_get_reg(reg, data, bytes);
++  }
++  uint32_t evu_reg_valid() const { return ref_evu_reg_valid(); }
++  int evu_drain(uint8_t flags, bool exception, uint8_t cause, uint64_t pc, uint64_t tval, bool valid) {
++    return ref_evu_drain(flags, exception, cause, pc, tval, valid);
++  }
++  int evu_get_csr(void *data, size_t bytes) { return ref_evu_get_csr(data, bytes); }
++
+ protected:
+   REF_OPTIONAL(DeclRefFunc)
+ 
+diff --git a/src/test/csrc/emu/emu.cpp b/src/test/csrc/emu/emu.cpp
+index 2773da308..115fa4c0e 100644
+--- a/src/test/csrc/emu/emu.cpp
++++ b/src/test/csrc/emu/emu.cpp
+@@ -764,6 +764,10 @@ void Emulator::snapshot_save() {
+ 
+ void Emulator::snapshot_load(const char *filename) {
+   auto snapshot_read = dut_ptr->snapshot_load(filename);
++#ifdef CONFIG_HAS_ACCELERATOR_CLOCK
++  accelerator_clock_level = dut_ptr->get_accelerator_clock();
++  accelerator_clock_phase = 0;
++#endif // CONFIG_HAS_ACCELERATOR_CLOCK
+ 
+   long size;
+   snapshot_read(&size, sizeof(size));
+diff --git a/src/test/scala/EvuInterfaceCheck.scala b/src/test/scala/EvuInterfaceCheck.scala
+new file mode 100644
+index 000000000..432d7f248
+--- /dev/null
++++ b/src/test/scala/EvuInterfaceCheck.scala
+@@ -0,0 +1,22 @@
++package difftest
++
++import chisel3._
++
++/** Generate the real C++ ABI without elaborating a full CPU or emitting RTL. */
++object EvuInterfaceCheck {
++  def main(args: Array[String]): Unit = {
++    circt.stage.ChiselStage.emitCHIRRTL(new Module {
++      val common = Seq(
++        new DiffArchEvent, new DiffInstrCommit(192), new DiffTrapEvent,
++        new DiffCSRState, new DiffHCSRState, new DiffVecCSRState,
++        new DiffFpCSRState, new DiffArchIntRegState, new DiffArchFpRegState,
++        new DiffArchVecRegState, new DiffEvuStoreEvent, new DiffEvuCompletionEvent,
++        new DiffEvuCSRState, new DiffEvuDrainEvent
++      )
++      common.foreach(bundle => DifftestModule(bundle, dontCare = true))
++      for (_ <- 0 until 32) DifftestModule(new DiffEvuVrfState(64), dontCare = true)
++      DifftestModule.collect("XiangShan")
++    })
++    println("EVU C++ interface generated")
++  }
++}

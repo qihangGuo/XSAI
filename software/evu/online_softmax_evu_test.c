@@ -42,7 +42,7 @@
 #endif
 #endif
 #ifndef EVU_SOFTMAX_STATE_LOAD_BATCH
-/* Candidate: fewer memory commands, but extra draining EVCFG writes. */
+/* Candidate: fewer memory commands, but extra serialized VL configurations. */
 #define EVU_SOFTMAX_STATE_LOAD_BATCH 0
 #endif
 #ifndef EVU_SOFTMAX_DRAIN_DIAG
@@ -152,7 +152,7 @@ static void synchronize(void) {
 
 static inline void configure(unsigned vl) {
   /* e32, m1, tail-undisturbed: short chunks preserve the accumulator tail. */
-  XV_CSR_WRITE(XV_EVCFG, XV_CONFIGURED | (UINT64_C(16) << 32) | vl);
+  (void)xv_setvli(vl, 0x10);
 }
 
 #if !OS_RESIDENT

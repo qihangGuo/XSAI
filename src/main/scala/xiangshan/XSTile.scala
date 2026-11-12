@@ -34,7 +34,7 @@ import xiangshan.backend.trace.TraceCoreInterface
 import xiangshan.backend.fu.matrix._
 import xiangshan.backend.fu.matrix.Bundles._
 import cute.{CutePerfAsyncCrossing, CutePerfToCoreIO, XSCute}
-import xiangshan.evu.{EvuCompletion, EvuCoreCommand, EvuDispatchRequest, EvuTop, MatrixVectorBridge}
+import xiangshan.evu.{EvuCompletion, EvuCoreCommand, EvuDispatchRequest, EvuTop}
 
 object MatAcc extends Enumeration {
   type MatAcc = Value
@@ -527,70 +527,6 @@ class XSTile()(implicit p: Parameters) extends LazyModule
       cute.module.io.difftestReset.foreach(_ := reset.asBool)
     }
 
-    evuOpt.foreach { evu =>
-      evu.module.io.matrixInput.valid := false.B
-      evu.module.io.matrixInput.bits := 0.U.asTypeOf(evu.module.io.matrixInput.bits)
-      evu.module.io.matrixOutput.ready := true.B
-      evu.module.io.cuteWrite.ready := true.B
-    }
-
-    // CUTE emits a completed tile; the bridge slices it into DLEN beats and
-    // only asserts the EVU input when the tile has been accepted.
-    cuteOpt.foreach { cute =>
-      if (evuOpt.isDefined) {
-        val evu = evuOpt.get
-        val tileBits = cute.module.io.cute.vectorResult.bits.getWidth
-        val bridge = withClockAndReset(acceleratorClock, acceleratorReset) {
-          Module(new MatrixVectorBridge(tileBits, p(ExternalVectorKey)))
-        }
-        bridge.io.in.valid := cute.module.io.cute.vectorResult.valid
-        bridge.io.in.bits.data := cute.module.io.cute.vectorResult.bits
-        bridge.io.in.bits.tileId := cute.module.io.cute.vectorResultTileId
-        bridge.io.in.bits.kComplete := cute.module.io.cute.vectorResultKComplete
-        bridge.io.in.bits.taskLast := cute.module.io.cute.vectorResultTaskLast
-        bridge.io.in.bits.scaleTag := evu.module.io.matrixScaleTag
-        bridge.io.in.bits.biasTag := evu.module.io.matrixBiasTag
-        cute.module.io.cute.vectorResult.ready := bridge.io.in.ready
-        evu.module.io.matrixInput <> bridge.io.out
-        evu.module.io.matrixOutput.ready := true.B
-
-        // Quantized EVU output is written directly into the selected CUTE
-        // ABMatrixReg entry. Both units are in this tile's vector/matrix
-        // clock domain; the Decoupled handshake is the ownership boundary.
-        val cuteAbWrite = cute.module.io.cute.evuAbWrite
-        cuteAbWrite.valid := evu.module.io.cuteWrite.valid
-        cuteAbWrite.bits.matrixReg := evu.module.io.cuteWrite.bits.matrixReg(
-          cuteAbWrite.bits.matrixReg.getWidth - 1, 0)
-        cuteAbWrite.bits.bank := evu.module.io.cuteWrite.bits.bank(
-          cuteAbWrite.bits.bank.getWidth - 1, 0)
-        cuteAbWrite.bits.addr := evu.module.io.cuteWrite.bits.entry(
-          cuteAbWrite.bits.addr.getWidth - 1, 0)
-        require(cuteAbWrite.bits.data.getWidth == evu.module.io.cuteWrite.bits.data.getWidth &&
-          cuteAbWrite.bits.byteMask.getWidth == evu.module.io.cuteWrite.bits.byteMask.getWidth,
-          "EVU and CUTE must agree on the fixed ABMatrixReg entry width")
-        cuteAbWrite.bits.data := evu.module.io.cuteWrite.bits.data
-        cuteAbWrite.bits.byteMask := evu.module.io.cuteWrite.bits.byteMask
-        evu.module.io.cuteWrite.ready := cuteAbWrite.ready
-        if (p(ExternalVectorKey).fpQuantSupported) {
-          require(cuteAbWrite.bits.data.getWidth == 256 &&
-            cuteAbWrite.bits.bank.getWidth == 3 && cuteAbWrite.bits.addr.getWidth == 5,
-            "EVU FP quantization requires CUTE 128x64 with eight banks and 32-byte entries")
-        }
-        if (env.EnableDifftest) {
-          val writeEvent = difftest.DifftestModule(new difftest.DiffEvuCuteWriteEvent, delay = 3)
-          writeEvent.coreid := io.hartId
-          writeEvent.valid := cuteAbWrite.fire
-          writeEvent.matrixReg := cuteAbWrite.bits.matrixReg
-          writeEvent.bank := cuteAbWrite.bits.bank
-          writeEvent.entry := cuteAbWrite.bits.addr
-          writeEvent.data := cuteAbWrite.bits.data.asTypeOf(writeEvent.data)
-          writeEvent.mask := cuteAbWrite.bits.byteMask
-        }
-      } else {
-        cute.module.io.cute.vectorResult.ready := true.B
-      }
-    }
-
     // Retired xv.* commands use dispatch; the raw command port remains local.
     // These commands are non-speculative, so a core branch redirect must not
     // cancel them. Completion/exception reporting still needs a job-state bridge.
@@ -599,9 +535,6 @@ class XSTile()(implicit p: Parameters) extends LazyModule
       evu.module.io.command.bits := DontCare
       if (!useAcceleratorCDC) {
         val perf = evu.module.io.perf
-        XSPerfReference("evu_matrix_store_stall_cycles", perf.matrixStoreStalls, XSPerfLevel.NORMAL)
-        XSPerfReference("evu_matrix_store_merges", perf.matrixStoreMerges, XSPerfLevel.NORMAL)
-        XSPerfReference("evu_matrix_partial_writes", perf.matrixPartialWrites, XSPerfLevel.NORMAL)
         XSPerfReference("evu_memory_tag_stall_cycles", perf.memoryTagStalls, XSPerfLevel.NORMAL)
         XSPerfReference("evu_memory_requests", perf.memRequests, XSPerfLevel.NORMAL)
         XSPerfReference("evu_memory_responses", perf.memResponses, XSPerfLevel.NORMAL)
@@ -673,16 +606,6 @@ class XSTile()(implicit p: Parameters) extends LazyModule
         event.addr := evu.module.io.storeTrace.bits.addr
         event.data := evu.module.io.storeTrace.bits.data.asTypeOf(event.data)
         event.mask := evu.module.io.storeTrace.bits.mask
-        val matrixTrace = evu.module.io.matrixTrace
-        val matrixEvent = difftest.DifftestModule(new difftest.DiffEvuMatrixEvent(p(ExternalVectorKey).dlenBits / 64), delay = 3)
-        matrixEvent.coreid := io.hartId
-        matrixEvent.valid := matrixTrace.valid
-        matrixEvent.row := matrixTrace.bits.row
-        matrixEvent.col := matrixTrace.bits.col
-        matrixEvent.data := matrixTrace.bits.data.asTypeOf(matrixEvent.data)
-        matrixEvent.mask := matrixTrace.bits.mask
-        matrixEvent.fflags := matrixTrace.bits.fflags
-        matrixEvent.last := matrixTrace.bits.last
         val snapshot = evu.module.io.archSnapshot.get
         for (reg <- 0 until p(ExternalVectorKey).vectorRegs) {
           val vrf = difftest.DifftestModule(new difftest.DiffEvuVrfState(p(ExternalVectorKey).vlenBits / 64), delay = 3)

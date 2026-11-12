@@ -99,6 +99,8 @@ class EvuSaturnOperandHarness(special: Boolean, pipelinedReads: Boolean = false)
     seq.io.iss.ready := io.issueReady
     seq.io.pipe_write_req.available := true.B
     seq.io.acc_valid := false.B
+    seq.io.acc_return := false.B
+    seq.io.lookahead := 0.U.asTypeOf(seq.io.lookahead)
     seq.io.vgu.slide_req.ready := true.B
     seq.io.vgu.slide_data := 0.U
     seq.io.vgu.gather_eidx.valid := false.B
@@ -169,6 +171,7 @@ class EvuSaturnOperandShellImp(outer: EvuSaturnOperandShell)(implicit p: Paramet
       read.req.valid := harness.io.req(i) && initialized
       read.req.bits.eg := harness.io.eg(i)
       read.req.bits.oldest := true.B
+      read.req.bits.lastOperand := false.B
       harness.io.ready(i) := read.req.ready && initialized
       harness.io.resp(i) := read.resp
     }

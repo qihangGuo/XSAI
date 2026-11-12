@@ -36,14 +36,12 @@ class EvuRetiredOpcodeSpec extends AnyFlatSpec with ChiselScalatestTester {
     test(LazyModule(new EvuTopHarness(ep)).module)
       .withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
         dut.io.dispatch.valid.poke(false.B)
-        dut.io.matrixInput.valid.poke(false.B)
-        dut.io.matrixOutput.ready.poke(true.B)
         dut.io.completion.ready.poke(false.B)
         dut.io.flush.poke(false.B)
         dut.io.a.ready.poke(true.B)
         dut.io.d.valid.poke(false.B)
 
-        for (funct7 <- Seq(0x09, 0x0b, 0x38, 0x4c, 0x4d, 0x4e, 0x4f); sew <- 0 to 2; vl <- Seq(0, 16)) {
+        for (funct7 <- Seq(0x09, 0x0b, 0x18, 0x19, 0x38, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x5e); sew <- 0 to 7; vl <- Seq(0, 16)) {
           dut.io.dispatch.bits.instr.poke(((BigInt(funct7) << 25) | (sew << 12) | (3 << 7) | 0x0b).U)
           dut.io.dispatch.bits.base.poke("hfff0".U)
           dut.io.dispatch.bits.vl.poke(vl.U)

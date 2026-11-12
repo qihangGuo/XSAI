@@ -77,7 +77,9 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
     addr >= "hbc0".U && addr <= "hbff".U) || isMret || isSret || isMNret || isDret
   private val evuControl = p(ExternalVectorKey).enable.B &&
     (isCSRAcc && xiangshan.evu.EvuCSRs.needsDrain(addr) || evuOwnershipChange)
-  private val evuReady = !evuControl || csrIn.evu.drained
+  // Other BJU3 functions share these input bits, but not their opcode namespace.
+  // In particular MSYNCRESET aliases MINIT here while this CSR input is invalid.
+  private val evuReady = !valid || !evuControl || csrIn.evu.drained
   val trapInstMod = Module(new TrapInstMod)
   val trapTvalMod = Module(new TrapTvalMod)
   val satpFlushMod = Module(new SatpFlushMod)

@@ -22,10 +22,7 @@ class EvuRmwStoreHarness(ep: EvuParams) extends Module {
   val tags = Module(new EvuMemoryTagRouter(ep))
   val adapter = Module(new EvuHbl2LineAdapter(ep))
   lines.io.client <> io.client
-  tags.io.clients(0).req.valid := false.B
-  tags.io.clients(0).req.bits := 0.U.asTypeOf(tags.io.clients(0).req.bits)
-  tags.io.clients(0).resp.ready := true.B
-  tags.io.clients(1) <> lines.io.memory
+  tags.io.client <> lines.io.memory
   adapter.io.client <> tags.io.memory
   io.memory <> adapter.io.memory
   lines.io.flush := io.flush
@@ -33,7 +30,6 @@ class EvuRmwStoreHarness(ep: EvuParams) extends Module {
   lines.io.storePending := false.B
   tags.io.flush := io.flush
   tags.io.adapterBusy := adapter.io.busy
-  tags.io.lookupTag := 0.U
   adapter.io.flush := io.flush
   io.busy := lines.io.busy || tags.io.busy || adapter.io.busy
   io.baseReturning := lines.io.memory.resp.fire
@@ -95,13 +91,12 @@ class EvuRmwStoreCoalescingSpec extends AnyFlatSpec with ChiselScalatestTester w
           dut.io.memory.resp.bits.fault.poke(if (error == 1) EvuFault.Bus else EvuFault.None)
           dut.io.memory.resp.valid.poke(true.B)
           await(dut.io.memory.resp.ready)
-          dut.clock.step()
-          dut.io.memory.resp.valid.poke(false.B)
           // Join exactly when the coalescer receives its base line.
           await(dut.io.baseReturning)
           store(2, accept = false)
           dut.io.merged.expect(true.B)
           dut.clock.step()
+          dut.io.memory.resp.valid.poke(false.B)
           dut.io.client.req.valid.poke(false.B)
           if (error != 1) {
             await(dut.io.memory.req.valid)
@@ -140,7 +135,7 @@ class EvuRmwStoreCoalescingSpec extends AnyFlatSpec with ChiselScalatestTester w
     }
   }
 
-  for (stage <- Seq("buffered", "get_wait", "prepared", "put_wait")) {
+  for (stage <- Seq("buffered", "queued_get", "get_wait", "prepared", "put_wait", "put_ack_flush")) {
     it should s"drain a flushed $stage store before releasing its owner and tag" in {
       test(new EvuRmwStoreHarness(EvuParams(enable = true)))
         .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
@@ -192,19 +187,40 @@ class EvuRmwStoreCoalescingSpec extends AnyFlatSpec with ChiselScalatestTester w
           req.valid.poke(false.B)
 
           var outstanding = Option.empty[BigInt]
-          if (stage != "buffered") {
+          if (stage == "queued_get") {
+            await(dut.io.memory.req.valid)
+            dut.io.memory.req.bits.write.expect(false.B)
+          } else if (stage != "buffered") {
             val get = acceptMemory(write = false)
             if (stage == "get_wait") { outstanding = Some(get) }
             else {
               respond(get)
-              await(dut.io.baseReturning)
-              dut.clock.step()
-              if (stage == "put_wait") { outstanding = Some(acceptMemory(write = true)) }
+              if (stage == "put_wait" || stage == "put_ack_flush") {
+                outstanding = Some(acceptMemory(write = true))
+              }
             }
           }
+          if (stage == "put_ack_flush") {
+            dut.io.memory.resp.bits.tag.poke(outstanding.get.U)
+            dut.io.memory.resp.valid.poke(true.B)
+            dut.io.memory.resp.ready.expect(true.B)
+          }
           dut.io.flush.poke(true.B)
+          dut.io.client.resp.valid.expect(false.B)
           dut.clock.step()
           dut.io.flush.poke(false.B)
+          if (stage == "put_ack_flush") {
+            dut.io.memory.resp.valid.poke(false.B)
+            outstanding = None
+          }
+          if (stage == "queued_get") {
+            // A queued physical request may already own WidthWidget beats.
+            // Flush must preserve it until memory accepts and answers it.
+            dut.io.memory.req.valid.expect(true.B)
+            dut.clock.step(3)
+            dut.io.memory.req.valid.expect(true.B)
+            outstanding = Some(acceptMemory(write = false))
+          }
           dut.io.memory.req.valid.expect(false.B)
           outstanding.foreach { tag =>
             dut.clock.step(4)
@@ -215,6 +231,9 @@ class EvuRmwStoreCoalescingSpec extends AnyFlatSpec with ChiselScalatestTester w
           await(dut.io.client.resp.valid)
           dut.io.client.resp.bits.tag.expect(5.U)
           dut.io.client.resp.bits.error.expect(false.B)
+          dut.clock.step(3)
+          dut.io.client.resp.valid.expect(true.B)
+          dut.io.client.resp.bits.tag.expect(5.U)
           dut.io.client.resp.ready.poke(true.B)
           dut.clock.step(5)
           dut.io.busy.expect(false.B)
@@ -285,11 +304,13 @@ class EvuRmwStoreCoalescingSpec extends AnyFlatSpec with ChiselScalatestTester w
           dut.io.memory.req.ready.poke(false.B)
           req.ready.expect(false.B)
           dut.io.client.resp.valid.expect(false.B)
+          dut.io.client.resp.ready.poke(false.B)
           dut.io.memory.resp.valid.poke(true.B)
           dut.clock.step()
           dut.io.memory.resp.valid.poke(false.B)
           req.ready.expect(false.B)
           dut.io.client.resp.valid.expect(true.B)
+          dut.io.client.resp.ready.poke(true.B)
           dut.clock.step()
           req.ready.expect(true.B)
         }

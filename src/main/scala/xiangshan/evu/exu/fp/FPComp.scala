@@ -131,6 +131,7 @@ class FPCompPipe(implicit p: Parameters) extends PipelinedFunctionalUnit(2)(p) w
 
   val s1_writes_as_mask = RegEnable(ctrl.bool(WritesAsMask), io.pipe(0).valid)
   val s1_exceptions = RegEnable(exceptions, io.pipe(0).valid)
+  val s1_sign_injection = RegEnable(ctrl.bool(FPSgnj), io.pipe(0).valid)
 
 
   io.write.valid := io.pipe(1).valid
@@ -139,7 +140,8 @@ class FPCompPipe(implicit p: Parameters) extends PipelinedFunctionalUnit(2)(p) w
   io.write.bits.data := RegEnable(out, io.pipe(0).valid)
 
   io.set_fflags.valid := io.write.valid
-  io.set_fflags.bits := Mux(io.pipe(1).bits.rvd_eew === 2.U, s1_exceptions(1), s1_exceptions(0))
+  io.set_fflags.bits := Mux(s1_sign_injection, 0.U,
+    Mux(io.pipe(1).bits.rvd_eew === 2.U, s1_exceptions(1), s1_exceptions(0)))
   io.scalar_write.valid := false.B
   io.scalar_write.bits := DontCare
 }

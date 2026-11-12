@@ -442,7 +442,9 @@ case class XSCoreParameters
       if (HasMatrixExtension) Seq(
         IssueBlockParams(Seq(
           ExeUnitParams("MSET0", Seq(MSetMtilexRiWmfCfg), Seq(MxWB(port = intSchdMxWbPort, 0)), Seq(Seq(IntRD(0, 2)))),
-          ExeUnitParams("MRELEASE", Seq(MreleaseCfg) ++ (if (EnableExternalVector) Seq(EvuCfg) else Nil), Seq(), Seq(Seq(IntRD(2, 2))))
+          ExeUnitParams("MRELEASE", Seq(MreleaseCfg) ++ (if (EnableExternalVector) Seq(EvuCfg) else Nil),
+            if (EnableExternalVector) Seq(IntWB(port = 3, 2)) else Seq(),
+            Seq(Seq(IntRD(2, 2))) ++ (if (EnableExternalVector) Seq(Seq(IntRD(1, 2))) else Seq()))
         ), numEntries = IssueQueueSize, numEnq = 2, numComp = IssueQueueCompEntrySize),
       ) else Nil
     ),

@@ -33,7 +33,6 @@ class EvuCSR(p: EvuParams) extends Module {
   val state = RegInit(0.U(2.W))
   val userEnable = RegInit(false.B)
   val supervisorEnable = RegInit(false.B)
-  val descriptors = RegInit(VecInit.fill(EvuCSRs.descriptorCount)(0.U(51.W)))
   val errorValid = RegInit(false.B)
   val errorCause = RegInit(0.U(4.W))
   val errorPC = RegInit(0.U(64.W))
@@ -42,16 +41,11 @@ class EvuCSR(p: EvuParams) extends Module {
 
   def dirty(): Unit = { state := 3.U }
   def configure(avl: UInt, requestedType: UInt, enable: Bool, forceVill: Bool): Unit = {
-    val sew = requestedType(5, 3)
-    val lmul = requestedType(2, 0)
-    val base = p.vlenBytes.U(32.W) >> sew
-    val maximum = Mux(lmul(2), base >> (8.U - lmul), base << lmul(1, 0))
-    val illegal = forceVill || sew > EvuIsa.maxSupportedSew.U || lmul === 4.U || maximum === 0.U
-    configured := enable
-    vill := enable && illegal
-    vtype := Mux(!enable, 0x10.U, Mux(illegal, 0.U, requestedType))
-    vl := Mux(!enable, (p.vlenBits / 32).U,
-      Mux(illegal, 0.U, Mux(avl > maximum, maximum, avl)))
+    val next = EvuConfigRules.normalize(p, avl, requestedType, enable, forceVill)
+    configured := next.configured
+    vill := next.vill
+    vtype := next.vtype
+    vl := next.vl
     dirty()
   }
 
@@ -60,12 +54,10 @@ class EvuCSR(p: EvuParams) extends Module {
     val f7 = cmd.instr(31, 25)
     val setvl = f7 === EvuIsa.setvli || f7 === EvuIsa.setvl
     when(setvl) {
-      // Legacy aux uses sign/magnitude LMUL; CSR VTYPE uses the RVV encoding.
-      val mag = cmd.aux(1, 0)
-      val lmul = Mux(cmd.aux(2), (8.U(4.W) - mag)(2, 0), Cat(0.U(1.W), mag))
-      val sew = Mux(f7 === EvuIsa.setvli, cmd.aux(5, 3), cmd.instr(14, 12))
-      configure(cmd.base, Cat(cmd.aux(7, 6), sew, lmul), true.B, cmd.aux(2) && mag === 0.U)
-    }.elsewhen(f7 =/= EvuIsa.store && f7 =/= EvuIsa.waitOp && f7 =/= EvuIsa.fence) {
+      // Scalar execution already computed this exact VL for integer writeback.
+      assert(cmd.config.valid && cmd.config.configured, "Missing retired EVU configuration")
+      configure(cmd.base, cmd.config.vtype, true.B, cmd.config.vill)
+    }.elsewhen(f7 =/= EvuIsa.store && f7 =/= EvuIsa.fence) {
       // Conservative dirty tracking also covers operations that later fail.
       dirty()
     }
@@ -110,9 +102,6 @@ class EvuCSR(p: EvuParams) extends Module {
             errorTval := 0.U
             errorTvalValid := false.B
           }
-        case a if a >= EvuCSRs.descriptorBase && a < EvuCSRs.descriptorBase + EvuCSRs.descriptorCount =>
-          descriptors(a - EvuCSRs.descriptorBase) := Mux(w.data(49, 48) <= 2.U, w.data(50, 0), 0.U)
-          dirty()
         case _ =>
       }
     }
@@ -130,7 +119,7 @@ class EvuCSR(p: EvuParams) extends Module {
     case EvuCSRs.cause => errorCause.pad(64)
     case EvuCSRs.epc => errorPC
     case EvuCSRs.tval => Mux(errorTvalValid, errorTval, 0.U)
-    case a => descriptors(a - EvuCSRs.descriptorBase).pad(64)
+    case _ => 0.U(64.W)
   })
   io.config.valid := true.B
   io.config.configured := configured
@@ -144,6 +133,5 @@ class EvuCSR(p: EvuParams) extends Module {
   io.snapshot := VecInit(Seq(vl.pad(64), Cat(vill, 0.U(55.W), vtype),
     0.U(64.W), p.vlenBytes.U(64.W), ZeroExt(configured, 64),
     flags.pad(64), ZeroExt(sat, 64), Cat(0.U(60.W), supervisorEnable, userEnable, state),
-    status & ~1.U(64.W), errorCause.pad(64), errorPC, Mux(errorTvalValid, errorTval, 0.U)) ++
-    descriptors.map(_.pad(64)) :+ cfg)
+    status & ~1.U(64.W), errorCause.pad(64), errorPC, Mux(errorTvalValid, errorTval, 0.U), cfg))
 }

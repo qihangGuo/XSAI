@@ -99,9 +99,11 @@ class StoreSequencer(resultForwarding: Boolean = false)(implicit p: Parameters) 
   io.rvd.valid := valid && !data_hazard && !rvdCaptured
   io.rvd.bits.eg := getEgId(inst.rd + (sidx << inst.emul), eidx, inst.mem_elem_size, false.B)
   io.rvd.bits.oldest := oldest
+  io.rvd.bits.lastOperand := false.B
   io.rvm.valid := valid && !data_hazard && renvm && !rvmCaptured
   io.rvm.bits.eg := getEgId(0.U, eidx, 0.U, true.B)
   io.rvm.bits.oldest := oldest
+  io.rvm.bits.lastOperand := false.B
 
   when (io.rvd.fire) {
     rvdData := io.rvd_resp

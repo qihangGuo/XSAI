@@ -18,6 +18,37 @@ class EvuReadPrioritySpec extends AnyFlatSpec with ChiselScalatestTester {
 
   behavior of "EVU demand-first VRF reads"
 
+  it should "favor a last operand without starving an ordinary demand" in {
+    implicit val p: Parameters = parameters
+    test(new OldestRRArbiter(2)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      dut.io.out.ready.poke(true.B)
+      for (i <- 0 until 2) {
+        dut.io.in(i).valid.poke(true.B)
+        dut.io.in(i).bits.eg.poke(i.U)
+        dut.io.in(i).bits.oldest.poke(false.B)
+        dut.io.in(i).bits.lastOperand.poke((i == 0).B)
+        dut.io.speculative(i).poke(false.B)
+      }
+      dut.io.chosen.expect(0.U)
+      var ordinaryGrants = 0
+      var gap = 0
+      for (_ <- 0 until 40) {
+        if (dut.io.in(1).ready.peek().litToBoolean) {
+          ordinaryGrants += 1
+          gap = 0
+        } else gap += 1
+        assert(gap <= 10, "last-operand preference starved an ordinary demand")
+        dut.clock.step()
+      }
+      assert(ordinaryGrants >= 3)
+      // SRAM write blockage gives no read opportunities and must not consume
+      // the demand's fairness budget or falsely acknowledge either request.
+      dut.io.out.ready.poke(false.B)
+      dut.clock.step(5)
+      dut.io.in.foreach(_.ready.expect(false.B))
+    }
+  }
+
   it should "serve a demand before an oldest prefetch and retain round-robin demand fairness" in {
     implicit val p: Parameters = parameters
     test(new OldestRRArbiter(3)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
@@ -25,6 +56,7 @@ class EvuReadPrioritySpec extends AnyFlatSpec with ChiselScalatestTester {
         dut.io.in(i).valid.poke(true.B)
         dut.io.in(i).bits.eg.poke(i.U)
         dut.io.in(i).bits.oldest.poke((i == 0).B)
+        dut.io.in(i).bits.lastOperand.poke(false.B)
         dut.io.speculative(i).poke((i == 0).B)
       }
       dut.io.out.ready.poke(false.B)
@@ -54,9 +86,11 @@ class EvuReadPrioritySpec extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.client.req.valid.poke(true.B)
       dut.io.client.req.bits.eg.poke(3.U)
       dut.io.client.req.bits.oldest.poke(false.B)
+      dut.io.client.req.bits.lastOperand.poke(false.B)
       dut.io.prefetch.valid.poke(true.B)
       dut.io.prefetch.bits.eg.poke(4.U)
       dut.io.prefetch.bits.oldest.poke(true.B)
+      dut.io.prefetch.bits.lastOperand.poke(false.B)
       dut.io.memory.req.ready.poke(true.B)
       dut.io.memory.resp.valid.poke(false.B)
       dut.io.memory.resp.bits.poke(0.U)
@@ -92,9 +126,11 @@ class EvuReadPrioritySpec extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.client.req.valid.poke(false.B)
       dut.io.client.req.bits.eg.poke(3.U)
       dut.io.client.req.bits.oldest.poke(false.B)
+      dut.io.client.req.bits.lastOperand.poke(false.B)
       dut.io.prefetch.valid.poke(true.B)
       dut.io.prefetch.bits.eg.poke(4.U)
       dut.io.prefetch.bits.oldest.poke(false.B)
+      dut.io.prefetch.bits.lastOperand.poke(false.B)
       dut.io.memory.req.ready.poke(true.B)
       dut.io.memory.resp.valid.poke(false.B)
       dut.io.memory.resp.bits.poke(0.U)
@@ -134,6 +170,7 @@ class EvuReadPrioritySpec extends AnyFlatSpec with ChiselScalatestTester {
           port.req.valid.poke(false.B)
           port.req.bits.eg.poke(0.U)
           port.req.bits.oldest.poke(false.B)
+          port.req.bits.lastOperand.poke(false.B)
           port.speculative.poke(false.B)
         }
         dut.io.pipe_write_reqs(0).request.poke(false.B)
@@ -154,6 +191,7 @@ class EvuReadPrioritySpec extends AnyFlatSpec with ChiselScalatestTester {
         ports(0).req.valid.poke(true.B)
         ports(0).req.bits.eg.poke(3.U)
         ports(0).req.bits.oldest.poke(true.B)
+        ports(0).req.bits.lastOperand.poke(false.B)
         ports(0).speculative.poke(true.B)
         ports(1).req.valid.poke(true.B)
         ports(1).req.bits.eg.poke(19.U)
@@ -170,6 +208,7 @@ class EvuReadPrioritySpec extends AnyFlatSpec with ChiselScalatestTester {
         ports(3).req.valid.poke(true.B)
         ports(3).req.bits.eg.poke(19.U)
         ports(3).req.bits.oldest.poke(true.B)
+        ports(3).req.bits.lastOperand.poke(false.B)
         ports(3).speculative.poke(true.B)
         ports(0).req.ready.expect(true.B)
         ports(2).req.ready.expect(true.B)

@@ -40,15 +40,6 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     val completion_vxsat = Output(Vec(nRelease, Bool()))
     val completion_fflags = Output(Vec(nRelease, UInt(5.W)))
 
-    // Special AI operations are sequenced by the EVU wrapper but access the
-    // same Saturn RegisterFile through these requester-side ports.
-    // RegisterAccess owns the VRF requester-side ports. From this modules
-    // perspective they are inputs, so flip both request bundles here; this
-    // avoids output-to-output bulk connections when the special sequencer is
-    // wired through EvuVectorSubsystem.
-    val special = new Bundle {
-      val read = Vec(3, Flipped(new VectorReadIO))
-    }
   })
 
   require(vLen >= 64)
@@ -67,15 +58,15 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   val xissParams = vParams.issStructure.generate(vParams)
   val all_supported_insns = xissParams.map(_.insns).flatten
   val interleave = vParams.interleaveReductions && vParams.reductionContexts > 1
-  val contextCounts = xissParams.map(_.seqs.map { s =>
-    if (interleave && (s.name == "fp_fma" || s.name == "fp_cmp")) 1 + vParams.reductionContexts else 1
+  val contextLayouts = xissParams.map(_.seqs.map { s =>
+    ExecuteContextLayout(s.name, interleave, vParams.fmaOrdinaryContexts, vParams.reductionContexts)
   })
 
   val vlissq = Module(new IssueQueue(vParams.vlissqEntries, 1))
   val vsissq = Module(new IssueQueue(vParams.vsissqEntries, 1))
   val vpissq = Module(new IssueQueue(vParams.vpissqEntries, vParams.reductionContexts))
-  val vxissqs = xissParams.zip(contextCounts).map { case (q, counts) =>
-    Module(new IssueQueue(q.depth, counts.sum)).suggestName(s"vxissq_${q.name}")
+  val vxissqs = xissParams.zip(contextLayouts).map { case (q, layouts) =>
+    Module(new IssueQueue(q.depth, layouts.map(_.size).sum)).suggestName(s"vxissq_${q.name}")
   }
 
   val vxus = xissParams.map(_.seqs.map(s => Module(new ExecutionUnit(s.fus, s.name)).suggestName(s"vxu${s.name}")))
@@ -88,11 +79,12 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     Module(new SpecialSequencer(all_supported_insns, i, vParams.reductionContexts, interleave)).suggestName(s"vps$i")
   }
   val vps = reductionSeqs.head // Only context zero handles permutations and VMU index/mask streams.
-  val executionContexts = xissParams.zip(contextCounts).map { case (q, counts) =>
-    q.seqs.zip(counts).map { case (s, count) =>
-      (0 until count).map { c =>
+  val executionContexts = xissParams.zip(contextLayouts).map { case (q, layouts) =>
+    q.seqs.zip(layouts).map { case (s, layout) =>
+      (0 until layout.size).map { c =>
         Module(new ExecuteSequencer(s.insns, maxPipeDepth, s.fus.size,
-          ordinaryOnly = count > 1 && c == 0, reductionOnly = count > 1 && c > 0,
+          ordinaryOnly = layout.dedicated && layout.reductionOwner(c).isEmpty,
+          reductionOnly = layout.reductionOwner(c).nonEmpty,
           resultForwarding = Set("fp_fma", "fp_cmp", "fp_exp").contains(s.name)))
           .suggestName(s"vxs${s.name}_$c")
       }
@@ -105,6 +97,9 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
   val flat_vxs = vxs.flatten
   val contextsByFu = executionContexts.flatten
+  val reductionOwnerBySequencer = contextsByFu.zip(contextLayouts.flatten).flatMap { case (seqs, layout) =>
+    seqs.zipWithIndex.map { case (seq, c) => seq -> layout.reductionOwner(c) }
+  }.toMap
   val fuBySequencer = contextsByFu.zip(flat_vxus).flatMap { case (seqs, xu) => seqs.map(_ => xu) }
   val representativeByFu = contextsByFu.map(seqs => flat_vxs.indexOf(seqs.head))
   io.executionPerf := 0.U.asTypeOf(io.executionPerf)
@@ -312,7 +307,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       val contextAllowed = if (!interleave) true.B else if (group.issq == vpissq) {
         !dispatchReduction || reductionChoice(c)
       } else seq match {
-        case s: ExecuteSequencer if s.reductionOnly => reductionChoice(c - 1)
+        case s: ExecuteSequencer if s.reductionOnly => reductionChoice(reductionOwnerBySequencer(s).get)
         case _ => true.B
       }
       seq.accepts(vdq.io.deq.bits) && contextAllowed
@@ -338,12 +333,14 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   // ======================================
   // Connect reads to VRF
 
-  val vrf = Module(new RegisterAccess(flat_vxs.size, maxPipeDepth, specialReads = 3,
-    reductionContexts = vParams.reductionContexts))
+  val vrf = Module(new RegisterAccess(flat_vxs.size, maxPipeDepth,
+    reductionContexts = vParams.reductionContexts,
+    executionClasses = contextsByFu.zip(xissParams.flatMap(_.seqs)).flatMap { case (seqs, factory) =>
+      Seq.fill(seqs.size)(EvuReadClass.names.indexOf(factory.name) match { case -1 => 4; case id => id })
+    }))
   pendingWrites := vrf.io.pendingWrites
   io.debugVrf.foreach(_ := vrf.io.debug.get)
   io.vrfPerf := vrf.io.perf
-  io.special <> vrf.io.special
 
   val forwardSeqs = flat_vxs.filter(_.io.forward.nonEmpty)
   val forwardUnits = flat_vxus.zip(xissParams.flatMap(_.seqs)).collect {
@@ -538,6 +535,24 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   // Contexts share one arithmetic unit and one physical result channel.
   // Reserve output time across all contexts, including different latencies.
   for (((seqs, xu), factory) <- contextsByFu.zip(flat_vxus).zip(xissParams.flatMap(_.seqs))) {
+    seqs.foreach(_.io.lookahead := 0.U.asTypeOf(seqs.head.io.lookahead))
+    val lookaheadEligible = WireInit(false.B)
+    if (factory.name == "fp_exp") {
+      val queueIndex = xissParams.indexWhere(_.seqs.exists(_.name == factory.name))
+      val next = vxissqs(queueIndex).io.deq
+      val eg = getEgId(next.bits.rs2, 0.U, next.bits.vconfig.vtype.vsew, false.B)
+      val olderWriter = forwardWriters.map { writer =>
+        writer.valid && writer.bits.writes(eg) && vatOlder(writer.bits.vat, next.bits.vat)
+      }.foldLeft(false.B)(_ || _)
+      lookaheadEligible := next.valid && next.bits.vm && next.bits.vstart === 0.U &&
+        !next.bits.scalar_to_vd0 && !next.bits.reduction &&
+        next.bits.vconfig.vtype.vsew === 2.U && next.bits.vconfig.vl >= (dLen / 32).U &&
+        !olderWriter && seqs.head.io.atTail
+      seqs.head.io.lookahead.valid := lookaheadEligible
+      seqs.head.io.lookahead.bits.eg := eg
+      seqs.head.io.lookahead.bits.oldest := next.bits.vat === io.vat_head
+      seqs.head.io.lookahead.bits.lastOperand := false.B
+    }
     val criticalPriority = factory.name == "fp_fma" || factory.name == "fp_cmp"
     val arb = Module(new SharedExecutionArbiter(seqs.size, maxPipeDepth, xu.nFUs, criticalPriority))
     for ((seq, c) <- seqs.zipWithIndex) { arb.io.in(c) <> executeCandidates(flat_vxs.indexOf(seq)) }
@@ -580,6 +595,55 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
           seq.io.pipe_write_req.request && !arb.io.available(c)
         }.reduce(_ || _))
       counters.priorityIssues := diagnosticCount(s"${factory.name}_priorityIssues", arb.io.priorityIssue)
+      if (vParams.diagnosticCounters) {
+        counters.lookaheadEligible := diagnosticCount(s"diag_${factory.name}_lookaheadEligible", lookaheadEligible)
+        counters.lookaheadIdle := diagnosticCount(s"diag_${factory.name}_lookaheadIdle", lookaheadEligible && !xu.io.iss.fire)
+        val ordinaryBlocked = queue.io.deq.valid && !queue.io.deq.bits.reduction && !queue.io.deq.ready
+        counters.ordinaryFull := diagnosticCount(s"diag_${factory.name}_ordinaryFull", ordinaryBlocked)
+        counters.ordinaryFullIdle := diagnosticCount(s"diag_${factory.name}_ordinaryFullIdle",
+          ordinaryBlocked && !xu.io.iss.fire)
+        counters.reductionFull := diagnosticCount(s"diag_${factory.name}_reductionFull",
+          queue.io.deq.valid && queue.io.deq.bits.reduction && !queue.io.deq.ready)
+        counters.operandsReadyIdle := diagnosticCount(s"diag_${factory.name}_operandsReadyIdle",
+          seqs.map(_.io.operandsReady).reduce(_ || _) && !xu.io.iss.fire)
+        counters.eligibleIdle := diagnosticCount(s"diag_${factory.name}_eligibleIdle",
+          arb.io.out.valid && !xu.io.iss.fire)
+        counters.readyLosers := diagnosticCount(s"diag_${factory.name}_readyLosers", PopCount(VecInit(
+          arb.io.in.zip(arb.io.available).map { case (in, available) =>
+            in.valid && available && !in.fire && xu.io.iss.fire
+          })))
+        counters.bankReservation := diagnosticCount(s"diag_${factory.name}_bankReservation",
+          seqs.map(s => s.io.pipe_write_req.request &&
+            !vrf.io.vxs(flat_vxs.indexOf(s)).pipe_write_req.available).reduce(_ || _))
+        counters.contextCycles := diagnosticCount(s"diag_${factory.name}_contextCycles",
+          PopCount(VecInit(seqs.map(_.io.busy))))
+        val target = seqs.map(_.accepts(vdq.io.deq.bits)).reduce(_ || _)
+        counters.dispatchReduction := diagnosticCount(s"diag_${factory.name}_dispatchReduction",
+          vdq.io.deq.valid && target && reductionBlocked)
+        for ((stage, j) <- EvuReductionStage.names.zipWithIndex) {
+          def matches(op: ExecuteMicroOp): Bool = op.acc && (j match {
+            case 0 => !op.acc_merge && !op.acc_fold
+            case 1 => op.acc_merge
+            case 2 => op.acc_fold
+            case _ => false.B
+          })
+          val issued = xu.io.iss.fire && matches(xu.io.iss.bits)
+          val stat = counters.stages(j)
+          stat.issues := diagnosticCount(s"diag_${factory.name}_${stage}_issues", issued)
+          stat.elements16 := diagnosticCount(s"diag_${factory.name}_${stage}_elements16",
+            Mux(issued && xu.io.iss.bits.vd_eew === 1.U, EvuOpClass.elements(xu.io.iss.bits, 1), 0.U))
+          stat.elements32 := diagnosticCount(s"diag_${factory.name}_${stage}_elements32",
+            Mux(issued && xu.io.iss.bits.vd_eew === 2.U, EvuOpClass.elements(xu.io.iss.bits, 2), 0.U))
+          stat.feedback := diagnosticCount(s"diag_${factory.name}_${stage}_feedback", PopCount(VecInit(
+            seqs.map(s => matches(s.io.iss.bits) && s.io.busy && s.io.waitReason.feedback))))
+          stat.operands := diagnosticCount(s"diag_${factory.name}_${stage}_operands", PopCount(VecInit(
+            seqs.map(s => matches(s.io.iss.bits) && s.io.busy && s.io.waitReason.operands))))
+          stat.resultReadyWait := diagnosticCount(s"diag_${factory.name}_${stage}_resultReadyWait", PopCount(VecInit(
+            seqs.map(s => matches(s.io.iss.bits) && s.io.busy && s.io.acc_valid && !s.io.iss.fire))))
+          stat.returnIssues := diagnosticCount(s"diag_${factory.name}_${stage}_returnIssues",
+            PopCount(VecInit(seqs.map(s => matches(s.io.iss.bits) && s.io.iss.fire && s.io.acc_return))))
+        }
+      }
     }
     if (factory.name == "fp_fma") {
       val previousVat = RegEnable(xu.io.iss.bits.vat, xu.io.iss.fire)
@@ -671,12 +735,14 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   io.index_access.ready := frontend_rindex.req.ready && !index_access_hazard
   frontend_rindex.req.bits.eg  := index_access_eg
   frontend_rindex.req.bits.oldest  := false.B
+  frontend_rindex.req.bits.lastOperand := false.B
   io.index_access.idx   := frontend_rindex.resp >> ((io.index_access.eidx << io.index_access.eew)(dLenOffBits-1,0) << 3) & eewBitMask(io.index_access.eew)
 
   val vm_busy = Wire(Bool())
   frontend_rmask.req.valid    := io.mask_access.valid && !vm_busy
   frontend_rmask.req.bits.eg  := getEgId(0.U, io.mask_access.eidx, 0.U, true.B)
   frontend_rmask.req.bits.oldest := false.B
+  frontend_rmask.req.bits.lastOperand := false.B
   io.mask_access.ready  := frontend_rmask.req.ready && !vm_busy
   io.mask_access.mask   := frontend_rmask.resp >> io.mask_access.eidx(log2Ceil(dLen)-1,0)
 
@@ -757,6 +823,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   }
   for (vxs <- flat_vxs) {
     vxs.io.acc_valid := false.B
+    vxs.io.acc_return := false.B
     if (vxs.usesAcc) {
       for (seq <- reductionSeqs) {
         when (vxs.io.vat === seq.io.vat && vxs.io.busy && seq.io.busy) {
@@ -765,6 +832,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
           seq.io.acc_other_slot := vxs.io.acc_other_slot
           seq.io.acc_merge := vxs.io.acc_merge
           vxs.io.acc_valid := seq.io.acc_data.valid
+          vxs.io.acc_return := seq.io.acc_return
           when (vxs.io.iss.fire && vxs.io.iss.bits.tail && vxs.io.iss.bits.acc) {
             seq.io.acc_done := true.B
           }
@@ -815,6 +883,97 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   clearVat(writeCompletion.io.release.valid, writeCompletion.io.release.bits)
   clearVat(vss.io.iss.fire && vss.io.iss.bits.tail, vss.io.iss.bits.vat)
   flat_vxus.foreach(_ => clearVat(false.B, 0.U))
+
+  if (vParams.diagnosticCounters && xissParams.flatMap(_.seqs).exists(s => EvuFuPerf.names.contains(s.name))) {
+    val fpSeqs = contextsByFu.zip(xissParams.flatMap(_.seqs)).collect {
+      case (seqs, factory) if EvuFuPerf.names.contains(factory.name) => seqs
+    }.flatten
+    val fpUnits = flat_vxus.zip(xissParams.flatMap(_.seqs)).collect {
+      case (unit, factory) if EvuFuPerf.names.contains(factory.name) => unit
+    }
+    val classes = fpUnits.map(u => EvuOpClass(u.io.iss.bits))
+    val seqClasses = fpSeqs.map(s => EvuOpClass(s.io.iss.bits))
+    val laneCounts = Seq(1, 2).map(sew => fpUnits.map(u => EvuOpClass.elements(u.io.iss.bits, sew)))
+    val trace = PlusArg("evu_cmd_trace", width = 1)
+    val ticks = RegInit(0.U(64.W)).suggestName("diag_ticks")
+    ticks := ticks + 1.U
+    val n = 1 << vParams.vatSz
+    val entered = Reg(Vec(n, UInt(64.W))).suggestName("diag_entered")
+    val contextAt = Reg(Vec(n, UInt(64.W))).suggestName("diag_contextAt")
+    val started = Reg(Vec(n, UInt(64.W))).suggestName("diag_started")
+    val hasStarted = RegInit(VecInit.fill(n)(false.B)).suggestName("diag_hasStarted")
+    val kinds = Reg(Vec(n, UInt(EvuOpClass.width.W))).suggestName("diag_kinds")
+    when(io.dis.fire) {
+      entered(io.dis.bits.vat) := ticks
+      hasStarted(io.dis.bits.vat) := false.B
+    }
+    for (unit <- fpUnits) {
+      when(unit.io.iss.fire && unit.io.iss.bits.head) {
+        val vat = unit.io.iss.bits.vat
+        started(vat) := ticks
+        hasStarted(vat) := true.B
+        kinds(vat) := EvuOpClass(unit.io.iss.bits)
+      }
+    }
+    val done = writeCompletion.io.release
+    val elapsed = ticks - started(done.bits)
+    for ((name, k) <- EvuOpClass.names.zipWithIndex) {
+      val stat = io.executionPerf.byOp(k)
+      val fires = fpUnits.zip(classes).map { case (u, cls) => u.io.iss.fire && cls === k.U }
+      stat.instructions := diagnosticCount(s"diag_${name}_instructions", PopCount(VecInit(
+        fpUnits.zip(fires).map { case (u, fire) => fire && u.io.iss.bits.head })))
+      stat.issues := diagnosticCount(s"diag_${name}_issues", PopCount(VecInit(fires)))
+      def elements(sew: Int): UInt = fpUnits.zip(fires).zip(laneCounts(sew - 1)).map { case ((u, fire), lanes) =>
+        val lowp = xiangshan.evu.EvuLowPrecision.backend(u.io.iss.bits.funct3, u.io.iss.bits.funct6)
+        Mux(fire && Mux(lowp, (sew == 2).B, u.io.iss.bits.vd_eew === sew.U), lanes, 0.U)
+      }.reduce(_ +& _)
+      stat.elements16 := diagnosticCount(s"diag_${name}_elements16", elements(1))
+      stat.elements32 := diagnosticCount(s"diag_${name}_elements32", elements(2))
+      def waits(reason: ExecuteWaitSignals => Bool): UInt = PopCount(VecInit(
+        fpSeqs.zip(seqClasses).map { case (s, cls) => s.io.busy && cls === k.U && reason(s.io.waitReason) }))
+      stat.dependency := diagnosticCount(s"diag_${name}_dependency", waits(_.dependency))
+      stat.operands := diagnosticCount(s"diag_${name}_operands", waits(_.operands))
+      stat.feedback := diagnosticCount(s"diag_${name}_feedback", waits(_.feedback))
+      val completed = done.valid && hasStarted(done.bits) && kinds(done.bits) === k.U
+      stat.completed := diagnosticCount(s"diag_${name}_completed", completed)
+      stat.latency := diagnosticCount(s"diag_${name}_latency", Mux(completed, elapsed, 0.U))
+    }
+    when(done.valid && hasStarted(done.bits)) {
+      when(trace.asBool && !reset.asBool) {
+        printf(p"[EVU-CMD-EXEC] event=complete vat=${done.bits} op=${kinds(done.bits)} queue=${contextAt(done.bits) - entered(done.bits)} first_wait=${started(done.bits) - contextAt(done.bits)} execute=${elapsed}\n")
+      }
+      hasStarted(done.bits) := false.B
+    }
+    // Per-context counters avoid a PC-indexed hardware table. The wrapper emits
+    // the VAT/job/epoch/PC mapping; the host joins records within that lifetime.
+    for ((s, index) <- fpSeqs.zipWithIndex) {
+      val accepted = Reg(UInt(64.W)).suggestName(s"diag_contextStart_$index")
+      val dep = RegInit(0.U(32.W)).suggestName(s"diag_contextDep_$index")
+      val operands = RegInit(0.U(32.W)).suggestName(s"diag_contextOperands_$index")
+      val feedback = RegInit(0.U(32.W)).suggestName(s"diag_contextFeedback_$index")
+      val wb = RegInit(0.U(32.W)).suggestName(s"diag_contextWb_$index")
+      val execution = RegInit(0.U(32.W)).suggestName(s"diag_contextExecution_$index")
+      when(s.io.busy) {
+        dep := dep + s.io.waitReason.dependency
+        operands := operands + s.io.waitReason.operands
+        feedback := feedback + s.io.waitReason.feedback
+        wb := wb + s.io.waitReason.writeback
+        execution := execution + s.io.waitReason.execution
+      }
+      when(s.io.iss.fire && s.io.iss.bits.tail && trace.asBool && !reset.asBool) {
+        printf(p"[EVU-CMD-EXEC] event=tail vat=${s.io.vat} op=${EvuOpClass(s.io.iss.bits)} context=${index.U} residence=${ticks - accepted} dep=${dep} operand=${operands} feedback=${feedback} wb=${wb} execution=${execution}\n")
+      }
+      when(s.io.dis.fire) {
+        accepted := ticks
+        contextAt(s.io.dis.bits.vat) := ticks
+        dep := 0.U
+        operands := 0.U
+        feedback := 0.U
+        wb := 0.U
+        execution := 0.U
+      }
+    }
+  }
 
   // Accumulate each instruction's active-element flags through its final writeback.
   val fflagsByVat = RegInit(VecInit.fill(1 << vParams.vatSz)(0.U(5.W)))

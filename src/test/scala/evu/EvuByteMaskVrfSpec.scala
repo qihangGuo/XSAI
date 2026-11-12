@@ -22,6 +22,8 @@ class EvuByteMaskVrfSpec extends AnyFlatSpec with ChiselScalatestTester {
   private def initialize(dut: AraRegisterFile): Unit = {
     dut.io.read(0)(0).req.valid.poke(false.B)
     dut.io.mask_read(0)(0).req.valid.poke(false.B)
+    dut.io.read(0)(0).req.bits.lastOperand.poke(false.B)
+    dut.io.mask_read(0)(0).req.bits.lastOperand.poke(false.B)
     dut.io.pipe_writes(0).valid.poke(false.B)
     dut.io.ll_writes(0).valid.poke(false.B)
     val req = dut.io.pipe_write_reqs(0)
@@ -66,6 +68,7 @@ class EvuByteMaskVrfSpec extends AnyFlatSpec with ChiselScalatestTester {
           ports.foreach { port =>
             port.req.bits.eg.poke(7.U)
             port.req.bits.oldest.poke(true.B)
+            port.req.bits.lastOperand.poke(false.B)
             port.req.valid.poke(true.B)
             port.req.ready.expect(true.B)
           }

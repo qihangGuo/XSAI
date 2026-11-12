@@ -37,6 +37,9 @@ class EvuVmuLineCoalescerSpec extends AnyFlatSpec with ChiselScalatestTester wit
           r.bits.write.poke(true.B)
         }
         def retire(): Unit = {
+          // Hold the logical response to test locks through delivery, whether
+          // the physical response is bypassed or buffered.
+          dut.io.client.resp.ready.poke(false.B)
           dut.io.client.req.valid.poke(false.B)
           dut.io.drain.poke(true.B)
           dut.io.memory.req.valid.expect(true.B)
@@ -52,6 +55,7 @@ class EvuVmuLineCoalescerSpec extends AnyFlatSpec with ChiselScalatestTester wit
           dut.clock.step()
           dut.io.memory.resp.valid.poke(false.B)
           dut.io.client.resp.valid.expect(true.B)
+          dut.io.client.resp.ready.poke(true.B)
           dut.clock.step()
           dut.io.busy.expect(false.B)
         }
@@ -244,12 +248,14 @@ class EvuVmuLineCoalescerSpec extends AnyFlatSpec with ChiselScalatestTester wit
         dut.io.memory.resp.bits.tag.poke(tag.U)
         dut.io.memory.resp.bits.error.poke(true.B)
         dut.io.memory.resp.bits.fault.poke(EvuFault.Bus)
+        dut.io.client.resp.ready.poke(false.B)
         dut.clock.step()
         dut.io.memory.resp.valid.poke(false.B)
         dut.io.client.resp.valid.expect(true.B)
         dut.io.client.resp.bits.tag.expect(6.U)
         dut.io.client.resp.bits.error.expect(true.B)
         dut.io.client.resp.bits.fault.expect(EvuFault.Bus)
+        dut.io.client.resp.ready.poke(true.B)
         dut.clock.step(3)
         dut.io.busy.expect(false.B)
       }
@@ -408,11 +414,11 @@ class EvuVmuLineCoalescerSpec extends AnyFlatSpec with ChiselScalatestTester wit
           dut.io.memory.resp.valid.poke(true.B)
           dut.io.memory.resp.bits.tag.poke(tag.U)
           dut.io.memory.resp.ready.expect(true.B)
-          dut.clock.step()
-          dut.io.memory.resp.valid.poke(false.B)
           dut.io.client.resp.valid.expect(true.B)
           dut.io.client.resp.bits.tag.expect((state % 8).U)
           dut.clock.step()
+          dut.io.memory.resp.valid.poke(false.B)
+          dut.io.client.resp.valid.expect(false.B)
           dut.io.busy.expect(false.B)
         }
         collectionCycles shouldBe 0

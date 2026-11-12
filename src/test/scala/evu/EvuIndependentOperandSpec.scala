@@ -40,6 +40,8 @@ class EvuIndependentOperandHarness(implicit p: Parameters) extends CoreModule wi
   seq.io.older_reads := io.olderReads
   seq.io.vat_head := 0.U
   seq.io.acc_valid := io.feedback
+  seq.io.acc_return := false.B
+  seq.io.lookahead := 0.U.asTypeOf(seq.io.lookahead)
   seq.io.iss.ready := io.issueReady
   seq.io.pipe_write_req.available := io.writebackReady
   seq.io.vgu.slide_req.ready := true.B

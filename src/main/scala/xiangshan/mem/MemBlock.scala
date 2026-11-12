@@ -834,8 +834,6 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
     // Drain older scalar stores before EVU can read their input or overwrite it.
     checker.io.range.req.valid := range.req.valid && io.mem_to_ooo.sbIsEmpty
     range.req.ready := checker.io.range.req.ready && io.mem_to_ooo.sbIsEmpty
-    checker.io.allowPhysicalLaunch := tlbcsr.satp.mode === 0.U && !tlbcsr.priv.virt &&
-      tlbcsr.priv.imode === CSRConst.ModeM && tlbcsr.priv.dmode === CSRConst.ModeM
     val tlb = dtlb_evu.get.requestor.head
     val permission = pmp_check.last.resp
     val pipeline = Module(new EvuPreflightPipeline)
@@ -844,6 +842,8 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
     pipeline.io.cancel := range.cancel
     pipeline.io.permissionFault := permission.ld || permission.st || permission.mmio
     val firstAddress = RegEnable(range.req.bits.base, range.req.fire)
+    // The range checker can send its first lookup in the acceptance cycle.
+    val lookupBase = Mux(range.req.fire, range.req.bits.base, firstAddress)
     val lookup = pipeline.io.translation.request
     val address = lookup.bits.check.vaddr
     val write = lookup.bits.check.write
@@ -851,7 +851,7 @@ class MemBlockInlinedImp(outer: MemBlockInlined) extends LazyModuleImp(outer)
     lookup.ready := tlb.req.ready
     tlb.req.bits := 0.U.asTypeOf(tlb.req.bits)
     tlb.req.bits.vaddr := address
-    tlb.req.bits.fullva := Mux(address < firstAddress, firstAddress, address)
+    tlb.req.bits.fullva := Mux(address < lookupBase, lookupBase, address)
     tlb.req.bits.checkfullva := true.B
     tlb.req.bits.cmd := Mux(write, TlbCmd.write, TlbCmd.read)
     tlb.req.bits.size := 6.U

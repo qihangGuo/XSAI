@@ -453,7 +453,7 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
 
   // Ordinary EVU memory has already passed non-speculative preflight when it
   // retires. Let the next command enter while its external Ack is outstanding.
-  // WAIT/FENCE, configuration and other backward barriers still drain EVU.
+  // FENCE, configuration and other backward barriers still drain EVU.
   backwardBarrier.io.robEmpty := isEmpty
   backwardBarrier.io.evuBusy := amuBuffer.map(_.io.evuBusy).getOrElse(false.B)
   // When any instruction commits, hasNoSpecExec should be set to false.B
@@ -856,6 +856,20 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
   val traceBlock = io.trace.blockCommit
   val blockCommit = misPredBlock || lastCycleFlush || hasWFI || io.redirect.valid ||
     (deqNeedFlush && !deqHasFlushed) || deqFlushBlock || criticalErrorState || traceBlock
+
+  if (env.EnableDifftest && p(ExternalVectorKey).enable) {
+    // Report once per long-stalled matrix configuration, before the generic
+    // commit watchdog loses the distinction between writeback and flush waits.
+    val sameHead = RegNext(deqPtr.asUInt) === deqPtr.asUInt
+    val mcfgWait = RegInit(0.U(11.W))
+    val waiting = deqPtrEntryValid && deqPtrEntry.isMsetcfg.get && !deqHasCommitted
+    when(waiting && sameHead) {
+      when(!mcfgWait.andR) { mcfgWait := mcfgWait + 1.U }
+    }.otherwise { mcfgWait := 0.U }
+    when(waiting && sameHead && mcfgWait === 1023.U) {
+      printf(p"[EVU-MCFG-STALL] pc=0x${Hexadecimal(debug_deqUop.pc)} rob=${deqPtr.asUInt} wb=${deqPtrEntry.commit_w} uops=${robEntries(deqPtr.value).uopNum} std_wb=${robEntries(deqPtr.value).stdWritebacked} need_flush=${deqPtrEntry.needFlush} flushed=${deqHasFlushed} record=${exceptionDataRead.valid} record_rob=${exceptionDataRead.bits.robIdx.asUInt} record_match=${deqHitExceptionGenState} record_flush=${exceptionDataRead.bits.flushPipe} evu_busy=${evuTrapBlocked} can_flush=${deqCanFlushPipe} blocked=${blockCommit} state=${state}\n")
+    }
+  }
 
   io.commits.isWalk := state === s_walk
   io.commits.isCommit := state === s_idle && !blockCommit

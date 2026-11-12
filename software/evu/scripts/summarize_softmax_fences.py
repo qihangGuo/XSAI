@@ -8,11 +8,30 @@ from pathlib import Path
 
 
 FIELDS = re.compile(r"(\w+)=[ \t]*([^\s\[]+)")
-RECORD = re.compile(r"\[EVU-(VMU|EXE|FU|PREFLIGHT)\]\s+|\[OS\]\s+(?=(?:r|first)=)")
-HARDWARE = re.compile(r"\[EVU-(?:VMU|EXE|FU|PREFLIGHT)\]\s+")
+KINDS = "VMU|EXE|FU|PREFLIGHT|SCHED|OP|RED|READ|MEM|LAT|CONFIG|HANDOFF|TAIL|READHINT"
+RECORD = re.compile(r"\[EVU-(" + KINDS + r")\]\s+|\[OS\]\s+(?=(?:r|first)=)")
+HARDWARE = re.compile(r"\[EVU-(?:" + KINDS + r")\]\s+")
 GUEST = re.compile(r"\[OS\]\s+(?:r=|first=|DONE\b|PASS\b)[^\r\n]*(?:\r?\n)?")
 PATHS = ("fp_fma", "fp_cmp", "fp_exp")
 REQUIRED = {"VMU", "EXE"} | {"FU:" + path for path in PATHS}
+DIAGNOSTICS = {
+    "HANDOFF": (("path",), ("eligible", "idle")),
+    "TAIL": (("path", "stage"), ("ready_wait", "return_issue")),
+    "READHINT": (("path",), ("last_grant", "last_block")),
+    "SCHED": (("path",), ("ordinary", "ordinary_idle", "reduction", "ready_idle", "eligible_idle",
+                            "losers", "bank_reserve", "contexts", "dispatch_red")),
+    "OP": (("op",), ("inst", "issue", "e16", "e32", "dep", "operand", "feedback", "completed", "latency")),
+    "RED": (("path", "stage"), ("issue", "e16", "e32", "feedback", "operand")),
+    "READ": (("path",), ("request", "grant", "read_block", "write_block", "response", "held", "pf_used")),
+    "MEM": ((), ("load", "store", "load_bytes", "store_bytes", "logical_load", "logical_store",
+                 "no_tag", "downstream", "load_lost", "store_lost", "response_block", "cancelled")),
+    "LAT": (("bucket",), ("load", "store")),
+}
+
+
+def snapshot_key(kind, sample):
+    labels = ("path",) if kind == "FU" else DIAGNOSTICS.get(kind, ((), ()))[0]
+    return ":".join((kind,) + tuple(sample[label] for label in labels))
 
 
 def fields(text):
@@ -54,6 +73,14 @@ def summarize_run(header, fences, results):
             if key in result:
                 values.append(key + "=" + result[key])
         output.append("[OS-INT] " + " ".join(values))
+        if "CONFIG" in start or "CONFIG" in end:
+            if "CONFIG" not in start or "CONFIG" not in end:
+                raise ValueError("incomplete formal CONFIG snapshot")
+            keys = ("dlen", "mlen", "vlen", "fma_contexts", "reduction_contexts")
+            if any(start["CONFIG"][k] != end["CONFIG"][k] for k in keys):
+                raise ValueError("configuration changed inside formal interval")
+            output.append("[OS-CONFIG] first=" + result["first"] + " " + " ".join(
+                key + "=" + end["CONFIG"][key] for key in keys))
         for kind, prefix, keys in (
             ("VMU", "OS-VMU", ("cmd", "tag", "get", "put", "partial", "full", "ack", "entry", "win", "merge",
                                "rmwget", "rmwmerge")),
@@ -68,7 +95,7 @@ def summarize_run(header, fences, results):
         for path in PATHS:
             kind = "FU:" + path
             values = ["first=" + result["first"], "path=" + path]
-            for key in ("issue", "dep", "operand", "feedback", "wb", "fu", "queue",
+            for key in ("issue", "dep", "operand", "feedback", "wb", "fu", "queue", "dispatch",
                         "idle", "arb", "qi", "slot", "pri", "nowork", "loadwait", "fwait"):
                 if key in start[kind] or key in end[kind]:
                     values.append(key + "=" + str(counter_delta(start[kind], end[kind], key)))
@@ -81,10 +108,20 @@ def summarize_run(header, fences, results):
                         "tlbreq", "tlbmiss", "sbwait", "outputwait", "serialwait"):
                 values.append(key + "=" + str(counter_delta(start["PREFLIGHT"], end["PREFLIGHT"], key)))
             output.append("[OS-PREFLIGHT] " + " ".join(values))
+        for kind in sorted(set(start) | set(end)):
+            tag = kind.split(":")[0]
+            if tag not in DIAGNOSTICS:
+                continue
+            if kind not in start or kind not in end:
+                raise ValueError("incomplete formal diagnostic snapshot: " + kind)
+            labels, keys = DIAGNOSTICS[tag]
+            values = ["first=" + result["first"]] + [label + "=" + end[kind][label] for label in labels]
+            values += [key + "=" + str(counter_delta(start[kind], end[kind], key)) for key in keys]
+            output.append("[OS-" + tag + "] " + " ".join(values))
     return output
 
 
-def records(lines):
+def records(lines, hardware=HARDWARE):
     # UART can interrupt even a hardware field name ("no[OS] ...\nwork=").
     # Extract complete guest lines and reconnect the interrupted hardware text.
     pending = ""
@@ -95,7 +132,7 @@ def records(lines):
                 pending = ""
             yield guest.group()
         clean = GUEST.sub("", line)
-        matches = list(HARDWARE.finditer(clean))
+        matches = list(hardware.finditer(clean))
         if matches:
             if pending:
                 yield pending + clean[:matches[0].start()]
@@ -135,9 +172,7 @@ def summarize(lines):
                     results.append(sample)
             elif header is not None:
                 fence = int(sample["fence"])
-                kind = match.group(1)
-                if kind == "FU":
-                    kind += ":" + sample["path"]
+                kind = snapshot_key(match.group(1), sample)
                 group = fences.setdefault(fence, {})
                 if kind in group:
                     raise ValueError("duplicate snapshot at fence {}: {}".format(fence, kind))
@@ -160,9 +195,7 @@ def format_table(summary):
                 cases = []
             cases.append({"INT": sample})
         else:
-            kind = tag[len("[OS-"):]
-            if kind == "FU":
-                kind += ":" + sample["path"]
+            kind = snapshot_key(tag[len("[OS-"):], sample)
             cases[-1][kind] = sample
     if cases:
         runs.append(cases)
@@ -197,6 +230,16 @@ def format_table(summary):
     )
 
     def cell(case, kind, key):
+        if key == "fp32_lane_pct":
+            sample = case.get(kind, {})
+            dlen = case.get("CONFIG", {}).get("dlen")
+            issues = int(sample.get("issue", "0"))
+            if not dlen or not issues or int(sample.get("e16", "0")):
+                return "-"
+            return "{:.1f}%".format(100 * int(sample["e32"]) / (issues * (int(dlen) // 32)))
+        if key == "avg_latency":
+            count = int(case.get(kind, {}).get("completed", "0"))
+            return "{:.1f}".format(int(case[kind]["latency"]) / count) if count else "-"
         value = case.get(kind, {}).get(key)
         if value is None:
             return "-"
@@ -221,6 +264,43 @@ def format_table(summary):
             for label, kind, key in rows:
                 output.append("  {:<30}".format(label) + "".join(
                     "{:>14}".format(cell(case, kind, key)) for case in run))
+        extra = (
+            ("Read and tail scheduling", (
+                ("FMA last-operand grants", "READHINT:fp_fma", "last_grant"),
+                ("EXP2 lookahead eligible", "HANDOFF:fp_exp", "eligible"),
+                ("EXP2 eligible while idle", "HANDOFF:fp_exp", "idle"),
+                ("Sum fold ready but waiting", "TAIL:fp_fma:fold", "ready_wait"),
+                ("Sum fold same-cycle returns", "TAIL:fp_fma:fold", "return_issue"))),
+            ("FMA scheduling (cycles unless labelled)", (
+                ("Ordinary context blocked", "SCHED:fp_fma", "ordinary"),
+                ("Blocked while FMA idle", "SCHED:fp_fma", "ordinary_idle"),
+                ("Operands ready, no issue", "SCHED:fp_fma", "ready_idle"),
+                ("Eligible, no issue", "SCHED:fp_fma", "eligible_idle"),
+                ("Ready loser context-cycles", "SCHED:fp_fma", "losers"),
+                ("Write bank reservation wait", "SCHED:fp_fma", "bank_reserve"))),
+            ("VMU request diagnostics", (
+                ("Logical load bytes", "MEM", "logical_load"),
+                ("Requested load beat bytes", "MEM", "load_bytes"),
+                ("Enabled store bytes", "MEM", "store_bytes"),
+                ("No free local tag cycles", "MEM", "no_tag"),
+                ("Downstream blocked cycles", "MEM", "downstream"))),
+        )
+        for title, rows in extra:
+            if any(kind in case for _, kind, _ in rows for case in run):
+                output.append(title)
+                for label, kind, key in rows:
+                    output.append("  {:<30}".format(label) + "".join(
+                        "{:>14}".format(cell(case, kind, key)) for case in run))
+        op_kinds = sorted({kind for case in run for kind in case if kind.startswith("OP:")})
+        if op_kinds:
+            output.append("Per-op issues / active FP32 / mean issue-to-completion cycles")
+            for kind in op_kinds:
+                if not any(int(case.get(kind, {}).get("issue", "0")) for case in run):
+                    continue
+                for key, suffix in (("issue", "issues"), ("e32", "FP32 lanes"),
+                                    ("fp32_lane_pct", "FP32 lane use"), ("avg_latency", "mean cycles")):
+                    output.append("  {:<30}".format(kind[3:] + " " + suffix) + "".join(
+                        "{:>14}".format(cell(case, kind, key)) for case in run))
     output.append("Counter rows overlap; do not add them. '-' means unavailable.")
     return output
 

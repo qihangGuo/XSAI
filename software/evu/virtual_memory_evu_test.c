@@ -72,7 +72,7 @@ static void trap_body(void) {
   if (fault_stage == 1 && cause == 13 && address == 0x40001000) {
     /* A faulting load must preserve its destination register in full. */
     XV_STORE(3, checkpoint, 2);
-    XV_WAIT();
+    XV_FENCE();
     for (unsigned i = 0; i < EVU_ELEMENTS; ++i)
       if (checkpoint[i] != 0x12340000u + i) ++failures;
     leaves[1] = pte(input_pages[2], PTE_RW);
@@ -119,7 +119,7 @@ static void supervisor_main(void) {
   __asm__ volatile ("fence rw, rw" ::: "memory");
   XV_LOAD(3, (void *)INPUT_VA, 2);
   XV_STORE(3, (void *)OUTPUT_VA, 2);
-  XV_WAIT();
+  XV_FENCE();
   for (unsigned i = 0; i < EVU_ELEMENTS; ++i)
     if (*element(output_pages, i) != values[i]) ++failures;
   if (!guards_ok(input_pages) || !guards_ok(output_pages)) ++failures;
@@ -129,21 +129,21 @@ static void supervisor_main(void) {
   /* Reinstall the known register pattern before testing a faulting load. */
   for (unsigned i = 0; i < EVU_ELEMENTS; ++i) checkpoint[i] = 0x12340000u + i;
   XV_LOAD(3, checkpoint, 2);
-  XV_WAIT();
+  XV_FENCE();
   leaves[1] = 0;
   fault_stage = 1;
   __asm__ volatile ("fence rw, rw\nsfence.vma zero, zero" ::: "memory");
   XV_LOAD(3, (void *)INPUT_VA, 2);
-  XV_WAIT();
+  XV_FENCE();
 
   /* Restore nonzero data so a partial faulting store cannot go unnoticed. */
   XV_LOAD(3, checkpoint, 2);
-  XV_WAIT();
+  XV_FENCE();
   leaves[1] = pte(input_pages[2], 0xc3); // V/R/A/D, write denied.
   fault_stage = 2;
   __asm__ volatile ("fence rw, rw\nsfence.vma zero, zero" ::: "memory");
   XV_STORE(3, (void *)INPUT_VA, 2);
-  XV_WAIT();
+  XV_FENCE();
   for (unsigned i = 0; i < EVU_ELEMENTS; ++i)
     if (*element(input_pages, i) != checkpoint[i]) ++failures;
   if (!guards_ok(input_pages) || !guards_ok(output_pages)) ++failures;

@@ -7,7 +7,8 @@ import freechips.rocketchip.tile.{CoreModule}
 import freechips.rocketchip.util._
 import xiangshan.evu.common._
 
-class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0, reductionContexts: Int = 1)(implicit p: Parameters)
+class RegisterAccess(exSeqs: Int, maxExuDepth: Int, reductionContexts: Int = 1,
+    executionClasses: Seq[Int] = Seq.empty)(implicit p: Parameters)
     extends CoreModule()(p) with HasVectorParams {
   val io = IO(new Bundle {
     val vls = new Bundle {
@@ -45,9 +46,6 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0, reduc
     val pendingWrites = Output(Vec(vParams.vrfBanking, Valid(new VectorWriteHazard)))
     val debug = Option.when(vParams.debugVrf)(Output(Vec(egsTotal, UInt(dLen.W))))
     val perf = Output(new VrfPerf)
-    val special = new Bundle {
-      val read = Vec(specialReads, Flipped(new VectorReadIO))
-    }
   })
 
   // The execute path has a logical 3R1W operand shape.  RegisterFile maps
@@ -58,15 +56,22 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0, reduc
 
   // Mask read arbitrates between <- [vxs], vls, vss, vps, frontend-mask
 
+  require(executionClasses.isEmpty || executionClasses.size == exSeqs)
+  private val exClasses = if (executionClasses.isEmpty) Seq.fill(exSeqs)(4) else executionClasses
+  // Must follow RegisterFile's data-group order, then its mask-group order.
+  private val readClasses = exClasses ++ Seq.fill(reductionContexts)(4) ++
+    exClasses ++ Seq(4) ++ exClasses ++ Seq(3) ++
+    exClasses ++ Seq(4, 3) ++ Seq.fill(reductionContexts)(4) ++ Seq(4)
   val vrf = Module(new RegisterFile(
-    reads = Seq(reductionContexts + exSeqs, 1 + exSeqs, 1 + exSeqs) ++ (if (specialReads > 0) Seq(specialReads) else Seq.empty),
+    reads = Seq(reductionContexts + exSeqs, 1 + exSeqs, 1 + exSeqs),
     maskReads = Seq(3 + reductionContexts + exSeqs),
     pipeWrites = exSeqs,
     llWrites = exSeqs + 2, // load + reset
     maxExuDepth,
     prefetchPorts = (0 until exSeqs).flatMap(i => (0 until 3).map(group => (group, i))),
     trackWrites = true,
-    scalarPorts = (0 until exSeqs).flatMap(i => (0 until 3).map(group => (group, i))) :+ (2, exSeqs)
+    scalarPorts = (0 until exSeqs).flatMap(i => (0 until 3).map(group => (group, i))) :+ (2, exSeqs),
+    readClasses = readClasses
   ))
   val resetting = RegInit(true.B)
   io.perf := vrf.io.perf
@@ -126,12 +131,6 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0, reduc
   vrf.io.read(1)(exSeqs) <> io.frontend.rindex
   vrf.io.read(2)(exSeqs) <> io.vss.rvd
 
-  if (specialReads > 0) {
-    for (i <- 0 until specialReads) {
-      vrf.io.read(3)(i) <> io.special.read(i)
-    }
-  }
-
   vrf.io.mask_read(0)(exSeqs)   <> io.vls.rvm
   vrf.io.mask_read(0)(exSeqs+1) <> io.vss.rvm
   vrf.io.mask_read(0)(exSeqs+2+reductionContexts) <> io.frontend.rmask
@@ -150,7 +149,6 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, specialReads: Int = 0, reduc
     io.vps.foreach(_.rvm.req.ready := false.B)
     io.frontend.rindex.req.ready := false.B
     io.frontend.rmask.req.ready := false.B
-    io.special.read.foreach(_.req.ready := false.B)
     io.load_write.ready := false.B
     io.iter_writes.foreach(_.ready := false.B)
     io.vxs.foreach(_.pipe_write_req.available := false.B)

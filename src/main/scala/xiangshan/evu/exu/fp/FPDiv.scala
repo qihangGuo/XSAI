@@ -240,11 +240,21 @@ case object FPDivSqrtFactory extends FunctionalUnitFactory {
   def generate(implicit p: Parameters) = new FPDivSqrt()(p)
 }
 
-class FPDivSqrt(implicit p: Parameters) extends IterativeFunctionalUnit()(p) with HasFPUParameters {
-  val supported_insns = FPDivSqrtFactory.insns
+case object SIMDFPDivSqrtFactory extends FunctionalUnitFactory {
+  private val arithmetic = Seq(FDIV.VV, FDIV.VF, FRDIV.VF, FSQRT_V)
+  def insns = arithmetic.flatMap(_.restrictSEW(2)).map(_.iterative) ++
+    arithmetic.flatMap(_.restrictSEW(1)).map(_.elementWise.iterative) ++
+    Seq(FRSQRT7_V, FREC7_V, FCLASS_V).flatMap(_.restrictSEW(1, 2)).map(_.elementWise.iterative)
+
+  def generate(implicit p: Parameters) = new FPDivSqrt(parallelFp32 = true)
+}
+
+class FPDivSqrt(parallelFp32: Boolean = false)(implicit p: Parameters)
+    extends IterativeFunctionalUnit()(p) with HasFPUParameters {
+  val supported_insns = if (parallelFp32) SIMDFPDivSqrtFactory.insns else FPDivSqrtFactory.insns
   io.set_vxsat := false.B
 
-  val fTypes = Seq(FType.S, FType.H)
+  val fTypes = if (parallelFp32) Seq(FType.H) else Seq(FType.S, FType.H)
 
   val divSqrts = fTypes.map { ft =>
     Module(new hardfloat.DivSqrtRecFN_small(ft.exp, ft.sig, 0))
@@ -277,6 +287,44 @@ class FPDivSqrt(implicit p: Parameters) extends IterativeFunctionalUnit()(p) wit
 
   val iss_fire_pipe = Reg(Bool())
   iss_fire_pipe := io.iss.valid
+
+  val wideOperation = parallelFp32.B && op.rvs2_eew === 2.U &&
+    (div_op || (op.opff6 === OPFFunct6.funary1 && op.rs1 === 0.U))
+  val wideReady = WireInit(false.B)
+  val wideData = WireInit(0.U(dLen.W))
+  val wideFlags = WireInit(0.U(5.W))
+  if (parallelFp32) {
+    val laneCount = dLen / 32
+    val finished = RegInit(VecInit.fill(laneCount)(false.B))
+    val results = Reg(Vec(laneCount, UInt(32.W)))
+    val exceptions = Reg(Vec(laneCount, UInt(5.W)))
+    val active = VecInit((0 until laneCount).map(lane => op.wmask(4 * lane)))
+    for (lane <- 0 until laneCount) {
+      val divider = Module(new hardfloat.DivSqrtRecFN_small(FType.S.exp, FType.S.sig, 0))
+      val source1 = FType.S.recode(op.rvs1_data(32 * lane + 31, 32 * lane))
+      val source2 = FType.S.recode(op.rvs2_data(32 * lane + 31, 32 * lane))
+      divider.io.inValid := iss_fire_pipe && wideOperation && active(lane)
+      divider.io.sqrtOp := !div_op
+      divider.io.a := Mux(ctrl.bool(FPSwapVdV2) && div_op, source1, source2)
+      divider.io.b := Mux(ctrl.bool(FPSwapVdV2) || !div_op, source2, source1)
+      divider.io.roundingMode := op.frm
+      divider.io.detectTininess := hardfloat.consts.tininess_afterRounding
+      when(divider.io.inValid) { assert(divider.io.inReady) }
+      when(divider.io.outValid_div || divider.io.outValid_sqrt) {
+        results(lane) := FType.S.ieee(divider.io.out)
+        exceptions(lane) := divider.io.exceptionFlags
+        finished(lane) := true.B
+      }
+      when(io.iss.valid) { finished(lane) := false.B }
+    }
+    wideReady := (finished.asUInt | ~active.asUInt).andR
+    wideData := VecInit(results.zip(active).map { case (result, enabled) =>
+      Mux(enabled, result, 0.U)
+    }).asUInt
+    wideFlags := exceptions.zip(active).map { case (flags, enabled) =>
+      Mux(enabled, flags, 0.U)
+    }.reduce(_ | _)
+  }
 
   val divSqrt_outs = divSqrts.zip(fTypes).map { case (f,ft) =>
     val eew = log2Ceil(ft.ieeeWidth / 8)
@@ -332,16 +380,18 @@ class FPDivSqrt(implicit p: Parameters) extends IterativeFunctionalUnit()(p) wit
     Seq(gen_vfclass, recSqrt7.io.out, rec7.io.out, divsqrt_reg)
   )(63,0)
 
-  io.write.valid := valid && ((vfclass_inst || vfrsqrt7_inst || vfrec7_inst) || divsqrt_valid)
+  io.write.valid := valid && Mux(wideOperation, wideReady,
+    vfclass_inst || vfrsqrt7_inst || vfrec7_inst || divsqrt_valid)
   io.write.bits.eg := op.wvd_eg
   io.write.bits.mask := FillInterleaved(8, op.wmask)
-  io.write.bits.data := Fill(dLenB >> 3, out)
+  io.write.bits.data := Mux(wideOperation, wideData, Fill(dLenB >> 3, out))
   io.stall := valid
   last := io.write.fire
 
-  io.set_fflags.valid := divsqrt_valid || (vfrsqrt7_inst && io.write.fire) || (vfrec7_inst && io.write.fire)
-  io.set_fflags.bits := Mux(divsqrt_valid, divsqrt_exc,
-    (recSqrt7.io.exc & Fill(5, vfrsqrt7_inst)) | (rec7.io.exc & Fill(5, vfrec7_inst)))
+  io.set_fflags.valid := Mux(wideOperation, io.write.fire,
+    divsqrt_valid || (vfrsqrt7_inst && io.write.fire) || (vfrec7_inst && io.write.fire))
+  io.set_fflags.bits := Mux(wideOperation, wideFlags, Mux(divsqrt_valid, divsqrt_exc,
+    (recSqrt7.io.exc & Fill(5, vfrsqrt7_inst)) | (rec7.io.exc & Fill(5, vfrec7_inst))))
 
   io.scalar_write.valid := false.B
   io.scalar_write.bits := DontCare

@@ -10,17 +10,13 @@ import xiangshan.evu._
 class EvuControlSequencerSpec extends AnyFlatSpec with ChiselScalatestTester with Matchers {
   behavior of "EVU control sequencer"
 
-  it should "complete launch and waits, then drain matrix status at fence" in {
+  it should "complete configuration, but fence only after the backend drains" in {
     val ep = EvuParams(enable = true, vlenBits = 512, dlenBits = 64, mlenBits = 64, lanes = 1)
     test(new EvuControlSequencer(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
       dut.io.flush.poke(false.B)
       dut.io.command.valid.poke(false.B)
       dut.io.completion.ready.poke(true.B)
-      dut.io.matrixBusy.poke(true.B)
-      dut.io.matrixException.poke(true.B)
-      dut.io.matrixFflags.poke(1.U)
-      dut.io.jobValid.foreach(_.poke(false.B))
-      dut.io.jobState.foreach(_.poke(EvuJobState.Free))
+      dut.io.backendBusy.poke(true.B)
 
       val cmd = dut.io.command.bits
       cmd.sew.poke(0.U)
@@ -48,45 +44,31 @@ class EvuControlSequencerSpec extends AnyFlatSpec with ChiselScalatestTester wit
         }
         signal.expect(true.B)
       }
-      def issue(opcode: UInt, id: Int, target: Int = 0): Unit = {
+      def issue(opcode: UInt, id: Int): Unit = {
         cmd.opcode.poke(opcode)
         cmd.jobId.poke(id.U)
-        cmd.base.poke(target.U)
         dut.io.command.valid.poke(true.B)
         await(dut.io.command.ready)
         dut.clock.step()
         dut.io.command.valid.poke(false.B)
       }
-      def complete(opcode: UInt, drain: Boolean = false): Unit = {
+      def complete(opcode: UInt): Unit = {
         await(dut.io.completion.valid)
         dut.io.completion.bits.opcode.expect(opcode)
-        dut.io.completion.bits.fflags.expect((if (drain) 1 else 0).U)
-        dut.io.completion.bits.exception.expect(drain.B)
+        dut.io.completion.bits.fflags.expect(0.U)
+        dut.io.completion.bits.exception.expect(false.B)
         dut.io.completion.bits.vxsat.expect(false.B)
         dut.io.completion.bits.dirtyVs.expect((opcode.litValue == EvuOpcode.SetVli.litValue ||
           opcode.litValue == EvuOpcode.SetVl.litValue).B)
-        dut.io.completion.bits.cause.expect(if (drain) EvuFault.Access else EvuFault.None)
+        dut.io.completion.bits.cause.expect(EvuFault.None)
         dut.clock.step()
       }
 
-      issue(EvuOpcode.Launch, id = 3)
-      complete(EvuOpcode.Launch)
-      dut.io.jobValid(0).poke(true.B)
-      dut.io.jobState(0).poke(EvuJobState.Running)
-      issue(EvuOpcode.Wait, id = 0)
-      complete(EvuOpcode.Wait)
-      dut.io.jobValid(1).poke(true.B)
-      dut.io.jobState(1).poke(EvuJobState.Running)
-      issue(EvuOpcode.Wait, id = 2, target = 1)
-      dut.clock.step(5)
-      dut.io.completion.valid.expect(false.B)
-      dut.io.jobState(1).poke(EvuJobState.Completed)
-      complete(EvuOpcode.Wait)
       issue(EvuOpcode.Fence, id = 4)
       dut.clock.step(5)
       dut.io.completion.valid.expect(false.B)
-      dut.io.matrixBusy.poke(false.B)
-      complete(EvuOpcode.Fence, drain = true)
+      dut.io.backendBusy.poke(false.B)
+      complete(EvuOpcode.Fence)
       issue(EvuOpcode.SetVli, id = 5)
       complete(EvuOpcode.SetVli)
       issue(EvuOpcode.SetVl, id = 6)
@@ -94,8 +76,4 @@ class EvuControlSequencerSpec extends AnyFlatSpec with ChiselScalatestTester wit
     }
   }
 
-  it should "elaborate the shared Saturn special sequencer without emitting Verilog" in {
-    val chirrtl = circt.stage.ChiselStage.emitCHIRRTL(new EvuSpecialSequencer(EvuParams(enable = true)))
-    chirrtl should include("module EvuMatrixDequant")
-  }
 }

@@ -26,8 +26,6 @@ class EvuVirtualMemorySpec extends AnyFlatSpec with ChiselScalatestTester with M
       dlenBits = 256, mlenBits = 256, lanes = 4, vrfBanks = 8)
     test(LazyModule(new EvuTopHarness(ep)).module).withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
       dut.io.dispatch.valid.poke(false.B)
-      dut.io.matrixInput.valid.poke(false.B)
-      dut.io.matrixOutput.ready.poke(true.B)
       dut.io.completion.ready.poke(false.B)
       dut.io.flush.poke(false.B)
       dut.io.a.ready.poke(true.B)

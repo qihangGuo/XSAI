@@ -1,7 +1,7 @@
 # Build one bare-metal test using the server's Abstract Machine toolchain.
 # Example: make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM NAME=online_softmax_evu_test
 
-NAME ?= quanti8mma_evu_example
+NAME ?= vector_add_evu_test
 # Keep SRCS as a makefile variable rather than a command-line variable.  A
 # command-line SRCS is inherited by the recursive AM_HOME build and would make
 # the AM support library try to compile this application source as its own.
@@ -62,34 +62,33 @@ BINARY := $(CURDIR)/build/$(NAME)-$(OS_VARIANT)-$(ARCH)
 endif
 endif
 
-ifneq ($(filter $(NAME),flash_attention_evu_test flash_attention_evu_breakdown flash_attention_evu_profile_cold flash_attention_evu_correct_warm),)
-EVU_FLASH_ROW_BATCH ?= 4
-EVU_FLASH_MERGE_PV ?= 1
-EVU_FLASH_SCALAR_OPS ?= 1
-EVU_FLASH_FUSE_ALPHA ?= $(EVU_FLASH_SCALAR_OPS)
-FA_DEFAULT_RECIP := 1
-ifeq ($(NAME),flash_attention_evu_correct_warm)
-FA_DEFAULT_RECIP := 0
-EVU_FLASH_EARLY_RECIP ?= 0
+ifeq ($(NAME),rmsnorm_nvfp4_evu_test)
+EVU_RMS_SAMPLES ?= 1
+EVU_RMS_BF16_INPUT ?= 0
+EVU_RMS_VERBOSE ?= 0
+EVU_RMS_ALPHA ?= 0.002232142857142857f
+EVU_RMS_ONLY ?= 0
+EVU_RMS_EPS ?= 1.0e-5f
+CFLAGS += -DEVU_RMS_SAMPLES=$(EVU_RMS_SAMPLES) -DEVU_RMS_BF16_INPUT=$(EVU_RMS_BF16_INPUT)
+CFLAGS += -DEVU_RMS_VERBOSE=$(EVU_RMS_VERBOSE)
+CFLAGS += -DEVU_RMS_ONLY=$(EVU_RMS_ONLY)
+CFLAGS += -DEVU_RMS_EPS=$(EVU_RMS_EPS) -DEVU_RMS_ALPHA=$(EVU_RMS_ALPHA)
+CFLAGS += -fno-fast-math
+RN_VARIANT := batch16-v7-only$(EVU_RMS_ONLY)-n$(EVU_RMS_SAMPLES)-bf$(EVU_RMS_BF16_INPUT)-e$(EVU_RMS_EPS)-a$(EVU_RMS_ALPHA)
+ifneq ($(EVU_RMS_VERBOSE),0)
+RN_VARIANT := $(RN_VARIANT)-verbose$(EVU_RMS_VERBOSE)
 endif
-EVU_FLASH_EARLY_RECIP ?= $(EVU_FLASH_SCALAR_OPS)
-EVU_FLASH_CHUNK_MAX ?= $(EVU_FLASH_SCALAR_OPS)
-CFLAGS += -DEVU_FLASH_ROW_BATCH=$(EVU_FLASH_ROW_BATCH) -DEVU_FLASH_MERGE_PV=$(EVU_FLASH_MERGE_PV) -DEVU_FLASH_SCALAR_OPS=$(EVU_FLASH_SCALAR_OPS)
-CFLAGS += -DEVU_FLASH_FUSE_ALPHA=$(EVU_FLASH_FUSE_ALPHA) -DEVU_FLASH_EARLY_RECIP=$(EVU_FLASH_EARLY_RECIP) -DEVU_FLASH_CHUNK_MAX=$(EVU_FLASH_CHUNK_MAX)
-# Each schedule gets separate objects and image paths, including when revisiting
-# an already-built variant. Keep each target's default image's old name.
-FA_VARIANT := rows$(EVU_FLASH_ROW_BATCH)-pv$(EVU_FLASH_MERGE_PV)-scalar$(EVU_FLASH_SCALAR_OPS)-alpha$(EVU_FLASH_FUSE_ALPHA)-recip$(EVU_FLASH_EARLY_RECIP)-max$(EVU_FLASH_CHUNK_MAX)
-DST_DIR := $(CURDIR)/build/obj/$(NAME)/$(FA_VARIANT)
-ifneq ($(EVU_FLASH_ROW_BATCH)-$(EVU_FLASH_MERGE_PV)-$(EVU_FLASH_SCALAR_OPS)-$(EVU_FLASH_FUSE_ALPHA)-$(EVU_FLASH_EARLY_RECIP)-$(EVU_FLASH_CHUNK_MAX),4-1-1-1-$(FA_DEFAULT_RECIP)-1)
-BINARY := $(CURDIR)/build/$(NAME)-$(FA_VARIANT)-$(ARCH)
+DST_DIR := $(CURDIR)/build/obj/$(NAME)/$(RN_VARIANT)
+ifneq ($(EVU_RMS_SAMPLES)-$(EVU_RMS_BF16_INPUT)-$(EVU_RMS_EPS)-$(EVU_RMS_VERBOSE)-$(EVU_RMS_ALPHA)-$(EVU_RMS_ONLY),1-0-1.0e-5f-0-0.002232142857142857f-0)
+BINARY := $(CURDIR)/build/$(NAME)-$(RN_VARIANT)-$(ARCH)
 endif
 endif
 
-ifneq ($(filter $(NAME),vector_memory_path_evu_test vector_add_evu_test exp2_evu_test online_softmax_evu_test csr_context_evu_test virtual_memory_evu_test flash_attention_evu_test flash_attention_evu_breakdown flash_attention_evu_profile_cold flash_attention_evu_correct_warm),)
+ifneq ($(filter $(NAME),vector_memory_path_evu_test vector_add_evu_test exp2_evu_test online_softmax_evu_test csr_context_evu_test virtual_memory_evu_test rmsnorm_nvfp4_evu_test rvv_math_evu_test low_precision_evu_test),)
 CFLAGS += -fno-tree-vectorize -fno-tree-slp-vectorize
 endif
 
-ifneq ($(filter $(NAME),vector_memory_path_evu_test online_softmax_evu_test flash_attention_evu_test flash_attention_evu_breakdown flash_attention_evu_profile_cold flash_attention_evu_correct_warm),)
+ifneq ($(filter $(NAME),vector_memory_path_evu_test online_softmax_evu_test rmsnorm_nvfp4_evu_test),)
 CFLAGS += -ffp-contract=off
 endif
 

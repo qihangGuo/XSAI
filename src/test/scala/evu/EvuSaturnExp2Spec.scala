@@ -13,7 +13,7 @@ import xiangshan.evu._
 
 import scala.collection.mutable
 
-class EvuSaturnExp2Shell(val ep: EvuParams)(implicit p: Parameters) extends LazyModule {
+class EvuSaturnExp2Shell(val ep: EvuParams, val configurableLmul: Boolean = false)(implicit p: Parameters) extends LazyModule {
   val visibility = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1("exp2-test")))))
   val sink = TLManagerNode(Seq(TLSlavePortParameters.v1(
     Seq(TLSlaveParameters.v1(address = Seq(AddressSet(0, 0xffff)),
@@ -31,8 +31,8 @@ class EvuSaturnExp2ShellImp(outer: EvuSaturnExp2Shell)(implicit p: Parameters) e
     val vrf = Output(Vec(ep.vectorRegs * ep.vlenBits / ep.dlenBits, UInt(ep.dlenBits.W)))
     val flush = Input(Bool())
     val vstart = Input(UInt(log2Ceil(ep.vlenBits + 1).W))
-    val cuteWrite = Output(Valid(new EvuCuteWrite(ep)))
     val scalarForwards = Output(UInt(64.W))
+    val lmul = Option.when(outer.configurableLmul)(Input(UInt(3.W)))
   })
   val backend = Module(new EvuVectorBackend(ep)(p.alterPartial {
     case TileVisibilityNodeKey => outer.visibility
@@ -45,16 +45,11 @@ class EvuSaturnExp2ShellImp(outer: EvuSaturnExp2Shell)(implicit p: Parameters) e
   backend.io.flush := io.flush
   backend.io.vta := false.B
   backend.io.vma := false.B
-  backend.io.vlmulSign := false.B
-  backend.io.vlmulMag := 0.U
+  val lmul = io.lmul.getOrElse(0.U(3.W))
+  backend.io.vlmulSign := lmul(2)
+  backend.io.vlmulMag := Mux(lmul(2), (8.U - lmul)(1, 0), lmul(1, 0))
   backend.io.vstart := io.vstart
   backend.io.vill := false.B
-  backend.io.cuteWrite.ready := true.B
-  io.cuteWrite.valid := backend.io.cuteWrite.valid
-  io.cuteWrite.bits := backend.io.cuteWrite.bits
-  backend.io.matrixInput.valid := false.B
-  backend.io.matrixInput.bits := 0.U.asTypeOf(backend.io.matrixInput.bits)
-  backend.io.matrixOutput.ready := true.B
   val bus = outer.visibility.out.head._1
   bus.a.valid := false.B
   bus.a.bits := 0.U.asTypeOf(bus.a.bits)
@@ -249,6 +244,19 @@ class EvuSaturnExp2Spec extends AnyFlatSpec with ChiselScalatestTester with Matc
           dut.io.vstart.poke(0.U)
           expectReg(2, results, sew)
         }
+        // Independent queue heads may prefetch their first EG at the previous
+        // tail; dependent consumers must still observe the produced version.
+        load(1, Seq.fill(32)(single(0f)), 2)
+        send(EvuOpcode.Exp2, 8, 2, 32, job = 0, source = 1)
+        send(EvuOpcode.Exp2, 9, 2, 32, job = 1, source = 1)
+        send(EvuOpcode.Exp2, 10, 2, 32, job = 2, source = 8)
+        send(EvuOpcode.Exp2, 11, 2, 32, job = 3, source = 9)
+        for (job <- 0 until 4) waitFor(job)
+        expectReg(8, Seq.fill(32)(single(1f)), 2)
+        expectReg(9, Seq.fill(32)(single(1f)), 2)
+        expectReg(10, Seq.fill(32)(single(2f)), 2)
+        expectReg(11, Seq.fill(32)(single(2f)), 2)
+
         // Submit the dependent reduction -> in-place E0 arithmetic -> E0
         // EXP2 -> broadcast chain without draining between commands.
         val inputs = (0 until 16).map(i => single((i % 4).toFloat))

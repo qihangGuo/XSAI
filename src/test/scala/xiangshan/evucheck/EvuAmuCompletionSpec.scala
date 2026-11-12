@@ -249,16 +249,16 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
     }
   }
 
-  it should "consume quant and fence completions once across dequeue bubbles and redirects" in {
+  it should "consume arithmetic and fence completions once across dequeue bubbles and redirects" in {
     val (base, _, _) = ArgParser.parse(Array("--config", "DefaultExternalVectorMatrixConfig",
       "--disable-perf", "--disable-alwaysdb"))
     implicit val p: Parameters = base.alterPartial {
       case XSCoreParamsKey => base(XSTileKey).head.copy(RobSize = 32)
     }
     test(new EvuAmuCompletionHarness).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
-      val quantPc = BigInt("80001100", 16)
+      val arithmeticPc = BigInt("80001100", 16)
       val fencePc = BigInt("8000113a", 16)
-      val quantInstr = BigInt("a055a68b", 16)
+      val arithmeticInstr = BigInt("6855a68b", 16)
       val fenceInstr = BigInt("3400000b", 16)
       def completion(pc: BigInt, opcode: Int, flags: Int, fault: Boolean = false): Unit = {
         val c = dut.io.completion.bits
@@ -270,9 +270,9 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
         c.exception.poke(fault.B)
         c.fflags.poke(flags.U)
         c.vxsat.poke(false.B)
-        c.dirtyVs.poke(false.B)
+        c.dirtyVs.poke((opcode == 0x34 && !fault).B)
         c.cause.poke((if (fault) 6 else 0).U)
-        c.jobId.poke((if (opcode == 0x50) 0 else 1).U)
+        c.jobId.poke((if (opcode == 0x34) 0 else 1).U)
         c.epoch.poke(0.U)
       }
       def reset(): Unit = {
@@ -286,7 +286,7 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
         dut.io.issueReady.poke(false.B)
         dut.io.redirect.poke(false.B)
         dut.io.completion.valid.poke(false.B)
-        completion(quantPc, 0x50, 1)
+        completion(arithmeticPc, 0x34, 1)
         dut.reset.poke(true.B)
         dut.clock.step(2)
         dut.reset.poke(false.B)
@@ -318,9 +318,10 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
       }
       for ((scalarGap, fault) <- Seq((false, false), (true, false), (false, true))) {
         reset()
-        prepare(0, quantPc, quantInstr)
+        prepare(0, arithmeticPc, arithmeticInstr)
         if (scalarGap) prepare(1, 0, 0, needAmu = false)
         prepare(if (scalarGap) 2 else 1, fencePc, fenceInstr)
+        completion(arithmeticPc, 0x34, 1, fault)
         // An offered completion cannot bypass command acceptance.
         dut.io.completion.valid.poke(true.B)
         dut.io.completion.ready.expect(false.B)
@@ -328,7 +329,7 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
         dut.io.status.valid.expect(false.B)
         dut.io.completion.valid.poke(false.B)
         dut.io.issueReady.poke(true.B)
-        for ((pc, instr) <- Seq((quantPc, quantInstr), (fencePc, fenceInstr))) {
+        for ((pc, instr) <- Seq((arithmeticPc, arithmeticInstr), (fencePc, fenceInstr))) {
           dut.io.issued.valid.expect(true.B)
           dut.io.issued.bits.pc.expect(pc.U)
           dut.io.issued.bits.instr.expect(instr.U)
@@ -337,16 +338,16 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
         dut.io.issued.valid.expect(false.B)
         dut.io.completion.ready.expect(true.B)
         dut.io.completion.valid.poke(true.B)
-        dut.clock.step() // Quant completes, but its AMU entry is not yet dequeued.
-        expectStatus(quantPc, 0x50, 1)
-        // Keep valid asserted: FENCE is ready immediately behind quant.
-        completion(fencePc, 0x1a, 16, fault)
+        dut.clock.step() // Arithmetic completes before its AMU entry is dequeued.
+        expectStatus(arithmeticPc, 0x34, 1, fault)
+        // Keep valid asserted: FENCE is ready immediately behind arithmetic.
+        completion(fencePc, 0x1a, 0)
         dut.io.completion.ready.expect(false.B)
-        dut.clock.step() // Dequeue the completed quant (and any scalar gap).
+        dut.clock.step() // Dequeue the completed arithmetic (and any scalar gap).
         dut.io.status.valid.expect(false.B)
         dut.io.completion.ready.expect(true.B)
         dut.clock.step()
-        expectStatus(fencePc, 0x1a, 16, fault)
+        expectStatus(fencePc, 0x1a, 0)
         dut.io.completion.valid.poke(false.B)
         dut.io.completion.ready.expect(false.B)
         dut.clock.step()
@@ -358,7 +359,7 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
         dut.io.busy.expect(false.B)
       }
       reset()
-      prepare(0, quantPc, quantInstr)
+      prepare(0, arithmeticPc, arithmeticInstr)
       dut.io.busy.expect(true.B)
       dut.io.preflightBusy.expect(false.B)
       dut.io.issueReady.poke(true.B)
@@ -380,14 +381,14 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
       dut.io.preflightBusy.expect(false.B)
       // A completed ordinary instruction still blocks preflight while its
       // status propagates; only control blocks ordinary memory preflight.
-      for (f7 <- Seq(1, 0x10, 0x11, 0x18, 0x19, 0x1a, 0x45, 0x46)) {
+      for (f7 <- Seq(1, 0x10, 0x11, 0x1a, 0x45, 0x46)) {
         reset()
-        prepare(0, quantPc, (BigInt(f7) << 25) | 0xb)
+        prepare(0, arithmeticPc, (BigInt(f7) << 25) | 0xb)
         dut.io.busy.expect(true.B)
         dut.io.preflightBusy.expect((!Seq(1, 0x10, 0x11).contains(f7)).B)
         dut.io.issueReady.poke(true.B)
         dut.clock.step()
-        completion(quantPc, 1, 0)
+        completion(arithmeticPc, 1, 0)
         dut.io.completion.valid.poke(true.B)
         dut.io.completion.ready.expect(true.B)
         dut.clock.step()

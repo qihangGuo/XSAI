@@ -57,6 +57,8 @@ class EvuGatherImmHarness(ep: EvuParams)(implicit p: Parameters) extends CoreMod
   sequencer.io.older_reads := 0.U
   sequencer.io.vat_head := 0.U
   sequencer.io.acc_valid := false.B
+  sequencer.io.acc_return := false.B
+  sequencer.io.lookahead := 0.U.asTypeOf(sequencer.io.lookahead)
   sequencer.io.vgu.slide_req.ready := true.B
   sequencer.io.vgu.slide_data := 0.U
   sequencer.io.vgu.gather_eidx.valid := false.B

@@ -185,3 +185,72 @@ interactive terminal with `--splitview-log=build/logs/softmax` also separates
 the splitview implementation checks that stdout is a terminal. The option
 alone has no effect in an emulator built without splitview support. Offline
 summarization works with the current combined log regardless of that setting.
+
+## Boundary forwarding: November 5, 2026
+
+The next change removes four registered handoffs around the existing TLB/PMP
+checks. It does not reuse translations or permission results across lines or
+commands. Every original logical line/read/write check still runs, including
+both the read and write checks for a partial-line E0 store.
+
+1. `EvuAddressCheck` can issue the first lookup in the cycle that it accepts
+   a legal, nonempty bounded range. A blocked lookup remains in the existing
+   cursor registers. Illegal, misaligned, oversized, overflowing, zero-length
+   and unbounded requests retain their original handling and issue no lookup.
+2. `EvuPreflightPipeline` can send a newly allocated check directly to the TLB
+   when no queued check is ready. Older ready/replayed checks keep priority;
+   TLB backpressure retains the new check in its allocated slot.
+3. The oldest check can return its PMP result without first waiting for the
+   answer register. The result still includes the registered PMP stage,
+   cacheability rejection and original translation-fault precedence. A stalled
+   or younger result is saved in the existing answer registers.
+4. The range checker can return the updated page map or first fault together
+   with the final lookup response. It waits for all accepted lookups to drain,
+   and holds the complete result in the existing register under CPU backpressure.
+
+`MemBlock` also forwards the newly accepted command's base address to the
+first TLB request's `fullva` field. Without this change, first-cycle issue could
+use the previous command's base for full-address or guest-address checking.
+
+Assuming a one-cycle TLB hit, the existing following PMP cycle and no
+backpressure, the expected local latency is:
+
+| Range | Logical checks | Previous response cycle | New response cycle |
+| --- | ---: | ---: | ---: |
+| Single-line E0 load | 1 | 6 | 2 |
+| Single-line E0 RMW store | 2 | 7 | 3 |
+| Aligned 64-byte full store | 1 | 6 | 2 |
+| Aligned 512-byte full store | 8 | 13 | 9 |
+
+Cycle zero is the range-request acceptance cycle. These are protocol-level
+expectations encoded in the new regression, not measured whole-kernel results.
+The TLB miss replay, ordered first-fault handling, three-cycle cancellation
+cooldown, scalar-store drain and final external memory-Ack requirements remain.
+No new buffers, TLB/PMP ports, ISA changes, VRF changes or cache-side changes
+are introduced. The bypasses extend combinational paths at the boundaries;
+server elaboration and implementation timing checks remain necessary.
+
+`EvuPreflightFastPathSpec` joins the production range checker and lookup
+pipeline, models one-cycle TLB responses and checks E0/full-line/cross-page
+requests with TLB and CPU backpressure. It also covers last-check PMP failure,
+guest faults, uncacheable results, changed physical mappings and cancellation
+in the completion-bypass cycle. Existing pipeline tests retain miss replay,
+slot wraparound and cancellation coverage, with updated handshake timing and
+an additional stalled-request/stalled-permission-result case.
+
+Per the local resource constraint, these Scala tests have been added but not
+executed. No Java/Mill build, RTL generation, emulator run or binary generation
+is performed locally. The server-side focused regression command is:
+
+```sh
+mill -i xiangshan.test.testOnly evu.EvuAddressCheckSpec \
+  evu.EvuPreflightPipelineSpec evu.EvuPreflightFastPathSpec
+```
+
+Rebuild EMU with the existing configuration and reuse the existing 512-bit
+NEMU library and guest binary. Compare the formal first=0/1 intervals against
+7,624/6,126 cycles. Logical checks should remain 1,285/1,221 with the unchanged
+default binary; compare `busy`, `outputwait`, FU `nowork` and kernel cycles
+together. Check Difftest and final pending entries, and repeat the existing
+FlashAttention correctness run. A shorter preflight alone does not guarantee
+an equal reduction in end-to-end cycles.

@@ -29,11 +29,6 @@ class XSCuteTopImpl(wrapper: XSCuteTop) extends LazyModuleImp(wrapper) {
   })
   io.ctrl2top <> cute.io.ctrl2top
   io.perf <> cute.io.perf
-  io.vectorResult <> cute.io.vectorResult
-  io.vectorResultTileId := cute.io.vectorResultTileId
-  io.vectorResultKComplete := cute.io.vectorResultKComplete
-  io.vectorResultTaskLast := cute.io.vectorResultTaskLast
-  io.evuAbWrite <> cute.io.evuAbWrite
   io.matrixPrefetch.zip(cute.io.matrixPrefetch).foreach { case (to, from) => to := from }
   wrapper.cute_tl.module.io.matrix_data_in <> io.matrix_data_in
   wrapper.cute_tl.module.io.mmu <> cute.io.mmu2llc
@@ -215,7 +210,7 @@ class XSCuteImp(wrapper: XSCute)(implicit p: Parameters) extends LazyModuleImp(w
 
     val mmu = wrapper.cute_tl.module.io.mmu
     val difftests = CuteDifftest.applyVec(
-      Seq.fill(matrixStoreDiffLaneCount)(new DiffMatrixStoreEvent),
+      Seq.fill(matrixStoreDiffLaneCount)(new DiffMatrixStoreEvent(storeBytes = MMUMaskWidth)),
       delay = 1
     )
 
@@ -237,7 +232,9 @@ class XSCuteImp(wrapper: XSCute)(implicit p: Parameters) extends LazyModuleImp(w
       difftests(channel).reqEncodedSourceId := Mux(reqValid, writeReq.bits.RequestSourceID, 0.U)
       difftests(channel).addr := Mux(reqValid, writeReq.bits.RequestAddr, 0.U)
       difftests(channel).data := Mux(reqValid, writeReq.bits.RequestData, 0.U).asTypeOf(Vec(64, UInt(8.W)))
-      difftests(channel).mask := Mux(reqValid, writeReq.bits.RequestMask, 0.U)
+      when(reqValid) {
+        assert(writeReq.bits.RequestMask.andR, "MatrixStore DiffTest requires a full write mask")
+      }
       difftests(channel).respValid := respValid
       difftests(channel).respEncodedSourceId := Mux(respValid, respEncodedSourceId, 0.U)
     }

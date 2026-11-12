@@ -12,7 +12,6 @@ class EvuCommandScoreboard(p: EvuParams) extends Module {
     val commandValid = Input(Bool())
     val readMask = Input(UInt(p.vectorRegs.W))
     val writeMask = Input(UInt(p.vectorRegs.W))
-    val matrixReadMask = Input(UInt(p.vectorRegs.W))
     val isMemory = Input(Bool())
     val chainable = Input(Bool())
     val jobId = Input(UInt(jobBits.W))
@@ -37,14 +36,18 @@ class EvuCommandScoreboard(p: EvuParams) extends Module {
   io.memoryOutstanding := memoryCount
   val busyReads = valid.zip(reads).map { case (v, m) => Mux(v, m, 0.U) }.reduce(_ | _)
   val busyWrites = valid.zip(writes).map { case (v, m) => Mux(v, m, 0.U) }.reduce(_ | _)
-  val ordered = !io.isMemory || memoryCount < p.memoryCommandDepth.U
+  // Only an accepted completion of a live memory owner returns credit.
+  // Keep its register reservation through this cycle; Saturn still checks EG
+  // dependencies when an independent successor uses the returned credit.
+  val memoryRelease = io.release.valid && valid(io.release.bits) && memoryJobs(io.release.bits)
+  val ordered = !io.isMemory || memoryCount < p.memoryCommandDepth.U || memoryRelease
   val protectedJobs = valid.zip(chainable).map { case (v, c) =>
     v && !(p.egChaining.B && io.chainable && c)
   }
   val protectedReads = protectedJobs.zip(reads).map { case (v, m) => Mux(v, m, 0.U) }.reduce(_ | _)
   val protectedWrites = protectedJobs.zip(writes).map { case (v, m) => Mux(v, m, 0.U) }.reduce(_ | _)
   val independent = !(io.readMask & protectedWrites).orR &&
-    !(io.writeMask & (protectedReads | protectedWrites | io.matrixReadMask)).orR
+    !(io.writeMask & (protectedReads | protectedWrites)).orR
   io.allowed := ordered && independent && !io.flush
   io.busy := valid.asUInt.orR
   io.busyWriteMask := busyWrites
@@ -69,6 +72,7 @@ class EvuCommandScoreboard(p: EvuParams) extends Module {
     chainable(io.jobId) := io.chainable
     memoryJobs(io.jobId) := io.isMemory
   }
+  assert(memoryCount <= p.memoryCommandDepth.U, "EVU memory command window overflow")
   when(io.flush) {
     valid.foreach(_ := false.B)
     memoryJobs.foreach(_ := false.B)

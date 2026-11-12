@@ -21,7 +21,7 @@ import xiangshan.evu.exu._
 /** Exercise production sequencers/FMA without elaborating unrelated backend FUs.
   * Source responses are a test fixture, not a replacement VRF implementation.
   */
-class EvuSharedReductionHarness(implicit p: Parameters) extends CoreModule with HasVectorParams {
+class EvuSharedReductionHarness(maximum: Boolean = false)(implicit p: Parameters) extends CoreModule with HasVectorParams {
   val io = IO(new Bundle {
     val command = Vec(2, Flipped(Decoupled(new BackendIssueInst)))
     val sourceReady = Input(Vec(2, Bool()))
@@ -29,8 +29,9 @@ class EvuSharedReductionHarness(implicit p: Parameters) extends CoreModule with 
     val completed = Output(Vec(2, Bool()))
     val switched = Output(UInt(32.W))
     val flags = Output(UInt(5.W))
+    val merges = Output(Vec(2, UInt(32.W)))
   })
-  val factory = SIMDFPFMAFactory(4, true)
+  val factory: FunctionalUnitFactory = if (maximum) FPCmpFactory else SIMDFPFMAFactory(4, true)
   val insns = VXSequencerParams("fp_fma", Seq(factory)).insns
   val execute = Seq.fill(2)(Module(new ExecuteSequencer(insns, 4, 1, reductionOnly = true)))
   val accumulators = (0 until 2).map(i => Module(new SpecialSequencer(insns, i, 2, true)))
@@ -49,6 +50,13 @@ class EvuSharedReductionHarness(implicit p: Parameters) extends CoreModule with 
   val flags = RegInit(0.U(5.W))
   when(fu.io.set_fflags.valid) { flags := flags | fu.io.set_fflags.bits }
   io.flags := flags
+  val merges = RegInit(VecInit.fill(2)(0.U(32.W)))
+  io.merges := merges
+  for (context <- 0 until 2) {
+    when(fu.io.iss.fire && fu.io.iss.bits.acc_merge && fu.io.iss.bits.vat === (context + 1).U) {
+      merges(context) := merges(context) + 1.U
+    }
+  }
   val previousVat = RegEnable(fu.io.iss.bits.vat, fu.io.iss.fire)
   val previousValid = RegNext(fu.io.iss.fire, false.B)
   val switched = RegInit(0.U(32.W))
@@ -76,7 +84,7 @@ class EvuSharedReductionHarness(implicit p: Parameters) extends CoreModule with 
     seq.io.vgu.gather_eidx.bits := 0.U
     for (read <- Seq(seq.io.rvs1, seq.io.rvs2, seq.io.rvd, seq.io.rvm)) {
       read.req.ready := io.sourceReady(i)
-      read.resp := Fill(2, (if (i == 0) 0x3f800000L else 0x40000000L).U(32.W))
+      read.resp := Fill(dLen / 32, (if (i == 0) 0x3f800000L else 0x40000000L).U(32.W))
     }
     acc.io.rvs2.ready := io.sourceReady(i)
     acc.io.rvm.ready := io.sourceReady(i)
@@ -88,6 +96,8 @@ class EvuSharedReductionHarness(implicit p: Parameters) extends CoreModule with 
     acc.io.acc_merge := seq.io.acc_merge
     acc.io.acc_data.ready := seq.io.acc_ready && seq.io.iss.ready
     seq.io.acc_valid := acc.io.acc_data.valid && acc.io.busy && seq.io.vat === acc.io.vat
+    seq.io.acc_return := acc.io.acc_return
+    seq.io.lookahead := 0.U.asTypeOf(seq.io.lookahead)
     acc.io.acc_done := seq.io.iss.fire && seq.io.iss.bits.acc && seq.io.iss.bits.tail
     acc.io.acc_fu_resp.valid := fu.io.acc_write.valid && fu.io.accWriteVat === acc.io.vat
     acc.io.acc_fu_resp.bits := fu.io.acc_write.bits
@@ -129,7 +139,7 @@ class EvuSharedReductionHarness(implicit p: Parameters) extends CoreModule with 
   }
 }
 
-class EvuSharedReductionShell(implicit p: Parameters) extends LazyModule {
+class EvuSharedReductionShell(val maximum: Boolean = false)(implicit p: Parameters) extends LazyModule {
   val client = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1("shared-fma-test")))))
   val sink = TLManagerNode(Seq(TLSlavePortParameters.v1(Seq(TLSlaveParameters.v1(
     address = Seq(AddressSet(0, 0xffffffffL)), supportsGet = TransferSizes(1, 64))), beatBytes = 64)))
@@ -139,7 +149,7 @@ class EvuSharedReductionShell(implicit p: Parameters) extends LazyModule {
 
 class EvuSharedReductionShellImp(outer: EvuSharedReductionShell)(implicit p: Parameters)
     extends LazyModuleImp(outer) {
-  val harness = Module(new EvuSharedReductionHarness()(p.alterPartial { case TileVisibilityNodeKey => outer.client }))
+  val harness = Module(new EvuSharedReductionHarness(outer.maximum)(p.alterPartial { case TileVisibilityNodeKey => outer.client }))
   val io = IO(chiselTypeOf(harness.io))
   io <> harness.io
 }
@@ -182,10 +192,6 @@ class EvuInterleavedBackendHarness(implicit p: Parameters) extends CoreModule wi
   backend.io.index_access.eew := 0.U
   backend.io.mask_access.valid := false.B
   backend.io.mask_access.eidx := 0.U
-  backend.io.special.read.foreach { r =>
-    r.req.valid := false.B
-    r.req.bits := 0.U.asTypeOf(r.req.bits)
-  }
   backend.io.scalar_resp.ready := true.B
   backend.io.fp_req.ready := true.B
   backend.io.fp_resp.valid := false.B
@@ -225,7 +231,7 @@ class EvuInterleavedReductionSpec extends AnyFlatSpec with ChiselScalatestTester
   it should "interleave production sequencers on a shared FMA under operand backpressure" in {
     implicit val p: Parameters = EvuVectorParameters(base, 512, 64, 64,
       VectorParams.lgvParams.copy(reductionContexts = 2, interleaveReductions = true))
-    test(LazyModule(new EvuSharedReductionShell).module).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+    test(LazyModule(new EvuSharedReductionShell()).module).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
       def clear(x: Data): Unit = x match {
         case b: Bool => b.poke(false.B)
         case u: UInt => u.poke(0.U)
@@ -264,12 +270,65 @@ class EvuInterleavedReductionSpec extends AnyFlatSpec with ChiselScalatestTester
     }
   }
 
+  it should "reduce short FP32 sums and maxima without merging unused accumulator slots" in {
+    implicit val parameters: Parameters = EvuVectorParameters(base, 4096, 512, 512,
+      VectorParams.lgvParams.copy(reductionContexts = 2, interleaveReductions = true))
+    for (maximum <- Seq(false, true)) {
+      test(LazyModule(new EvuSharedReductionShell(maximum)).module)
+        .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+          def clear(data: Data): Unit = data match {
+            case value: Bool => value.poke(false.B)
+            case value: UInt => value.poke(0.U)
+            case value: SInt => value.poke(0.S)
+            case values: Vec[_] => values.foreach(clear)
+            case bundle: Bundle => bundle.elements.values.foreach(clear)
+          }
+          for (length <- Seq(1, 13, 16, 17, 32, 33, 48, 49, 64, 128)) {
+            dut.io.command.foreach(_.valid.poke(false.B))
+            dut.reset.poke(true.B)
+            dut.clock.step(2)
+            dut.reset.poke(false.B)
+            for (context <- 0 until 2) {
+              val command = dut.io.command(context)
+              clear(command.bits)
+              val function = if (maximum) OPFFunct6.fredmax else OPFFunct6.fredusum
+              command.bits.bits.poke(((function.litValue << 26) | (BigInt(1) << 25) |
+                ((context + 1) << 20) | (1 << 12) | ((context + 3) << 7) | 0x57).U)
+              command.bits.vconfig.vl.poke(length.U)
+              command.bits.vconfig.vtype.vsew.poke(2.U)
+              command.bits.vat.poke((context + 1).U)
+              command.bits.reduction.poke(true.B)
+              command.bits.renv1.poke(true.B)
+              command.bits.renv2.poke(true.B)
+              command.bits.wvd.poke(true.B)
+              command.valid.poke(true.B)
+              dut.io.sourceReady(context).poke(true.B)
+              command.ready.expect(true.B)
+            }
+            dut.clock.step()
+            dut.io.command.foreach(_.valid.poke(false.B))
+            dut.clock.step(160)
+            dut.io.completed.foreach(_.expect(true.B))
+            for (context <- 0 until 2) {
+              val expected = ((if (maximum) 1 else length) * (context + 1)).toFloat
+              dut.io.result(context).expect((java.lang.Float.floatToRawIntBits(expected).toLong & 0xffffffffL).U)
+              dut.io.merges(context).expect((math.min(4, (length + 15) / 16) - 1).U)
+            }
+            dut.io.flags.expect(0.U)
+          }
+        }
+    }
+  }
+
   it should "retain production 1RW VRF and shared arithmetic units in memory-only elaboration" in {
     implicit val p: Parameters = base
     val ir = ChiselStage.emitCHIRRTL(LazyModule(new EvuSaturnMemoryTagHarness(
       EvuParams(enable = true, enableDifftest = true))).module)
     ir should include ("vxsfp_fma_1")
     ir should include ("vxsfp_fma_2")
+    ir should include ("vxsfp_fma_3")
+    ir should not include "vxsfp_cmp_3"
+    "\\binst vxufp_fma of ".r.findAllIn(ir).length shouldBe 1
     ir should include ("sram_array_1p64x64m8")
   }
 

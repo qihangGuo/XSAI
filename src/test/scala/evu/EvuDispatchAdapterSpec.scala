@@ -21,8 +21,7 @@ class EvuDispatchAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with
         (0x56, EvuOpcode.FMul, 0x40), (0x57, EvuOpcode.FDiv, 0x40),
         (0x58, EvuOpcode.FMax, 0x40), (0x59, EvuOpcode.Exp2, 0x40),
         (0x5a, EvuOpcode.FAdd, 0x20), (0x5b, EvuOpcode.FSub, 0x20),
-        (0x5c, EvuOpcode.FMul, 0x20), (0x5d, EvuOpcode.FMax, 0x20),
-        (0x5e, EvuOpcode.FpQuantToCute, 0x10))
+        (0x5c, EvuOpcode.FMul, 0x20), (0x5d, EvuOpcode.FMax, 0x20))
       for ((f7, opcode, aux) <- forms) {
         issue(dut, f7, sew = 2)
         dut.io.out.bits.opcode.expect(opcode)
@@ -80,10 +79,9 @@ class EvuDispatchAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with
         15   -> EvuOpcode.Exp2,
         0x10 -> EvuOpcode.Load,
         0x11 -> EvuOpcode.Store,
-        0x18 -> EvuOpcode.Launch,
-        0x19 -> EvuOpcode.Wait,
+        0x3e -> EvuOpcode.SlideUp,
+        0x3f -> EvuOpcode.SlideDown,
         0x1a -> EvuOpcode.Fence,
-        0x50 -> EvuOpcode.FpQuantToCute,
         0x51 -> EvuOpcode.GatherImm
       )
       for ((funct7, opcode) <- operations) {
@@ -115,10 +113,9 @@ class EvuDispatchAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with
   it should "reject retired encodings, unsupported widths and unknown operations" in {
     test(new EvuDispatchAdapter(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
       initialize(dut)
-      val removed = for (funct7 <- Seq(0x08, 0x09, 0x0a, 0x0b, 0x38, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f); sew <- 0 to 7) yield (funct7, sew, 0x0b)
-      val fpWidths = (0 to 7).filter(_ != 2).map(sew => (0x50, sew, 0x0b))
+      val removed = for (funct7 <- Seq(0x08, 0x09, 0x0a, 0x0b, 0x18, 0x19, 0x38, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x5e); sew <- 0 to 7) yield (funct7, sew, 0x0b)
       val invalid = Seq((1, 3, 0x0b), (0x10, 3, 0x0b), (0x11, 3, 0x0b),
-        (0x30, 3, 0x0b), (0x39, 2, 0x0b), (0x3a, 2, 0x0b), (0x3b, 2, 0x0b), (1, 4, 0x0b), (0x7f, 0, 0x0b), (1, 0, 0x2b)) ++ removed ++ fpWidths
+        (0x30, 3, 0x0b), (0x39, 2, 0x0b), (0x3a, 2, 0x0b), (0x3b, 2, 0x0b), (1, 4, 0x0b), (0x7f, 0, 0x0b), (1, 0, 0x2b)) ++ removed
       for ((funct7, sew, custom) <- invalid) {
         issue(dut, funct7, sew, custom)
         dut.io.out.valid.expect(true.B)

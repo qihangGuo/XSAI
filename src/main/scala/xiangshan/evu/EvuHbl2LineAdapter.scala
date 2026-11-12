@@ -127,7 +127,6 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
     (!incoming.mask.andR || incoming.bytes =/= 64.U || incoming.addr(5, 0) =/= 0.U)
 
   val responses = Module(new RRArbiter(new EvuLineMemoryResponse(p), n))
-  io.client.resp <> responses.io.out
   for (i <- 0 until n) {
     responses.io.in(i).valid := states(i) === respond && !io.flush
     responses.io.in(i).bits := results(i)
@@ -137,6 +136,26 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
   val d = io.memory.resp.bits
   val waiting = states(d.tag) === readWait || states(d.tag) === writeWait
   io.memory.resp.ready := waiting
+  // Buffered responses have priority. A single-line final response can pass
+  // through, but an RMW Get must still issue its Put and wait for that Ack.
+  // D is accepted independently of client readiness; results/states retain
+  // the response if the bypass loses arbitration or the client backpressures.
+  val finalResponse = io.memory.resp.valid && waiting && !crosses(d.tag) &&
+    !dropped(d.tag) && !io.flush &&
+    (d.error || states(d.tag) === writeWait || !requests(d.tag).write)
+  val bypass = finalResponse && !responses.io.out.valid
+  val combinedReadData = Mux(second(d.tag), Cat(d.data, firstData(d.tag)), Cat(0.U(512.W), d.data))
+  val returnedReadData = (combinedReadData >> (requests(d.tag).addr(5, 0) << 3))(511, 0)
+  val bypassBits = WireDefault(results(d.tag))
+  bypassBits.error := d.error
+  bypassBits.fault := Mux(d.error, d.fault, EvuFault.None)
+  when(states(d.tag) === readWait && !requests(d.tag).write && !d.error) {
+    bypassBits.data := returnedReadData
+  }
+  io.client.resp.valid := responses.io.out.valid || bypass
+  io.client.resp.bits := Mux(bypass, bypassBits, responses.io.out.bits)
+  responses.io.out.ready := io.client.resp.ready
+  val bypassFire = bypass && io.client.resp.fire
   when(io.memory.resp.valid) {
     assert(waiting, "EVU received an HBL2 response for a free or non-waiting tag")
   }
@@ -166,11 +185,11 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
       }.otherwise {
         when(states(i) === readWait) {
           firstData(i) := d.data
-          val combined = Mux(second(i), Cat(d.data, firstData(i)), Cat(0.U(512.W), d.data))
-          results(i).data := (combined >> (requests(i).addr(5, 0) << 3))(511, 0)
+          results(i).data := returnedReadData
         }
         finishPart()
       }
+      when(bypassFire) { states(i) := idle }
     }
     when(io.flush) {
       when(states(i) === readWait || states(i) === writeWait) {

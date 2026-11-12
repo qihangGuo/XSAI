@@ -90,11 +90,11 @@ class EvuPreflightPipelineSpec extends AnyFlatSpec with ChiselScalatestTester wi
         dut.io.translation.response.valid.poke(false.B)
         dut.io.permissionFault.poke(false.B)
         dut.io.request.ready.expect(true.B)
-        dut.clock.step()
-        dut.io.request.valid.poke(false.B)
         dut.io.translation.request.valid.expect(true.B)
         val tag = dut.io.translation.request.bits.tag.peek().litValue
         dut.clock.step()
+        dut.io.request.valid.poke(false.B)
+        dut.io.translation.request.valid.expect(false.B)
         dut.io.translation.response.valid.poke(true.B)
         dut.io.translation.response.bits.tag.poke(tag.U)
         dut.io.translation.response.bits.answer.paddr.poke("hdead0000".U)
@@ -121,22 +121,79 @@ class EvuPreflightPipelineSpec extends AnyFlatSpec with ChiselScalatestTester wi
         }
         dut.io.permissionFault.poke(false.B)
         dut.io.request.ready.expect(true.B)
-        dut.clock.step()
-        dut.io.request.valid.poke(false.B)
+        dut.io.translation.request.valid.expect(true.B)
         dut.io.translation.request.bits.check.vaddr.expect("h80000100".U)
         val fresh = dut.io.translation.request.bits.tag.peek().litValue
         dut.clock.step()
+        dut.io.request.valid.poke(false.B)
         dut.io.translation.response.valid.poke(true.B)
         dut.io.translation.response.bits.tag.poke(fresh.U)
         dut.io.translation.response.bits.answer.paddr.poke("h80000100".U)
         dut.io.translation.response.bits.answer.fault.poke(EvuAddressFault.None)
         dut.clock.step()
         dut.io.translation.response.valid.poke(false.B)
-        dut.clock.step()
         dut.io.response.valid.expect(true.B)
         dut.io.response.bits.paddr.expect("h80000100".U)
         dut.io.response.bits.fault.expect(EvuAddressFault.None)
+        dut.clock.step()
+        dut.io.response.valid.expect(false.B)
+        dut.io.busy.expect(false.B)
       }
+    }
+  }
+
+  it should "retain an incoming check across TLB backpressure and hold the bypassed PMP fault" in {
+    test(new EvuPreflightPipeline).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      dut.io.cancel.poke(false.B)
+      dut.io.request.valid.poke(true.B)
+      dut.io.request.bits.vaddr.poke("h40000040".U)
+      dut.io.request.bits.write.poke(true.B)
+      dut.io.translation.request.ready.poke(false.B)
+      dut.io.translation.response.valid.poke(false.B)
+      dut.io.permissionFault.poke(false.B)
+      dut.io.response.ready.poke(false.B)
+      dut.io.request.ready.expect(true.B)
+      dut.io.translation.request.valid.expect(true.B)
+      dut.clock.step()
+      dut.io.request.valid.poke(false.B)
+      dut.io.request.bits.vaddr.poke("hdead0000".U)
+      dut.io.request.bits.write.poke(false.B)
+      for (_ <- 0 until 3) {
+        dut.io.translation.request.valid.expect(true.B)
+        dut.io.translation.request.bits.check.vaddr.expect("h40000040".U)
+        dut.io.translation.request.bits.check.write.expect(true.B)
+        dut.clock.step()
+      }
+      val tag = dut.io.translation.request.bits.tag.peek().litValue
+      dut.io.translation.request.ready.poke(true.B)
+      dut.clock.step()
+      val response = dut.io.translation.response
+      response.valid.poke(true.B)
+      response.bits.tag.poke(tag.U)
+      response.bits.answer.paddr.poke("h80000040".U)
+      response.bits.answer.gpaddr.poke("h90000040".U)
+      response.bits.answer.nonLeaf.poke(false.B)
+      response.bits.answer.fault.poke(EvuAddressFault.None)
+      response.bits.miss.poke(false.B)
+      response.bits.uncacheable.poke(false.B)
+      dut.clock.step()
+      response.valid.poke(false.B)
+      dut.io.permissionFault.poke(true.B)
+      dut.io.response.valid.expect(true.B)
+      dut.io.response.bits.fault.expect(EvuAddressFault.Access)
+      dut.clock.step()
+      dut.io.permissionFault.poke(false.B)
+      for (_ <- 0 until 3) {
+        dut.io.response.valid.expect(true.B)
+        dut.io.response.bits.fault.expect(EvuAddressFault.Access)
+        dut.io.response.bits.paddr.expect("h80000040".U)
+        dut.io.response.bits.gpaddr.expect("h90000040".U)
+        dut.clock.step()
+      }
+      dut.io.response.ready.poke(true.B)
+      dut.clock.step()
+      dut.io.response.valid.expect(false.B)
+      dut.io.busy.expect(false.B)
     }
   }
 }

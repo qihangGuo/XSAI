@@ -44,4 +44,8 @@ class Mcfg(cfg: FuConfig)(implicit p: Parameters) extends PipedFuncUnit(cfg) {
   io.out.bits.res.data := Mux(isMgetcfg, io.in.bits.ctrl.mcfgReadRaw.getOrElse(0.U), mcfgRaw)
   io.out.bits.ctrl.exceptionVec.get := 0.U.asTypeOf(io.out.bits.ctrl.exceptionVec.get)
   io.out.bits.ctrl.exceptionVec.get(ExceptionNO.illegalInstr) := unsupported
+  // Re-publish the decoded serialization request at writeback: the ROB's
+  // oldest exception record may no longer hold the enqueue-time notification.
+  io.out.bits.ctrl.flushPipe.get := io.in.bits.ctrl.flushPipe.get &&
+    MSetOpType.isMsetcfg(io.in.bits.ctrl.fuOpType) && !unsupported
 }

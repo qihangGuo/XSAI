@@ -3,13 +3,12 @@ package xiangshan.evu
 import chisel3._
 import chisel3.util._
 
-/** Version 1 of the independent, RV64 external-vector context interface. */
+/** Version 2: returned-VL configuration instructions, no quant descriptors. */
 object EvuCSRs {
+  val abiVersion = 2
   val cfg = 0x8c0
   val fflags = 0x8c1
   val vxsat = 0x8c2
-  // Reserved context slots retained for CSR/checkpoint ABI compatibility.
-  val descriptorBase = 0x8d0
   val state = 0xbc8
   val vlenb = 0xcd0
   val capability = 0xcd1
@@ -17,21 +16,44 @@ object EvuCSRs {
   val cause = 0xcd3
   val epc = 0xcd4
   val tval = 0xcd5
-  val descriptorCount = 8
   val addresses: Seq[Int] = Seq(cfg, fflags, vxsat) ++
-    (0 until descriptorCount).map(descriptorBase + _) ++
     Seq(state, vlenb, capability, status, cause, epc, tval)
-  val snapshotWords = 21 // legacy five views, flags/sat/state, error triple/status, eight descriptors
+  val snapshotWords = 13 // vector views, flags/state, error records, EVCFG
 
   def contains(addr: UInt): Bool = addresses.map(a => addr === a.U).reduce(_ || _)
   def needsDrain(addr: UInt): Bool = Seq(cfg, fflags, vxsat, state, status, cause, epc, tval)
-    .map(a => addr === a.U).reduce(_ || _) ||
-    (addr >= descriptorBase.U && addr < (descriptorBase + descriptorCount).U)
+    .map(a => addr === a.U).reduce(_ || _)
 
   def capabilityValue(p: EvuParams): BigInt =
-    BigInt(1) | (BigInt(descriptorCount) << 8) | (BigInt(7) << 16) |
-      (BigInt(1) << 24) | (BigInt(if (p.fpQuantSupported) 1 else 0) << 25) |
-      (BigInt(1) << 26) // fixed RNE, packed FP32 quantization to CUTE, immediate gather
+    BigInt(abiVersion) | (BigInt(7) << 16) |
+      (BigInt(1) << 24) | // bit 25 is reserved after retirement of direct quantization
+      (BigInt(1) << 26) | (BigInt(1) << 27) | (BigInt(1) << 28) | (BigInt(1) << 29)
+}
+
+/** Shared by scalar VL writeback and the authoritative retired CSR update. */
+object EvuConfigRules {
+  def requestedType(instruction: UInt, registerType: UInt): UInt =
+    Mux(instruction(31, 25) === EvuIsa.setvli,
+      Cat(instruction(14, 12), instruction(24, 20)).pad(64), registerType)
+
+  def normalize(p: EvuParams, avl: UInt, requestedType: UInt,
+      enable: Bool = true.B, forceVill: Bool = false.B): EvuExecutionConfig = {
+    val result = Wire(new EvuExecutionConfig(p))
+    val requested = requestedType.pad(64)
+    val sew = requested(5, 3)
+    val lmul = requested(2, 0)
+    val base = p.vlenBytes.U(32.W) >> sew
+    val maximum = Mux(lmul(2), base >> (8.U - lmul), base << lmul(1, 0))
+    val illegal = forceVill || requested(63, 8).orR ||
+      sew > EvuIsa.maxSupportedSew.U || lmul === 4.U || maximum === 0.U
+    result.valid := true.B
+    result.configured := enable
+    result.vill := enable && illegal
+    result.vtype := Mux(!enable, 0x10.U, Mux(illegal, 0.U, requested(7, 0)))
+    result.vl := Mux(!enable, (p.vlenBits / 32).U,
+      Mux(illegal, 0.U, Mux(avl > maximum, maximum, avl)))
+    result
+  }
 }
 
 class EvuExecutionConfig(p: EvuParams) extends Bundle {

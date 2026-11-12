@@ -39,8 +39,8 @@ class EvuSaturnMemoryTagHarnessImp(outer: EvuSaturnMemoryTagHarness)(implicit p:
   }))
   backend.io.command <> io.command
   if (outer.integerOverlapOnly) {
-    // Constrain the dynamic decode so FIRRTL can prune unexercised FP and
-    // quant datapaths from this Treadle test, not from production hardware.
+    // Constrain the dynamic decode so FIRRTL can prune unexercised FP
+    // datapaths from this Treadle test, not from production hardware.
     backend.io.command.bits.opcode := Mux(io.command.bits.opcode === EvuOpcode.Load, EvuOpcode.Load,
       Mux(io.command.bits.opcode === EvuOpcode.Store, EvuOpcode.Store, EvuOpcode.Add))
     backend.io.command.bits.sew := 2.U
@@ -60,10 +60,6 @@ class EvuSaturnMemoryTagHarnessImp(outer: EvuSaturnMemoryTagHarness)(implicit p:
   backend.io.vlmulMag := 0.U
   backend.io.vstart := 0.U
   backend.io.vill := false.B
-  backend.io.cuteWrite.ready := true.B
-  backend.io.matrixInput.valid := false.B
-  backend.io.matrixInput.bits := 0.U.asTypeOf(backend.io.matrixInput.bits)
-  backend.io.matrixOutput.ready := true.B
 
   val bus = outer.visibility.out.head._1
   bus.a.valid := false.B

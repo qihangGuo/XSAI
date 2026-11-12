@@ -27,6 +27,7 @@ class RegisterReadCollector(implicit p: Parameters) extends CoreModule()(p) with
     val prefetchUsed = Output(Bool())
     val prefetchDiscarded = Output(Bool())
     val demandPrefetchWait = Output(Bool())
+    val held = Output(Bool())
   })
 
   val pending = RegInit(false.B)
@@ -40,6 +41,7 @@ class RegisterReadCollector(implicit p: Parameters) extends CoreModule()(p) with
   io.client.resp := Mux(buffered, data, io.memory.resp.bits)
   val discard = available && !io.client.req.fire &&
     ((!speculative && !io.client.req.valid) || (io.client.req.valid && !matches))
+  io.held := available && !io.client.req.fire && !discard
   val canIssue = !pending || io.client.req.fire || discard
   val demand = io.client.req.valid && !io.client.req.fire
   val usePrefetch = io.prefetch.valid && !demand
@@ -85,28 +87,35 @@ class OldestRRArbiter(val n: Int)(implicit p: Parameters) extends Module {
   val hasDemand = io.in.zip(io.speculative).map { case (in, spec) => in.valid && !spec }.reduce(_ || _)
   val eligible = io.speculative.map(spec => !hasDemand || !spec)
   for (i <- 0 until n) {
-    arb.io.in(i).valid := io.in(i).valid && eligible(i)
     arb.io.in(i).bits := io.in(i).bits
   }
 
-  val oldest = VecInit(io.in.zip(eligible).map { case (in, allow) => in.valid && allow && in.bits.oldest })
-  val oldestWinner = PriorityEncoderOH(oldest)
-  val useOldest = oldest.asUInt.orR
-
-  io.out.valid := Mux(useOldest, true.B, arb.io.out.valid)
-  io.out.bits := Mux(useOldest,
-    Mux1H(oldestWinner, io.in.map(_.bits)),
-    arb.io.out.bits)
-  io.chosen := Mux(useOldest,
-    PriorityEncoder(oldestWinner),
-    arb.io.chosen)
-  arb.io.out.ready := io.out.ready && !useOldest
-
-  for (i <- 0 until n) {
-    io.in(i).ready := Mux(useOldest,
-      oldestWinner(i) && io.out.ready,
-      arb.io.in(i).ready && eligible(i))
+  val age = RegInit(VecInit.fill(n)(0.U(3.W)))
+  val previousEg = Reg(Vec(n, chiselTypeOf(io.in.head.bits.eg)))
+  val tracked = RegInit(VecInit.fill(n)(false.B))
+  val rank = io.in.indices.map { i =>
+    val same = tracked(i) && previousEg(i) === io.in(i).bits.eg
+    Cat(age(i).andR && same && !io.speculative(i),
+      io.in(i).bits.oldest, io.in(i).bits.lastOperand)
   }
+  val bestRank = io.in.indices.map(i => Mux(io.in(i).valid && eligible(i), rank(i), 0.U))
+    .reduce((a, b) => Mux(a > b, a, b))
+  for (i <- 0 until n) {
+    val selectedClass = rank(i) === bestRank
+    arb.io.in(i).valid := io.in(i).valid && eligible(i) && selectedClass
+    io.in(i).ready := arb.io.in(i).ready && eligible(i) && selectedClass
+    when(!io.in(i).valid || io.speculative(i) || io.in(i).fire) {
+      age(i) := 0.U
+      tracked(i) := false.B
+    }.otherwise {
+      tracked(i) := true.B
+      previousEg(i) := io.in(i).bits.eg
+      when(!tracked(i) || previousEg(i) =/= io.in(i).bits.eg) { age(i) := 0.U }
+        .elsewhen(io.out.fire && !age(i).andR) { age(i) := age(i) + 1.U }
+    }
+  }
+  io.out <> arb.io.out
+  io.chosen := arb.io.chosen
 }
 
 class RegisterReadXbar(n: Int, banks: Int)(implicit p: Parameters) extends CoreModule()(p) with HasVectorParams {
@@ -130,6 +139,7 @@ class RegisterReadXbar(n: Int, banks: Int)(implicit p: Parameters) extends CoreM
       arbs(j).io.in(i).valid := io.in(i).req.valid && bank_sel(j)
       arbs(j).io.in(i).bits.eg := io.in(i).req.bits.eg >> bankOffset
       arbs(j).io.in(i).bits.oldest := io.in(i).req.bits.oldest
+      arbs(j).io.in(i).bits.lastOperand := io.in(i).req.bits.lastOperand
       arbs(j).io.speculative(i) := io.in(i).speculative
     }
     io.in(i).req.ready := Mux1H(bank_sel, arbs.map(_.io.in(i).ready))
@@ -178,11 +188,13 @@ class VrfPerf extends Bundle {
   val prefetchDeferred = UInt(64.W)
   val prefetchUsed = UInt(64.W)
   val prefetchDiscarded = UInt(64.W)
+  val byRead = Vec(EvuReadClass.names.size, new EvuReadPerf)
 }
 
 class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrites: Int, maxDepth: Int,
                    sramSuffix: String = "evu_vrf", prefetchPorts: Seq[(Int, Int)] = Seq.empty,
-                   trackWrites: Boolean = false, scalarPorts: Seq[(Int, Int)] = Seq.empty)
+                   trackWrites: Boolean = false, scalarPorts: Seq[(Int, Int)] = Seq.empty,
+                   readClasses: Seq[Int] = Seq.empty)
                   (implicit p: Parameters) extends CoreModule()(p) with HasVectorParams {
 
   val io = IO(new RegisterFileIO(reads, maskReads, pipeWrites, llWrites, maxDepth,
@@ -259,6 +271,26 @@ class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrit
   io.perf.prefetchUsed := diagnosticCount("prefetchUsed", PopCount(VecInit(collectors.map(_.io.prefetchUsed).toSeq)))
   io.perf.prefetchDiscarded := diagnosticCount("prefetchDiscarded",
     PopCount(VecInit(collectors.map(_.io.prefetchDiscarded).toSeq)))
+  require(readClasses.isEmpty || readClasses.size == collectors.size)
+  if (vParams.diagnosticCounters) {
+    val classes = if (readClasses.isEmpty) Seq.fill(collectors.size)(4) else readClasses
+    for ((name, k) <- EvuReadClass.names.zipWithIndex) {
+      val selected = collectors.zip(classes).collect { case (c, id) if id == k => c }
+      val stat = io.perf.byRead(k)
+      def count(field: String, event: RegisterReadCollector => Bool): UInt =
+        diagnosticCount(s"diag_read_${name}_$field", PopCount(VecInit(selected.map(event).toSeq :+ false.B)))
+      def writing(c: RegisterReadCollector): Bool = vrf.io.diagnosticWrites(vrfBank(c.io.memory.req.bits.eg))
+      stat.requests := count("requests", c => c.io.client.req.valid)
+      stat.grants := count("grants", c => c.io.memory.req.fire && !c.io.memory.speculative)
+      stat.readBlocked := count("readBlocked", c => c.io.grantWait && !writing(c))
+      stat.writeBlocked := count("writeBlocked", c => c.io.grantWait && writing(c))
+      stat.responseWait := count("responseWait", _.io.responseWait)
+      stat.held := count("held", _.io.held)
+      stat.prefetchUsed := count("prefetchUsed", _.io.prefetchUsed)
+      stat.lastGranted := count("lastGranted", c => c.io.memory.req.fire && !c.io.memory.speculative && c.io.memory.req.bits.lastOperand)
+      stat.lastBlocked := count("lastBlocked", c => c.io.grantWait && c.io.memory.req.bits.lastOperand)
+    }
+  }
 }
 
 class SramRegisterFileIO(
@@ -282,6 +314,7 @@ class SramRegisterFileIO(
   val perf = Output(new VrfPerf)
   val demandPrefetchBlocked = Output(Bool())
   val prefetchDeferred = Output(Bool())
+  val diagnosticWrites = Output(Vec(vParams.vrfBanking, Bool()))
   val e0Values = Option.when(scalarForwarding)(Output(Vec(32, Valid(UInt(32.W)))))
 }
 
@@ -420,7 +453,7 @@ class AraRegisterFile(
     val readArb = Module(new OldestRRArbiter(requesterCount))
     val readPorts = allXbars.map(_(bank))
     val readReqs = readPorts.map(_.req)
-    val ranks = readPorts.map(port => Cat(!port.speculative, port.req.bits.oldest))
+    val ranks = readPorts.map(port => Cat(!port.speculative, port.req.bits.oldest, port.req.bits.lastOperand))
 
     // Equal-row sharing must retain the strongest demand/age priority.
     for (requester <- 0 until requesterCount) {
@@ -440,6 +473,7 @@ class AraRegisterFile(
     val hasPipeWrite = pipeValid(bank)
     val hasLlWrite = llPendingValid(bank) && !hasPipeWrite
     val hasWrite = hasPipeWrite || hasLlWrite
+    io.diagnosticWrites(bank) := (if (vParams.diagnosticCounters) hasWrite && !reset.asBool else false.B)
     io.pendingWrites.foreach { pending =>
       pending(bank).valid := llPendingValid(bank) && llOwners.get(bank).valid && !reset.asBool
       pending(bank).bits.eg := llPending(bank).eg
@@ -540,6 +574,7 @@ class AraRegisterFile(
   io.perf.prefetchDeferred := 0.U
   io.perf.prefetchUsed := 0.U
   io.perf.prefetchDiscarded := 0.U
+  io.perf.byRead := 0.U.asTypeOf(io.perf.byRead)
   io.demandPrefetchBlocked := demandPrefetchBlocked.asUInt.orR
   io.prefetchDeferred := prefetchDeferred.asUInt.orR
 }

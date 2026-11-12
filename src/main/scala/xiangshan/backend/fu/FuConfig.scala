@@ -386,10 +386,10 @@ object FuConfig {
     fuType = FuType.evu,
     fuGen = (p: Parameters, cfg: FuConfig) => Module(new EvuFuncUnit(cfg)(p).suggestName("Evu")),
     srcData = Seq(
-      Seq(IntData()),
+      Seq(IntData(), IntData()),
     ),
     piped = true,
-    writeIntRf = false,
+    writeIntRf = true,
     latency = CertainLatency(0),
     needAmuCtrl = true,
     immType = Set(SelImm.IMM_EVU),
@@ -493,6 +493,7 @@ object FuConfig {
     writeIntRf = true,
     latency = CertainLatency(0),
     exceptionOut = Seq(illegalInstr),
+    flushPipe = true,
   )
 
   val MmaCfg: FuConfig = FuConfig (

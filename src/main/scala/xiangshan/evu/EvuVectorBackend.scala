@@ -43,10 +43,6 @@ class EvuVectorBackendIO(p: EvuParams) extends Bundle {
   val vlmulMag = Input(UInt(2.W))
   val vstart = Input(UInt(log2Ceil(p.vlenBits + 1).W))
   val vill = Input(Bool())
-  val cuteWrite = Decoupled(new EvuCuteWrite(p))
-  val matrixInput = Flipped(Decoupled(new MatrixMicroBlock(p)))
-  val matrixOutput = Decoupled(new MatrixMicroBlock(p))
-  val matrixFflags = Output(UInt(5.W))
   val vrfPerf = Output(new xiangshan.evu.backend.VrfPerf)
   val executionPerf = Output(new xiangshan.evu.common.EvuExecutionPerf)
   val memoryOrderStalls = Output(UInt(64.W))
@@ -54,6 +50,7 @@ class EvuVectorBackendIO(p: EvuParams) extends Bundle {
   val memoryComputeOverlap = Output(UInt(64.W))
   val memoryOutstanding = Output(UInt(log2Ceil(p.memoryCommandDepth + 1).W))
   val memoryStorePending = Output(Bool())
+  val memoryDiagnostic = Output(new xiangshan.evu.common.EvuMemoryDiagnostic)
 }
 
 /**
@@ -61,7 +58,7 @@ class EvuVectorBackendIO(p: EvuParams) extends Bundle {
   *
   * Saturn is the EVU execution engine: its issue queues, element-group
   * chaining and RegisterFile are the only architectural vector state. This
-  * adapter translates command metadata and exposes the same VRF to fused paths.
+  * adapter translates command metadata without any external VRF consumers.
   * It maps VAT releases back to EVU job IDs and remaps the independent load/store tags into one
   * HBL2 source-ID namespace.
   */
@@ -88,6 +85,8 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     pipelinedVatClear = true,
     issStructure = if (p.splitFpIssue) xiangshan.evu.common.VectorIssueStructure.SplitFP else VectorParams.lgvParams.issStructure,
     reductionContexts = p.reductionContexts,
+    fmaOrdinaryContexts = p.fmaOrdinaryContexts,
+    parallelFp32Div = p.parallelFp32Div,
     interleaveReductions = p.interleaveReductions
   )
   private implicit val saturnP: Parameters = EvuVectorParameters(
@@ -103,7 +102,6 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   private val saturn = withReset(reset.asBool || io.flush) {
     Module(new EvuVectorSubsystem()(saturnP))
   }
-  private val special = Module(new EvuSpecialSequencer(p))
   io.debugVrf.foreach(_ := saturn.io.debugVrf.get)
   io.vrfPerf := saturn.io.vrfPerf
   io.executionPerf := saturn.io.executionPerf
@@ -111,25 +109,6 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   val localVl = Mux(cmd.aux(6), Mux(cmd.vl === 0.U || io.vstart =/= 0.U, 0.U, 1.U), cmd.vl)
   private val zeroCompletionPending = RegInit(false.B)
   private val zeroCompletionReg = RegInit(0.U.asTypeOf(new EvuCompletion(p)))
-
-  // Translate the EVU architectural (register, DLEN chunk) view used by the
-  // special sequencer to Saturn's element-group address space.
-  private val specialChunkBits = log2Ceil(p.vlenBits / p.dlenBits)
-  for (i <- 0 until 3) {
-    saturn.io.special.read(i).req.valid := special.io.vrf.read(i).valid && !io.flush
-    saturn.io.special.read(i).req.bits.eg :=
-      (special.io.vrf.read(i).bits.addr << specialChunkBits) + special.io.vrf.read(i).bits.chunk
-    saturn.io.special.read(i).req.bits.oldest := special.io.vrf.read(i).bits.oldest
-    special.io.vrf.read(i).ready := saturn.io.special.read(i).req.ready && !io.flush
-    special.io.vrf.readData(i) := saturn.io.special.read(i).resp
-  }
-  special.io.flush := io.flush
-  special.io.cuteWrite <> io.cuteWrite
-  // The matrix input connection is installed after the cross-path hazard
-  // table below.  This prevents a CUTE parameter read from racing a Saturn
-  // write in the same cycle.
-  io.matrixOutput <> special.io.matrix.out
-  io.matrixFflags := special.io.matrix.fflags
 
   private def isSaturnOpcode(opcode: UInt): Bool = Seq(
     EvuOpcode.Add, EvuOpcode.Sub, EvuOpcode.And, EvuOpcode.Or, EvuOpcode.Xor,
@@ -142,7 +121,7 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     EvuOpcode.WMul, EvuOpcode.SatAdd, EvuOpcode.SatSub, EvuOpcode.SlideUp,
     EvuOpcode.SlideDown, EvuOpcode.ReduceAnd, EvuOpcode.ReduceOr, EvuOpcode.ReduceXor,
     EvuOpcode.Load, EvuOpcode.Store, EvuOpcode.Gather, EvuOpcode.GatherImm, EvuOpcode.Exp2
-  ).map(opcode === _).reduce(_ || _)
+  ).map(opcode === _).reduce(_ || _) || EvuRvvMath.contains(opcode) || EvuLowPrecision.contains(opcode)
 
   val isMemory = cmd.opcode === EvuOpcode.Load || cmd.opcode === EvuOpcode.Store
   val nextVat = RegInit(0.U(saturnParams.vatSz.W))
@@ -153,6 +132,7 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   io.memoryStorePending := saturn.io.memoryStorePending
   val isExp2 = cmd.opcode === EvuOpcode.Exp2
   val isGatherImm = cmd.opcode === EvuOpcode.GatherImm
+  val isSlide = EvuIsa.isSlide(cmd.opcode)
   val supportedWidth = EvuIsa.supportsElementWidth(cmd.opcode, cmd.sew)
   val isOpm = Seq(EvuOpcode.Mul, EvuOpcode.Mac, EvuOpcode.ReduceSum, EvuOpcode.ReduceMax, EvuOpcode.ReduceMin, EvuOpcode.WAdd, EvuOpcode.WSub, EvuOpcode.WMul, EvuOpcode.ReduceAnd, EvuOpcode.ReduceOr, EvuOpcode.ReduceXor).map(cmd.opcode === _).reduce(_ || _)
   val isOpf = Seq(EvuOpcode.FAdd, EvuOpcode.FSub, EvuOpcode.FMul, EvuOpcode.FMacc, EvuOpcode.FDiv, EvuOpcode.FMin, EvuOpcode.FMax, EvuOpcode.FReduceSum, EvuOpcode.FReduceMin, EvuOpcode.FReduceMax, EvuOpcode.Exp2).map(cmd.opcode === _).reduce(_ || _)
@@ -171,8 +151,6 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     EvuOpcode.Max -> OPIFunct6.max.asUInt,
     EvuOpcode.SatAdd -> OPIFunct6.sadd.asUInt,
     EvuOpcode.SatSub -> OPIFunct6.ssub.asUInt,
-    EvuOpcode.SlideUp -> OPIFunct6.slideup.asUInt,
-    EvuOpcode.SlideDown -> OPIFunct6.slidedown.asUInt,
     EvuOpcode.Gather -> OPIFunct6.rgather.asUInt
   ))
   val opmFunct6 = MuxLookup(cmd.opcode, OPMFunct6.mul.asUInt)(Seq(
@@ -201,7 +179,10 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     EvuOpcode.FReduceMax -> OPFFunct6.fredmax.asUInt,
     EvuOpcode.Exp2 -> OPFFunct6.funary1.asUInt
   ))
-  val arithmeticBits = Mux(isGatherImm, EvuSaturnGather.encodeImmediate(cmd), Cat(
+  val arithmeticBits = Mux(EvuLowPrecision.contains(cmd.opcode), EvuLowPrecision.encode(cmd),
+    Mux(EvuRvvMath.contains(cmd.opcode), EvuRvvMath.encode(cmd),
+    Mux(isSlide, EvuSaturnSlide.encode(cmd),
+    Mux(isGatherImm, EvuSaturnGather.encodeImmediate(cmd), Cat(
     Mux(isOpf, opfFunct6, Mux(isOpm, opmFunct6, opiFunct6)),
     // Custom xv commands encode {mask-enable, vm} in aux[1:0].  Existing
     // Saturn-routed commands leave aux[1] clear and therefore remain
@@ -212,38 +193,37 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     Mux(isOpf, VectorConsts.OPFVV, Mux(isOpm, VectorConsts.OPMVV, VectorConsts.OPIVV)),
     cmd.vd,
     VectorConsts.opcVector
-  ))
+  )))))
   val memoryBits = EvuSaturnMemory.encode(cmd)
 
-  val isSpecialOpcode = Seq(EvuOpcode.FpQuantToCute, EvuOpcode.Scatter,
-    EvuOpcode.Invalid).map(cmd.opcode === _).reduce(_ || _)
+  // Invalid, retired and unsupported commands must complete with an error,
+  // even at VL=0. They must not wait for a removed special execution path.
+  val unsupportedOpcode = !isSaturnOpcode(cmd.opcode)
   // RVV permits VL=0 as a completed no-op. Do not send it into Saturn's
   // sequencer (which quite correctly expects at least one element); emit a
   // normal ordered completion instead.
-  val zeroCommand = io.command.valid && !isSpecialOpcode &&
+  val zeroCommand = io.command.valid &&
     isSaturnOpcode(cmd.opcode) && (localVl === 0.U || (isExp2 && io.vstart >= localVl))
   // Width errors are completed in order, just like VL=0 no-ops.  They must
   // never enter a sequencer after its 64-bit element datapaths were removed.
   val unsupportedWidthCommand = io.command.valid && !supportedWidth &&
     cmd.opcode =/= EvuOpcode.SetVli && cmd.opcode =/= EvuOpcode.SetVl
-  val immediateCompletion = zeroCommand || unsupportedWidthCommand
+  val encodedLmul = Mux(io.vlmulSign, (8.U - io.vlmulMag)(2, 0), io.vlmulMag.pad(3))
+  val invalidMathGroup = EvuRvvMath.contains(cmd.opcode) &&
+    (!EvuRvvMath.validGroups(cmd.opcode, cmd.vd, cmd.vs1, cmd.vs2, encodedLmul) ||
+      (cmd.aux(6) && (encodedLmul =/= 0.U || cmd.sew =/= 2.U)) || cmd.aux(1))
+  val invalidLowPrecision = EvuLowPrecision.contains(cmd.opcode) &&
+    (!EvuLowPrecision.validGroups(cmd.opcode, cmd.vd, cmd.vs1, cmd.vs2, encodedLmul) ||
+      cmd.aux =/= 0.U || io.vstart =/= 0.U || cmd.vl > (p.vlenBits / 32).U)
+  val invalidSlideGroup = isSlide &&
+    !EvuSaturnSlide.validGroups(cmd.opcode, cmd.vd, cmd.vs2, encodedLmul)
+  val illegalCommand = unsupportedOpcode || io.vill || !supportedWidth || invalidMathGroup || invalidLowPrecision || invalidSlideGroup
+  val immediateCompletion = zeroCommand || unsupportedWidthCommand ||
+    (io.command.valid && (unsupportedOpcode || io.vill || invalidMathGroup || invalidLowPrecision || invalidSlideGroup))
 
-  // Cross-path register hazards. Saturn's VAT tracks ordinary Saturn
-  // operations internally; these entries extend that contract to the fused
-  // special sequencer and CUTE parameter reads. One entry is kept per EVU job
-  // so an early completion cannot clear a later command's reservation.
+  // Keep command-window credits and non-chainable register reservations
+  // until completion. Saturn's VAT handles ordinary element-group hazards.
   private val reservations = Module(new EvuCommandScoreboard(p))
-  // Two queued inputs + two arithmetic stages + two output slots. Eight
-  // metadata-only credits keep the pipeline fed without a second data buffer.
-  private val matrixCredits = 8
-  private val matrixHazardCount = RegInit(0.U(log2Ceil(matrixCredits + 1).W))
-  private val matrixHazardHead = RegInit(0.U(log2Ceil(matrixCredits).W))
-  private val matrixHazardTail = RegInit(0.U(log2Ceil(matrixCredits).W))
-  private val matrixHazardRead = RegInit(VecInit.fill(matrixCredits)(0.U(p.vectorRegs.W)))
-  val busyWriteMask = reservations.io.busyWriteMask
-  val incomingMatrixMask = UIntToOH(io.matrixInput.bits.scaleTag(4, 0), p.vectorRegs) |
-    UIntToOH(io.matrixInput.bits.biasTag(4, 0), p.vectorRegs)
-  val matrixReadMask = matrixHazardRead.reduce(_ | _)
 
   val commandReadMask = WireDefault(0.U(p.vectorRegs.W))
   val commandWriteMask = WireDefault(0.U(p.vectorRegs.W))
@@ -252,24 +232,23 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   val reduction = Seq(EvuOpcode.ReduceSum, EvuOpcode.ReduceMax, EvuOpcode.ReduceMin,
     EvuOpcode.ReduceAnd, EvuOpcode.ReduceOr, EvuOpcode.ReduceXor,
     EvuOpcode.FReduceSum, EvuOpcode.FReduceMin, EvuOpcode.FReduceMax).map(cmd.opcode === _).reduce(_ || _)
-  val destinationRegisters = Mux(reduction, 1.U,
-    Mux(widening && !io.vlmulSign, groupRegisters << 1, groupRegisters))
+  val destinationRegisters = Mux(EvuRvvMath.contains(cmd.opcode),
+    EvuRvvMath.destinationRegisters(cmd.opcode, encodedLmul), Mux(reduction, 1.U,
+      Mux(widening && !io.vlmulSign, groupRegisters << 1, groupRegisters)))
+  val sourceRegisters = Mux(EvuRvvMath.contains(cmd.opcode),
+    EvuRvvMath.sourceRegisters(cmd.opcode, encodedLmul), groupRegisters)
   def registerGroup(reg: UInt, count: UInt): UInt = VecInit((0 until p.vectorRegs).map { i =>
     i.U >= reg && i.U < (reg +& count)
   }).asUInt
-  when (isSpecialOpcode) {
-    when (cmd.opcode === EvuOpcode.FpQuantToCute) {
-      // The FP command reads probabilities in vs2 and inverse scales in rd.
-      commandReadMask := UIntToOH(cmd.vs2, p.vectorRegs) | UIntToOH(cmd.vd, p.vectorRegs)
-    }
-  }.elsewhen (isSaturnOpcode(cmd.opcode)) {
+  when (isSaturnOpcode(cmd.opcode) && !illegalCommand) {
     commandReadMask := registerGroup(cmd.vs1, Mux(reduction, 1.U, groupRegisters)) |
-      registerGroup(cmd.vs2, groupRegisters) |
+      registerGroup(cmd.vs2, sourceRegisters) |
       Mux(cmd.opcode === EvuOpcode.Mac || cmd.opcode === EvuOpcode.FMacc,
         registerGroup(cmd.vd, destinationRegisters), 0.U) |
       Mux(cmd.aux(1) && !cmd.aux(0), UIntToOH(0.U, p.vectorRegs), 0.U)
-    when (isExp2 || isGatherImm) {
-      commandReadMask := registerGroup(cmd.vs2, groupRegisters) |
+    when (isExp2 || isGatherImm || isSlide || EvuRvvMath.unary(cmd.opcode) || EvuRvvMath.immediate(cmd.opcode) ||
+        EvuLowPrecision.unary(cmd.opcode)) {
+      commandReadMask := registerGroup(cmd.vs2, sourceRegisters) |
         Mux(cmd.aux(1) && !cmd.aux(0), UIntToOH(0.U, p.vectorRegs), 0.U)
     }
     when (cmd.opcode === EvuOpcode.Load) {
@@ -281,14 +260,12 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
       commandWriteMask := registerGroup(cmd.vd, destinationRegisters)
     }
   }
-  // Bound memory commands independently of arithmetic. Ordinary Saturn pairs
-  // retain EG hazards; special and matrix paths retain whole-register guards.
+  // Bound memory commands independently of arithmetic and retain EG hazards.
   reservations.io.commandValid := io.command.valid
   reservations.io.readMask := commandReadMask
   reservations.io.writeMask := commandWriteMask
-  reservations.io.matrixReadMask := matrixReadMask
   reservations.io.isMemory := isMemory
-  reservations.io.chainable := isSaturnOpcode(cmd.opcode) && !isSpecialOpcode && !immediateCompletion
+  reservations.io.chainable := isSaturnOpcode(cmd.opcode) && !immediateCompletion
   reservations.io.jobId := cmd.jobId
   reservations.io.accept := io.command.fire
   reservations.io.release.valid := io.completion.fire
@@ -300,32 +277,16 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   io.memoryComputeOverlap := reservations.io.memoryComputeOverlap
   io.memoryOutstanding := reservations.io.memoryOutstanding
 
-  // Matrix/CUTE consumes scale and bias through the same VRF. It has no
-  // architectural write, but its read reservation must remain until the
-  // transformed beat leaves the special sequencer.
-  val matrixInputAllowed = matrixHazardCount < matrixCredits.U &&
-    !((incomingMatrixMask & busyWriteMask).orR)
-
-  special.io.matrix.in.valid := io.matrixInput.valid && matrixInputAllowed && !io.command.valid && !io.flush
-  special.io.matrix.in.bits := io.matrixInput.bits
-  io.matrixInput.ready := special.io.matrix.in.ready && matrixInputAllowed &&
-    !io.command.valid && !io.flush
-
   saturn.io.issue.valid := io.command.valid && isSaturnOpcode(cmd.opcode) &&
-    !isSpecialOpcode && !immediateCompletion && supportedWidth && commandHazardFree && contextAvailable && !io.flush
-  special.io.command.valid := io.command.valid && isSpecialOpcode && supportedWidth &&
-    commandHazardFree && !io.flush
-  special.io.invalidate := io.command.fire && commandWriteMask.orR
-  special.io.command.bits := cmd
+    !immediateCompletion && supportedWidth && commandHazardFree && contextAvailable && !io.flush
   val backendReady = Mux(immediateCompletion, !zeroCompletionPending,
-    Mux(isSpecialOpcode, special.io.command.ready && supportedWidth,
-      saturn.io.issue.ready && contextAvailable && isSaturnOpcode(cmd.opcode) && supportedWidth &&
-        cmd.vl =/= 0.U && !io.flush))
+    saturn.io.issue.ready && contextAvailable && isSaturnOpcode(cmd.opcode) && supportedWidth &&
+      cmd.vl =/= 0.U && !io.flush)
   io.command.ready := backendReady && commandHazardFree && !io.flush
   saturn.io.issue.bits := 0.U.asTypeOf(saturn.io.issue.bits)
   saturn.io.issue.bits.bits := Mux(isMemory, memoryBits, arithmeticBits)
   saturn.io.issue.bits.vconfig.vl := localVl
-  saturn.io.issue.bits.scalarVrfSource := cmd.aux(5)
+  saturn.io.issue.bits.scalarVrfSource := cmd.aux(5) || EvuLowPrecision.scaled(cmd.opcode)
   saturn.io.issue.bits.vconfig.vtype.vill := io.vill
   saturn.io.issue.bits.vconfig.vtype.reserved := 0.U
   saturn.io.issue.bits.vconfig.vtype.vma := io.vma
@@ -344,7 +305,7 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   saturn.io.issue.bits.page := Mux(cmd.pageMap.enabled, 0.U, cmd.base >> 12)
   saturn.io.issue.bits.conservativeMemoryOrdering := cmd.pageMap.enabled
   saturn.io.issue.bits.rm := 0.U
-  saturn.io.issue.bits.emul := 0.U
+  saturn.io.issue.bits.emul := Mux(io.vlmulSign, 0.U, io.vlmulMag)
   saturn.io.issue.bits.fast_sg := false.B
   saturn.io.issue.bits.mop := Mux(cmd.stride === 0.S, VectorConsts.mopUnit, VectorConsts.mopStrided)
 
@@ -375,14 +336,14 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
       zeroCompletionReg.tvalValid := false.B
       zeroCompletionReg.opcode := cmd.opcode
       zeroCompletionReg.vd := cmd.vd
-      zeroCompletionReg.exception := io.vill || !supportedWidth
+      zeroCompletionReg.exception := illegalCommand
       zeroCompletionReg.fflags := 0.U
       zeroCompletionReg.vxsat := false.B
       // Like the reference, conservatively dirty arithmetic contexts even for
       // an empty ALU operation. Zero-length memory operations leave VS alone.
-      zeroCompletionReg.dirtyVs := !io.vill && supportedWidth &&
+      zeroCompletionReg.dirtyVs := !illegalCommand &&
         cmd.opcode =/= EvuOpcode.Load && cmd.opcode =/= EvuOpcode.Store
-      zeroCompletionReg.cause := Mux(io.vill || !supportedWidth, EvuFault.Illegal, EvuFault.None)
+      zeroCompletionReg.cause := Mux(illegalCommand, EvuFault.Illegal, EvuFault.None)
       zeroCompletionReg.jobId := cmd.jobId
       zeroCompletionReg.epoch := cmd.epoch
       zeroCompletionPending := true.B
@@ -444,37 +405,17 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   val zeroCompletion = Wire(Decoupled(new EvuCompletion(p)))
   zeroCompletion.valid := zeroCompletionPending && !io.flush
   zeroCompletion.bits := zeroCompletionReg
-  val completionArbiter = Module(new Arbiter(new EvuCompletion(p), 3))
+  val completionArbiter = Module(new Arbiter(new EvuCompletion(p), 2))
   completionArbiter.io.in(0) <> saturnCompletion
-  completionArbiter.io.in(1) <> special.io.completion
-  completionArbiter.io.in(2) <> zeroCompletion
+  completionArbiter.io.in(1) <> zeroCompletion
   io.completion <> completionArbiter.io.out
   when (zeroCompletion.fire) { zeroCompletionPending := false.B }
-  val matrixEnq = io.matrixInput.fire
-  val matrixDeq = io.matrixOutput.fire
-  when(matrixDeq) {
-    matrixHazardRead(matrixHazardHead) := 0.U
-    matrixHazardHead := matrixHazardHead + 1.U
-  }
-  when(matrixEnq) {
-    matrixHazardRead(matrixHazardTail) := incomingMatrixMask
-    matrixHazardTail := matrixHazardTail + 1.U
-  }
-  when(matrixEnq && !matrixDeq) {
-    matrixHazardCount := matrixHazardCount + 1.U
-  }.elsewhen(matrixDeq && !matrixEnq) {
-    matrixHazardCount := matrixHazardCount - 1.U
-  }
   when(io.flush) {
     contextLive.foreach(_ := false.B)
     pendingReleases := 0.U
     memoryErrorSticky.foreach(_ := false.B)
     zeroCompletionPending := false.B
     memoryFaultSticky.foreach(_ := EvuFault.None)
-    matrixHazardRead.foreach(_ := 0.U)
-    matrixHazardCount := 0.U
-    matrixHazardHead := 0.U
-    matrixHazardTail := 0.U
   }.otherwise {
     when(saturnCompletion.fire) { contextLive(completionVat) := false.B }
     pendingReleases := visibleReleases & ~Mux(saturnCompletion.fire, UIntToOH(completionVat, vatEntries), 0.U(vatEntries.W))
@@ -497,24 +438,24 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   val hblVat = Reg(Vec(p.maxMemOutstanding, UInt(saturnParams.vatSz.W)))
   private val saturnSlots = p.maxMemOutstanding
   require(saturnSlots > 0)
-  // These are client-local IDs; EvuMemoryTagRouter allocates global sources
-  // independently for Saturn and the matrix write-combining buffer.
+  // These are client-local IDs; line coalescing and the tag router retain
+  // physical ownership independently until Ack or completed flush drain.
   val freeMask = ((BigInt(1) << saturnSlots) - 1).U(p.maxMemOutstanding.W) & ~hblInFlight.asUInt
   val hasFreeTag = freeMask.orR
   val freeTag = PriorityEncoder(freeMask)
   val loadPending = saturn.io.dmem.load_req.valid
   val storePending = saturn.io.dmem.store_req.valid
-  // Saturn exposes independent load/store queues.  Prefer loads while the
-  // store queue is young, but force a pending store after a bounded wait so
-  // continuous loads cannot starve writeback.  WAIT/FENCE and command
-  // dependency protection remain in Saturn and the command scoreboard.
-  private val storeFairnessThreshold = 8
-  val storeWaitBits = log2Ceil(storeFairnessThreshold + 1)
-  // Count load grants rather than wall-clock cycles: downstream HBL2 back
-  // pressure should not consume the store's fairness budget.
-  val storeWaitGrants = RegInit(0.U(storeWaitBits.W))
-  val storeAged = storeWaitGrants >= storeFairnessThreshold.U
-  val chooseStore = storePending && (!loadPending || storeAged)
+  // Saturn's ready store already passed its ordering/data guards. Near a
+  // full command window, let it advance after two load grants instead of
+  // eight. Use registered occupancy, not the completion-credit bypass.
+  val requestArbiter = Module(new EvuVmuRequestArbiter)
+  requestArbiter.io.loadPending := loadPending
+  requestArbiter.io.storePending := storePending
+  requestArbiter.io.windowPressure := reservations.io.memoryOutstanding >=
+    (p.memoryCommandDepth - 1).max(1).U
+  requestArbiter.io.grant := io.memory.req.fire
+  requestArbiter.io.flush := io.flush
+  val chooseStore = requestArbiter.io.chooseStore
   val requestVat = Mux(chooseStore, saturn.io.dmem.store_req.bits.vat, saturn.io.dmem.load_req.bits.vat)
   val requestVirtualAddress = virtualBaseByVat(requestVat) +
     (Mux(chooseStore, saturn.io.dmem.store_req.bits.addr, saturn.io.dmem.load_req.bits.addr) &
@@ -536,17 +477,6 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   io.memory.req.bits.tag := freeTag
   saturn.io.dmem.load_req.ready := io.memory.req.ready && hasFreeTag && !chooseStore && !io.flush
   saturn.io.dmem.store_req.ready := io.memory.req.ready && hasFreeTag && chooseStore && !io.flush
-
-  when(io.flush) {
-    storeWaitGrants := 0.U
-  }.elsewhen(!storePending) {
-    storeWaitGrants := 0.U
-  }.elsewhen(io.memory.req.fire && chooseStore) {
-    storeWaitGrants := 0.U
-  }.elsewhen(io.memory.req.fire && loadPending &&
-    storeWaitGrants < storeFairnessThreshold.U) {
-    storeWaitGrants := storeWaitGrants + 1.U
-  }
 
   when(io.memory.req.fire) {
     hblAddress(freeTag) := requestVirtualAddress
@@ -598,6 +528,60 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     }
   }
 
-  io.busy := saturn.io.busy || special.io.busy || hblInFlight.asUInt.orR ||
+  io.memoryDiagnostic := 0.U.asTypeOf(io.memoryDiagnostic)
+  if (p.enableDifftest) {
+    val trace = freechips.rocketchip.util.PlusArg("evu_cmd_trace", width = 1)
+    val ticks = RegInit(0.U(64.W)).suggestName("diag_memoryTicks")
+    ticks := ticks + 1.U
+    def count(name: String, increment: UInt): UInt = {
+      val value = RegInit(0.U(64.W)).suggestName(s"diag_memory_$name")
+      when(io.flush) { value := 0.U }.otherwise { value := value + increment }
+      value
+    }
+    val stats = io.memoryDiagnostic
+    val issued = io.memory.req.fire
+    stats.loads := count("loads", issued && !chooseStore)
+    stats.stores := count("stores", issued && chooseStore)
+    stats.loadBytes := count("loadBytes", Mux(issued && !chooseStore, p.mlenBytes.U, 0.U))
+    stats.storeBytes := count("storeBytes", Mux(issued && chooseStore, PopCount(io.memory.req.bits.mask), 0.U))
+    val logicalBytes = localVl << cmd.sew
+    stats.logicalLoadBytes := count("logicalLoadBytes", Mux(saturn.io.issue.fire &&
+      cmd.opcode === EvuOpcode.Load, logicalBytes, 0.U))
+    stats.logicalStoreBytes := count("logicalStoreBytes", Mux(saturn.io.issue.fire &&
+      cmd.opcode === EvuOpcode.Store, logicalBytes, 0.U))
+    stats.noTag := count("noTag", (loadPending || storePending) && !hasFreeTag)
+    stats.downstream := count("downstream", io.memory.req.valid && !io.memory.req.ready)
+    stats.loadLost := count("loadLost", issued && loadPending && chooseStore)
+    stats.storeLost := count("storeLost", issued && storePending && !chooseStore)
+    stats.responseBlocked := count("responseBlocked", io.memory.resp.valid && responseLive &&
+      !responseDrop && !io.memory.resp.ready)
+    val sentAt = Reg(Vec(p.maxMemOutstanding, UInt(64.W))).suggestName("diag_memorySentAt")
+    when(issued) { sentAt(freeTag) := ticks }
+    val latency = ticks - sentAt(responseTag)
+    val bucket = Mux(latency < 16.U, 0.U, Mux(latency < 64.U, 1.U, Mux(latency < 256.U, 2.U, 3.U)))
+    val response = io.memory.resp.fire && !responseDrop && !io.flush
+    for (b <- 0 until 4) {
+      stats.loadLatency(b) := count(s"loadLatency$b", response && !responseStore && bucket === b.U)
+      stats.storeLatency(b) := count(s"storeLatency$b", response && responseStore && bucket === b.U)
+    }
+    stats.cancelled := count("cancelled", io.memory.resp.fire && responseDrop)
+    val ticket = RegInit(0.U(64.W)).suggestName("diag_ticket")
+    val tickets = Reg(Vec(vatEntries, UInt(64.W))).suggestName("diag_tickets")
+    val acceptedAt = Reg(Vec(vatEntries, UInt(64.W))).suggestName("diag_commandAccepted")
+    when(saturn.io.issue.fire) {
+      tickets(nextVat) := ticket
+      acceptedAt(nextVat) := ticks
+      ticket := ticket + 1.U
+      when(trace.asBool) {
+        printf(p"[EVU-CMD] event=accept ticket=${ticket} vat=${nextVat} job=${cmd.jobId} epoch=${cmd.epoch} pc=0x${Hexadecimal(cmd.pc)} opcode=${cmd.opcode} t=${ticks}\n")
+      }
+    }
+    when(saturnCompletion.fire && trace.asBool) {
+      printf(p"[EVU-CMD] event=complete ticket=${tickets(completionVat)} vat=${completionVat} job=${jobIdByVat(completionVat)} epoch=${epochByVat(completionVat)} pc=0x${Hexadecimal(pcByVat(completionVat))} total=${ticks - acceptedAt(completionVat)} t=${ticks}\n")
+    }
+    when(io.flush && trace.asBool) { printf(p"[EVU-CMD] event=flush t=${ticks}\n") }
+  }
+
+  io.busy := saturn.io.busy || hblInFlight.asUInt.orR ||
     pendingReleases.orR || zeroCompletionPending || reservations.io.busy
 }

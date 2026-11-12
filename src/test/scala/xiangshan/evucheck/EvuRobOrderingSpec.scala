@@ -7,6 +7,7 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import xiangshan.backend.decode.{EvuDecoder, XSDecode}
 import xiangshan.backend.rob.RobEnqueueBarrier
+import xiangshan.SrcType
 
 class EvuRobOrderingSpec extends AnyFlatSpec with ChiselScalatestTester with Matchers {
   behavior of "ROB backward barriers with asynchronous EVU memory"
@@ -15,9 +16,18 @@ class EvuRobOrderingSpec extends AnyFlatSpec with ChiselScalatestTester with Mat
     val entries = EvuDecoder.decodeArray.map { case (pattern, decode) =>
       (pattern.value >> 25).toInt -> decode.asInstanceOf[XSDecode]
     }.toMap
-    for (f7 <- Seq(0x10, 0x11, 0x52, 0x53, 0x18, 0x19, 0x1a, 0x45, 0x46)) {
+    for (f7 <- Seq(0x10, 0x11, 0x52, 0x53, 0x1a, 0x45, 0x46)) {
       entries(f7).noSpec shouldBe true
       entries(f7).blockBack shouldBe true
+    }
+    for (retired <- Seq(0x18, 0x19, 0x50, 0x5e)) {
+      entries.contains(retired) shouldBe false
+    }
+    for (slide <- Seq(0x3e, 0x3f)) {
+      entries(slide).src1 shouldBe SrcType.reg
+      entries(slide).xWen shouldBe false
+      entries(slide).noSpec shouldBe false
+      entries(slide).blockBack shouldBe false
     }
   }
 
@@ -40,7 +50,7 @@ class EvuRobOrderingSpec extends AnyFlatSpec with ChiselScalatestTester with Mat
         dut.clock.step()
         dut.io.blocked.expect(false.B) // No physical Ack is required to enqueue again.
       }
-      // WAIT/FENCE/configuration retain the original drain requirement.
+      // FENCE/configuration retain the original drain requirement.
       dut.io.enqueue.valid.poke(true.B)
       dut.io.enqueue.bits.poke(false.B)
       dut.clock.step()

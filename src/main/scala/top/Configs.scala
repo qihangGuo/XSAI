@@ -588,6 +588,10 @@ class DefaultExternalVectorMatrixConfig(n: Int = 1) extends Config(
   WithExternalVector() ++ new DefaultMatrixConfig(n)
 )
 
+class DefaultExternalVectorScalarDivMatrixConfig(n: Int = 1) extends Config(
+  WithExternalVector(EvuParams(enable = true, parallelFp32Div = false)) ++ new DefaultMatrixConfig(n)
+)
+
 // Keep the prefetch-enabled experiment as a separate static configuration so
 // DefaultMatrixConfig remains the reproducible prefetch-off baseline.
 class DefaultMatrixPrefetchConfig(n: Int = 1) extends Config(

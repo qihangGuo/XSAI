@@ -33,13 +33,6 @@ class EvuVectorSubsystem(implicit p: Parameters)
     val vrfPerf = Output(new VrfPerf)
     val executionPerf = Output(new EvuExecutionPerf)
     val debugVrf = Option.when(vParams.debugVrf)(Output(Vec(egsTotal, UInt(dLen.W))))
-    // The special sequencer is the requester; its VRF requests enter this
-    // subsystem and the read responses leave it. Mark the
-    // complete nested bundle as Flipped so backend.io.special has real
-    // drivers instead of an unbound req/bits connection.
-    val special = Flipped(new Bundle {
-      val read = Vec(3, new VectorReadIO)
-    })
   })
 
   private val dispatcher = Module(new VectorDispatcher)
@@ -51,7 +44,6 @@ class EvuVectorSubsystem(implicit p: Parameters)
   io.debugVrf.foreach(_ := backend.io.debugVrf.get)
   io.vrfPerf := backend.io.vrfPerf
   io.executionPerf := backend.io.executionPerf
-  backend.io.special <> io.special
   backend.io.dis <> dispatcher.io.dis
   vmu.io.enq <> dispatcher.io.mem
 

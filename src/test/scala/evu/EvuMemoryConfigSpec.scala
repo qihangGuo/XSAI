@@ -9,10 +9,15 @@ import xiangshan.evu._
 class EvuMemoryConfigSpec extends AnyFlatSpec with ChiselScalatestTester {
   behavior of "EVU memory preflight configuration"
 
-  it should "use accepted vtype and VL while retaining the launch descriptor length" in {
+  it should "use accepted vtype and VL for ordinary memory commands" in {
     val ep = EvuParams(enable = true)
     test(new EvuMemoryConfig(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
       for (command <- Seq(dut.io.command, dut.io.accepted.bits)) {
+        command.config.valid.poke(false.B)
+        command.config.configured.poke(false.B)
+        command.config.vl.poke(0.U)
+        command.config.vtype.poke(0.U)
+        command.config.vill.poke(false.B)
         command.instr.poke(((BigInt(0x10) << 25) | (2 << 12) | 0x0b).U)
         command.base.poke(0.U)
         command.vl.poke(128.U)
@@ -45,8 +50,6 @@ class EvuMemoryConfigSpec extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.length.expect(512.U) // Clamp AVL to VLMAX.
       configure(0, 2 << 3)
       dut.io.length.expect(0.U)
-      dut.io.command.instr.poke(((BigInt(0x18) << 25) | (4 << 12) | 0x0b).U)
-      dut.io.length.expect(512.U)
       configure(8, 7 << 3)
       dut.io.illegal.expect(true.B)
     }

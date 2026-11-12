@@ -32,8 +32,6 @@ class EvuTopHarnessImp(outer: EvuTopHarness)(implicit p: Parameters) extends Laz
   val io = IO(new Bundle {
     val dispatch   = Flipped(Decoupled(new EvuDispatchRequest(outer.ep)))
     val completion = Decoupled(new EvuCompletion(outer.ep))
-    val matrixInput = Flipped(Decoupled(new MatrixMicroBlock(outer.ep)))
-    val matrixOutput = Decoupled(UInt(outer.ep.dlenBits.W))
     val flush      = Input(Bool())
     val a          = Decoupled(new TLBundleA(edge.bundle))
     val d          = Flipped(Decoupled(new TLBundleD(edge.bundle)))
@@ -44,9 +42,6 @@ class EvuTopHarnessImp(outer: EvuTopHarness)(implicit p: Parameters) extends Laz
   outer.evu.module.io.command.valid := false.B
   outer.evu.module.io.command.bits  := DontCare
   io.completion <> outer.evu.module.io.completion
-  outer.evu.module.io.cuteWrite.ready := true.B
-  outer.evu.module.io.matrixInput <> io.matrixInput
-  io.matrixOutput <> outer.evu.module.io.matrixOutput
   outer.evu.module.io.drain.request.valid := false.B
   outer.evu.module.io.drain.request.bits := false.B
   outer.evu.module.io.drain.response.ready := true.B

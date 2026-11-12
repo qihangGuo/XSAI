@@ -95,6 +95,13 @@ class VectorIssueInst(implicit p: Parameters) extends CoreBundle()(p) with HasVe
 }
 
 class BackendIssueInst(implicit p: Parameters) extends VectorIssueInst()(p) {
+  def extendsSource2: Bool = isOpm && opmf6 === OPMFunct6.xunary0 && rs1(4, 1) === 3.U
+  def registerEmul(wide: Bool, narrow: Bool = false.B): UInt = {
+    val base = Mux(vconfig.vtype.vlmul_sign, -vconfig.vtype.vlmul_mag.zext,
+      vconfig.vtype.vlmul_mag.zext)
+    val exponent = base +& wide.asUInt.zext - narrow.asUInt.zext
+    Mux(exponent < 0.S, 0.U, exponent.asUInt)(2, 0)
+  }
   val reduction = Bool()      // accumulates into vd[0]
   val scalar_to_vd0 = Bool()  // mv scalar to vd[0]
   val wide_vd = Bool()        // vd reads/writes at 2xSEW
@@ -147,6 +154,7 @@ class ScalarWrite extends Bundle {
 class VectorReadReq(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams {
   val eg = UInt(log2Ceil(egsTotal).W)
   val oldest = Bool()
+  val lastOperand = Bool()
 }
 
 class VectorReadIO(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams {
@@ -303,7 +311,7 @@ class PipeHazard(pipe_depth: Int)(implicit p: Parameters) extends CoreBundle()(p
 }
 
 object EvuFuPerf {
-  val names = Seq("fp_fma", "fp_cmp", "fp_exp")
+  val names = Seq("fp_fma", "fp_cmp", "fp_exp", "fp_xx8", "fp_mxfp")
 }
 
 class EvuFuPerf extends Bundle {
@@ -323,6 +331,18 @@ class EvuFuPerf extends Bundle {
   val noWork = UInt(64.W)
   val loadWait = UInt(64.W)
   val forwardWait = UInt(64.W)
+  val ordinaryFull = UInt(64.W)
+  val ordinaryFullIdle = UInt(64.W)
+  val reductionFull = UInt(64.W)
+  val operandsReadyIdle = UInt(64.W)
+  val eligibleIdle = UInt(64.W)
+  val readyLosers = UInt(64.W)
+  val bankReservation = UInt(64.W)
+  val contextCycles = UInt(64.W)
+  val dispatchReduction = UInt(64.W)
+  val lookaheadEligible = UInt(64.W)
+  val lookaheadIdle = UInt(64.W)
+  val stages = Vec(EvuReductionStage.names.size, new EvuReductionPerf)
 }
 
 class EvuExecutionPerf extends Bundle {
@@ -345,6 +365,7 @@ class EvuExecutionPerf extends Bundle {
   val earlyOperandReads = UInt(64.W)
   val reductionPrefetches = UInt(64.W)
   val byFu = Vec(EvuFuPerf.names.size, new EvuFuPerf)
+  val byOp = Vec(EvuOpClass.names.size, new EvuOpPerf)
 }
 
 class SequencerHazard(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams {

@@ -3,16 +3,19 @@
 
 #include "evu_intrinsics.h"
 
-/* Independent EVU CSR ABI 1, RV64. Core fcsr/vcsr/vstart are unrelated. */
+/* Independent EVU CSR ABI 2, RV64. Core fcsr/vcsr/vstart are unrelated. */
 #define XV_EVCFG 0x8c0
 #define XV_EFFLAGS 0x8c1
 #define XV_EVXSAT 0x8c2
-#define XV_EQDESC0 0x8d0
 #define XV_MEVSTATE 0xbc8
 #define XV_EVLENB 0xcd0
 #define XV_EVCAP 0xcd1
-#define XV_CAP_FPQUANT_CUTE (UINT64_C(1) << 25)
+/* EVCAP bit 25 is reserved and reads zero: no direct matrix coupling. */
 #define XV_CAP_GATHER_IMM (UINT64_C(1) << 26)
+#define XV_CAP_RETURNED_VL (UINT64_C(1) << 27)
+#define XV_CAP_RVV_MATH (UINT64_C(1) << 28)
+#define XV_CAP_LOW_PRECISION (UINT64_C(1) << 29)
+#define XV_CONTEXT_MAGIC UINT64_C(0x4556554354580002)
 #define XV_EVSTATUS 0xcd2
 #define XV_EVCAUSE 0xcd3
 #define XV_EVEPC 0xcd4
@@ -33,36 +36,28 @@ static inline void xv_enable_m(unsigned access) {
   XV_CSR_WRITE(XV_MEVSTATE, (value & 3 ? value : value | 1) | (access & 12));
 }
 
-/* Standard RVV VTYPE low byte: e8/e16/e32, m1/m2/m4/m8 or mf2/mf4/mf8.
- * AVL zero means empty. UINT32_MAX requests VLMAX. Rounding is fixed RNE. */
-static inline uint32_t xv_setvl(uint32_t avl, uint8_t vtype) {
-  XV_CSR_WRITE(XV_EVCFG, XV_CONFIGURED | ((uint64_t)vtype << 32) | avl);
-  return (uint32_t)XV_CSR_READ(XV_EVCFG);
-}
-
-/* Legacy context-slot packing only. 0x4c/0x4e are retired; these slots do
- * not configure FP quantization or matrix dequantization. */
-static inline uint64_t xv_descriptor(unsigned scale, unsigned bias, int32_t zero,
-                                      unsigned shift, unsigned output_sew) {
-  return (UINT64_C(1) << 50) | ((uint64_t)(output_sew & 3) << 48) |
-    ((uint64_t)(shift & 63) << 42) | ((uint64_t)(uint32_t)zero << 10) |
-    ((uint64_t)(bias & 31) << 5) | (scale & 31);
+/* M-mode restoration only, including Configured=0 and VILL. Normal code uses
+ * xv_setvli/xv_setvl, which return VL without an extra draining CSR read. */
+static inline void xv_restore_config(uint64_t cfg) {
+  XV_CSR_WRITE(XV_EVCFG, cfg);
 }
 
 /* Diagnostic error registers describe the first error since ACK. ACK clears
  * only the record; a failed operation can have partial writes and must not be retried blindly. */
 typedef struct {
   uint64_t vr[32][64] __attribute__((aligned(64)));
-  uint64_t cfg, fflags, vxsat, state, descriptors[8];
+  uint64_t abi, cfg, fflags, vxsat, state;
   uint64_t status, cause, pc, tval;
 } xv_context;
 
-/* ABI 1 context helpers require VLEN=4096 and M-mode. Return -1 for an
+/* ABI 2 context helpers require VLEN=4096 and M-mode. Return -1 for an
  * unsupported/disabled context, -2 for an error requiring software handling.
  * CSR reads drain all old work before changing the temporary save configuration.
  * Read-only error records are copied for diagnosis, not restored into hardware. */
 static inline int xv_context_save(xv_context *ctx) {
+  if ((XV_CSR_READ(XV_EVCAP) & 255) != 2) return -1;
   if (XV_CSR_READ(XV_EVLENB) != sizeof(ctx->vr[0])) return -1;
+  ctx->abi = XV_CONTEXT_MAGIC;
   ctx->state = XV_CSR_READ(XV_MEVSTATE);
   if (!(ctx->state & 3)) return -1;
   ctx->status = XV_CSR_READ(XV_EVSTATUS);
@@ -73,15 +68,7 @@ static inline int xv_context_save(xv_context *ctx) {
   ctx->cfg = XV_CSR_READ(XV_EVCFG);
   ctx->fflags = XV_CSR_READ(XV_EFFLAGS);
   ctx->vxsat = XV_CSR_READ(XV_EVXSAT);
-  ctx->descriptors[0] = XV_CSR_READ(0x8d0);
-  ctx->descriptors[1] = XV_CSR_READ(0x8d1);
-  ctx->descriptors[2] = XV_CSR_READ(0x8d2);
-  ctx->descriptors[3] = XV_CSR_READ(0x8d3);
-  ctx->descriptors[4] = XV_CSR_READ(0x8d4);
-  ctx->descriptors[5] = XV_CSR_READ(0x8d5);
-  ctx->descriptors[6] = XV_CSR_READ(0x8d6);
-  ctx->descriptors[7] = XV_CSR_READ(0x8d7);
-  xv_setvl(512, 0);
+  xv_setvli(512, 0);
   XV_STORE(0, ctx->vr[0], 0);
   XV_STORE(1, ctx->vr[1], 0);
   XV_STORE(2, ctx->vr[2], 0);
@@ -120,10 +107,10 @@ static inline int xv_context_save(xv_context *ctx) {
     ctx->cause = XV_CSR_READ(XV_EVCAUSE);
     ctx->pc = XV_CSR_READ(XV_EVEPC);
     ctx->tval = XV_CSR_READ(XV_EVTVAL);
-    XV_CSR_WRITE(XV_EVCFG, ctx->cfg);
+    xv_restore_config(ctx->cfg);
     return -2;
   }
-  XV_CSR_WRITE(XV_EVCFG, ctx->cfg);
+  xv_restore_config(ctx->cfg);
   XV_CSR_WRITE(XV_EFFLAGS, ctx->fflags);
   XV_CSR_WRITE(XV_EVXSAT, ctx->vxsat);
   XV_CSR_WRITE(XV_MEVSTATE, ctx->state);
@@ -131,11 +118,12 @@ static inline int xv_context_save(xv_context *ctx) {
 }
 
 static inline int xv_context_restore(const xv_context *ctx) {
+  if (ctx->abi != XV_CONTEXT_MAGIC || (XV_CSR_READ(XV_EVCAP) & 255) != 2) return -1;
   if (!(ctx->state & 3) || XV_CSR_READ(XV_EVLENB) != sizeof(ctx->vr[0])) return -1;
   if (ctx->status & 2) return -2;
   xv_enable_m(0);
   if (XV_CSR_READ(XV_EVSTATUS) & 2) return -2;
-  xv_setvl(512, 0);
+  xv_setvli(512, 0);
   XV_LOAD(0, ctx->vr[0], 0);
   XV_LOAD(1, ctx->vr[1], 0);
   XV_LOAD(2, ctx->vr[2], 0);
@@ -170,15 +158,7 @@ static inline int xv_context_restore(const xv_context *ctx) {
   XV_LOAD(31, ctx->vr[31], 0);
   XV_FENCE();
   if (XV_CSR_READ(XV_EVSTATUS) & 2) return -2;
-  XV_CSR_WRITE(XV_EVCFG, ctx->cfg);
-  XV_CSR_WRITE(0x8d0, ctx->descriptors[0]);
-  XV_CSR_WRITE(0x8d1, ctx->descriptors[1]);
-  XV_CSR_WRITE(0x8d2, ctx->descriptors[2]);
-  XV_CSR_WRITE(0x8d3, ctx->descriptors[3]);
-  XV_CSR_WRITE(0x8d4, ctx->descriptors[4]);
-  XV_CSR_WRITE(0x8d5, ctx->descriptors[5]);
-  XV_CSR_WRITE(0x8d6, ctx->descriptors[6]);
-  XV_CSR_WRITE(0x8d7, ctx->descriptors[7]);
+  xv_restore_config(ctx->cfg);
   XV_CSR_WRITE(XV_EFFLAGS, ctx->fflags);
   XV_CSR_WRITE(XV_EVXSAT, ctx->vxsat);
   XV_CSR_WRITE(XV_MEVSTATE, ctx->state);

@@ -78,18 +78,29 @@ class EvuVmuLineCoalescer(p: EvuParams, collectRmwStores: Boolean = true) extend
     val acceptedTag = Mux(accept, UIntToOH(incoming.tag, n), 0.U(n.W))
 
     val responseTags = (0 until n).map(i => Mux(states(i) === responded, owners(i), 0.U(n.W))).reduce(_ | _)
-    val responseTag = PriorityEncoder(responseTags)
-    val responseEntry = PriorityEncoder(VecInit((0 until n).map(i =>
-      states(i) === responded && owners(i)(responseTag))).asUInt)
-    io.client.resp.valid := responseTags.orR && !io.flush
-    io.client.resp.bits := faults(responseEntry)
+    val bufferedTag = PriorityEncoder(responseTags)
+    val bufferedEntry = PriorityEncoder(VecInit((0 until n).map(i =>
+      states(i) === responded && owners(i)(bufferedTag))).asUInt)
+    val busTag = io.memory.resp.bits.tag
+    // Do not bypass an RMW base-line Get, a crossing request, a multi-owner
+    // response, or a line gaining another owner on this cycle.
+    val bypass = io.memory.resp.valid && states(busTag) === waiting && !passthrough(busTag) &&
+      PopCount(owners(busTag)) === 1.U && !(accept && index === busTag) &&
+      !responseTags.orR && !draining && !io.flush
+    val responseTag = Mux(bypass, PriorityEncoder(owners(busTag)), bufferedTag)
+    val responseEntry = Mux(bypass, busTag, bufferedEntry)
+    val response = Mux(bypass, io.memory.resp.bits, faults(bufferedEntry))
+    io.client.resp.valid := (responseTags.orR || bypass) && !io.flush
+    io.client.resp.bits := response
     io.client.resp.bits.tag := responseTag
-    io.client.resp.bits.data := faults(responseEntry).data >> (offsets(responseTag) << 3)
+    io.client.resp.bits.data := response.data >> (offsets(responseTag) << 3)
+    val bypassFire = bypass && io.client.resp.fire
     val returnedTag = Mux(io.client.resp.fire, UIntToOH(responseTag, n), 0.U(n.W))
     liveTags := (liveTags | acceptedTag) & ~returnedTag
 
     val pressure = io.client.req.valid && (!free.asUInt.orR || liveTags.andR)
-    val arbiter = Module(new RRArbiter(new EvuLineMemoryRequest(p), n))
+    val arbiter = Module(new EvuVmuLineArbiter(p))
+    arbiter.io.flush := io.flush
     for (i <- 0 until n) {
       val completingLine = accept && index === i.U
       // Only collect while an actual store can advance through the VMU.
@@ -103,6 +114,7 @@ class EvuVmuLineCoalescer(p: EvuParams, collectRmwStores: Boolean = true) extend
         io.drain || pressure || (io.client.req.valid && locked) || age(i).andR
       arbiter.io.in(i).valid := (states(i) === collecting && seal || states(i) === prepared) &&
         !(completingLine && incoming.write) && !io.flush && !draining
+      arbiter.io.prepared(i) := states(i) === prepared
       arbiter.io.in(i).bits := requests(i)
       arbiter.io.in(i).bits.write := requests(i).write && !startRmw
       arbiter.io.in(i).bits.mask := Mux(startRmw, Fill(64, 1.U(1.W)), requests(i).mask)
@@ -143,7 +155,6 @@ class EvuVmuLineCoalescer(p: EvuParams, collectRmwStores: Boolean = true) extend
         requests(index).mask := requests(index).mask | shiftedMask
       }
     }
-    val busTag = io.memory.resp.bits.tag
     io.memory.resp.ready := states(busTag) === waiting || states(busTag) === reading
     when(io.memory.resp.valid) {
       assert(states(busTag) === waiting || states(busTag) === reading, "VMU line response has no owner")
@@ -164,7 +175,7 @@ class EvuVmuLineCoalescer(p: EvuParams, collectRmwStores: Boolean = true) extend
           (requests(busTag).data & ~joinBits) | (shiftedData & joinBits), requests(busTag).data)
         requests(busTag).data := (io.memory.resp.bits.data & ~byteBits) | (data & byteBits)
         states(busTag) := prepared
-      }.otherwise { states(busTag) := responded }
+      }.otherwise { states(busTag) := Mux(bypassFire, empty, responded) }
     }
 
     when(draining && !states.map(_ =/= empty).reduce(_ || _) && !io.flush) { draining := false.B }

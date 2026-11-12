@@ -25,16 +25,15 @@ case class EvuParams(
     memoryCommandDepth: Int = 4,
     commandDepth:       Int = 16,
     completionDepth:    Int = 16,
-    matrixStoreEntries: Int = 16,
-    matrixStoreQueueDepth: Int = 8,
     egChaining: Boolean = true,
     vmuLineCoalescing: Boolean = true,
     splitFpIssue: Boolean = true,
+    parallelFp32Div: Boolean = true,
     reductionContexts: Int = 2,
+    fmaOrdinaryContexts: Int = 1,
     scalarInstructions: Boolean = true,
     decoupledAmuIssue: Boolean = true,
-    interleaveReductions: Boolean = true,
-    quantCommandDepth: Int = 4
+    interleaveReductions: Boolean = true
 ) {
   require(vlenBits > 0 && vlenBits   % 8 == 0)
   require(dlenBits > 0 && dlenBits   % 8 == 0 && vlenBits > dlenBits && vlenBits % dlenBits == 0)
@@ -53,15 +52,14 @@ case class EvuParams(
   require(executeIssueDepth > 0 && specialIssueDepth > 0)
   require(loadInflightDepth >= maxMemOutstanding)
   require(loadResponseDepth >= maxMemOutstanding)
-  // Matrix and Saturn local tags are remapped onto a shared HBL2 source pool.
+  // VMU line transactions are remapped onto the HBL2 source pool.
   require(maxMemOutstanding >= 8 && (maxMemOutstanding & (maxMemOutstanding - 1)) == 0)
-  require(matrixStoreEntries >= 2 && matrixStoreQueueDepth > 0)
   require(commandDepth > 0 && completionDepth > 0)
   require(memoryCommandDepth >= 1 && memoryCommandDepth <= 4 && memoryCommandDepth <= commandDepth)
   require(commandDepth <= 32 && (commandDepth & (commandDepth - 1)) == 0,
     "EVU job IDs must fit the Saturn VAT space and wrap at a power of two")
-  require(quantCommandDepth >= 1 && quantCommandDepth <= commandDepth)
   require(reductionContexts >= 1 && reductionContexts <= 4)
+  require(fmaOrdinaryContexts >= 1 && fmaOrdinaryContexts <= 2)
 
   val vrfBankCount: Int = vrfBanks
   val vlenBytes:     Int = vlenBits / 8
@@ -71,7 +69,6 @@ case class EvuParams(
   val regIndexWidth: Int = log2Ceil(vectorRegs)
   val laneBits:      Int = dlenBits / lanes
   val translationPages: Int = (8 * vlenBytes + 4095) / 4096 + 1
-  val fpQuantSupported: Boolean = dlenBits == 256 || dlenBits == 512
 }
 
 /** Translations checked before retirement, retained separately for each command. */
@@ -128,14 +125,4 @@ class EvuCompletion(p: EvuParams) extends Bundle {
   val epoch     = UInt(2.W)
   // Stable architectural cause snapshot consumed at ordered completion.
   val cause     = UInt(4.W)
-}
-
-
-/** A masked quantized beat in CUTE's fixed 32-byte ABMatrixReg entry. */
-class EvuCuteWrite(p: EvuParams) extends Bundle {
-  val matrixReg = UInt(2.W)
-  val bank = UInt(8.W)
-  val entry = UInt(16.W)
-  val data = UInt(256.W)
-  val byteMask = UInt(32.W)
 }

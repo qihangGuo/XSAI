@@ -59,6 +59,7 @@ class EvuSkewedVrfSpec extends AnyFlatSpec with ChiselScalatestTester with Match
           reads(0).req.valid.poke(true.B)
           reads(0).req.bits.eg.poke(eg.U)
           reads(0).req.bits.oldest.poke(false.B)
+          reads(0).req.bits.lastOperand.poke(false.B)
           reads(0).req.ready.expect(true.B)
           dut.clock.step()
           reads(0).resp.valid.expect(true.B)
@@ -72,6 +73,7 @@ class EvuSkewedVrfSpec extends AnyFlatSpec with ChiselScalatestTester with Match
           reads(i).req.valid.poke(true.B)
           reads(i).req.bits.eg.poke(((i + 1) * 16).U)
           reads(i).req.bits.oldest.poke(true.B)
+          reads(i).req.bits.lastOperand.poke(false.B)
           reads(i).req.ready.expect(true.B)
         }
         dut.clock.step()
@@ -103,10 +105,12 @@ class EvuSkewedVrfSpec extends AnyFlatSpec with ChiselScalatestTester with Match
     implicit val p: Parameters = parameters(4096)
     test(new RegisterReadCollector).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
       dut.io.client.req.bits.oldest.poke(false.B)
+      dut.io.client.req.bits.lastOperand.poke(false.B)
       dut.io.client.req.bits.eg.poke(16.U)
       dut.io.client.req.valid.poke(true.B)
       dut.io.prefetch.valid.poke(false.B)
       dut.io.prefetch.bits.oldest.poke(false.B)
+      dut.io.prefetch.bits.lastOperand.poke(false.B)
       dut.io.prefetch.bits.eg.poke(17.U)
       dut.io.memory.req.ready.poke(true.B)
       dut.io.memory.resp.valid.poke(false.B)

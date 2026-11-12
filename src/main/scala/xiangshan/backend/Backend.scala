@@ -861,29 +861,26 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
     val f7 = payload.instr(31, 25)
     val load = EvuIsa.isLoad(f7)
     val store = EvuIsa.isStore(f7)
-    val launch = f7 === EvuIsa.launch
     val effectiveSew = Mux(csrio.evu.configured, csrio.evu.config.vtype(5, 3), payload.instr(14, 12))
     val effectiveLength = Mux(EvuIsa.isElementZero(f7),
       Mux(csrio.evu.configured && csrio.evu.config.vl === 0.U, 0.U, 4.U),
       Mux(csrio.evu.configured, csrio.evu.config.vl << effectiveSew, payload.length))
     val control = f7 === EvuIsa.setvli || f7 === EvuIsa.setvl ||
-      f7 === EvuIsa.waitOp || f7 === EvuIsa.fence || launch
+      f7 === EvuIsa.fence
     val decoded = f7.pad(8) // Supported custom funct7 values equal backend opcodes.
     val illegalConfig = !control && (csrio.evu.config.vill ||
       !EvuIsa.supportsElementWidth(decoded, effectiveSew))
     val effectiveLmul = Mux(csrio.evu.configured, csrio.evu.config.vtype(2, 0), 0.U)
     val invalidGroup = !EvuIsa.supportsRegisterGroups(payload.instr, effectiveLmul)
-    val invalidFpQuantTarget = !EvuIsa.supportsFpQuantTarget(p(ExternalVectorKey), payload.instr,
-      payload.base, Mux(csrio.evu.configured, csrio.evu.config.vl, payload.vl))
-    val permissionFault = !csrio.evu.permitted || illegalConfig || invalidGroup || invalidFpQuantTarget
-    val memory = source.bits.amuCtrl.get.evu && (load || store || launch) && !permissionFault
+    val permissionFault = !csrio.evu.permitted || illegalConfig || invalidGroup
+    val memory = source.bits.amuCtrl.get.evu && (load || store) && !permissionFault
     val killed = source.bits.robIdx.needFlush(ctrlBlock.io.redirect)
     val checking = RegInit(false.B)
-    val preflightBlocked = Mux(launch, ctrlBlock.io.evuBusy, ctrlBlock.io.evuPreflightBusy)
+    val preflightBlocked = ctrlBlock.io.evuPreflightBusy
     check.req.valid := source.valid && memory && !checking && !preflightBlocked && !killed
     XSPerfAccumulate("evu_preflight_serial_stall", source.valid && memory && !checking && preflightBlocked)
     check.req.bits.base := payload.base
-    check.req.bits.length := Mux(launch, payload.length, effectiveLength)
+    check.req.bits.length := effectiveLength
     check.req.bits.read := load
     check.req.bits.write := store
     // Custom ordinary stores are unmasked and unit-stride. Only a 64-byte
@@ -891,9 +888,8 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
     check.req.bits.fullLineWrite := (p(ExternalVectorKey).mlenBits == 512).B &&
       f7 === EvuIsa.store && !payload.base(5, 0).orR && !effectiveLength(5, 0).orR
     check.req.bits.alignment := effectiveSew
-    check.req.bits.unbounded := launch
-    check.req.bits.illegal := !launch && (csrio.evu.config.vill ||
-      ((load || store) && effectiveSew > 3.U))
+    check.req.bits.illegal := csrio.evu.config.vill ||
+      ((load || store) && effectiveSew > EvuIsa.maxSupportedSew.U)
     check.cancel := ctrlBlock.io.redirect.valid
     check.resp.ready := source.valid && memory && sink.ready && !killed
     when(check.req.fire) { checking := true.B }
@@ -902,7 +898,8 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
     source.ready := sink.ready && (!memory || check.resp.valid) && !killed
     val translated = WireInit(payload)
     translated.pageMap := check.resp.bits.pageMap
-    translated.config := csrio.evu.config
+    translated.config := Mux(f7 === EvuIsa.setvli || f7 === EvuIsa.setvl,
+      payload.config, csrio.evu.config)
     sink.bits.amuCtrl.get.data := translated.asUInt
     when(permissionFault) {
       sink.bits.exceptionVec.get(ExceptionNO.illegalInstr) := true.B

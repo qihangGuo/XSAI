@@ -10,6 +10,87 @@ import xiangshan.evu._
 class EvuHbl2LineAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with Matchers {
   behavior of "EvuHbl2LineAdapter"
 
+  for (write <- Seq(false, true); flushOnResponse <- Seq(false, true)) {
+    it should s"retain stalled final responses and suppress same-cycle flush write=$write flush=$flushOnResponse" in {
+      test(new EvuHbl2LineAdapter(EvuParams(enable = true)))
+        .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+          dut.io.flush.poke(false.B)
+          dut.io.client.req.valid.poke(false.B)
+          dut.io.client.resp.ready.poke(false.B)
+          dut.io.memory.req.ready.poke(false.B)
+          dut.io.memory.resp.valid.poke(false.B)
+          dut.io.memory.resp.bits.data.poke(0.U)
+          dut.io.memory.resp.bits.error.poke(false.B)
+          dut.io.memory.resp.bits.fault.poke(EvuFault.None)
+          dut.io.memory.resp.bits.tag.poke(0.U)
+          def request(tag: Int): Unit = {
+            val r = dut.io.client.req
+            r.valid.poke(true.B)
+            r.bits.jobId.poke(tag.U)
+            r.bits.epoch.poke(0.U)
+            r.bits.addr.poke((128 + tag * 64).U)
+            r.bits.data.poke((tag + 1).U)
+            r.bits.mask.poke(((BigInt(1) << 64) - 1).U)
+            r.bits.fullLineData.poke(false.B)
+            r.bits.bytes.poke(64.U)
+            r.bits.write.poke(write.B)
+            r.bits.tag.poke(tag.U)
+            r.ready.expect(true.B)
+            dut.clock.step()
+            r.valid.poke(false.B)
+            var cycles = 0
+            while (!dut.io.memory.req.valid.peek().litToBoolean && cycles < 20) {
+              dut.clock.step(); cycles += 1
+            }
+            dut.io.memory.req.valid.expect(true.B)
+            dut.io.memory.req.bits.tag.expect(tag.U)
+            dut.io.memory.req.ready.poke(true.B)
+            dut.clock.step()
+            dut.io.memory.req.ready.poke(false.B)
+          }
+          request(0)
+          request(1)
+          dut.io.memory.resp.valid.poke(true.B)
+          dut.io.memory.resp.bits.tag.poke(0.U)
+          dut.io.memory.resp.bits.data.poke(123.U)
+          dut.io.flush.poke(flushOnResponse.B)
+          dut.io.memory.resp.ready.expect(true.B)
+          dut.io.client.resp.valid.expect((!flushOnResponse).B)
+          dut.clock.step()
+          dut.io.memory.resp.valid.poke(false.B)
+          dut.io.flush.poke(false.B)
+          dut.io.client.resp.valid.expect((!flushOnResponse).B)
+          dut.clock.step(3)
+
+          // The second final response must not overwrite a buffered first one.
+          // On flush, it must drain without resurrecting an architectural fault.
+          dut.io.client.resp.ready.poke(true.B)
+          dut.io.memory.resp.valid.poke(true.B)
+          dut.io.memory.resp.bits.tag.poke(1.U)
+          dut.io.memory.resp.bits.error.poke(true.B)
+          dut.io.memory.resp.bits.fault.poke(EvuFault.Bus)
+          dut.io.memory.resp.ready.expect(true.B)
+          dut.io.client.resp.valid.expect((!flushOnResponse).B)
+          if (!flushOnResponse) {
+            dut.io.client.resp.bits.tag.expect(0.U)
+            dut.io.client.resp.bits.error.expect(false.B)
+            if (!write) { dut.io.client.resp.bits.data.expect(123.U) }
+          }
+          dut.clock.step()
+          dut.io.memory.resp.valid.poke(false.B)
+          if (!flushOnResponse) {
+            dut.io.client.resp.valid.expect(true.B)
+            dut.io.client.resp.bits.tag.expect(1.U)
+            dut.io.client.resp.bits.error.expect(true.B)
+            dut.io.client.resp.bits.fault.expect(EvuFault.Bus)
+            dut.clock.step()
+          }
+          dut.io.client.resp.valid.expect(false.B)
+          dut.io.busy.expect(false.B)
+        }
+    }
+  }
+
   it should "preserve masked bytes across two lines and hold overlapping requests until completion" in {
     val ep = EvuParams(enable = true)
     test(new EvuHbl2LineAdapter(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>

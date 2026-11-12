@@ -19,14 +19,21 @@ static int csr_context_test_main(void) {
   for (unsigned i = 0; i < 128; ++i) { one[i] = 0x3f800000; three[i] = 0x40400000; }
   /* Execute EVU FP with both core contexts Off, core FRM=RDN, vstart=37. */
   __asm__ volatile ("li t0, 0x6600\ncsrc mstatus, t0" ::: "t0", "memory");
-  xv_setvl(128, 0x10);
+  int ok = (XV_CSR_READ(XV_EVCAP) & 255) == 2;
+  ok &= ((XV_CSR_READ(XV_EVCAP) >> 8) & 255) == 0;
+  ok &= xv_setvli(UINT64_MAX, 0x10) == 128;
+  ok &= xv_setvl(13, 0x0f) == 13;
+  ok &= xv_setvli(0, 0x10) == 0;
+  ok &= xv_setvl(UINT64_MAX, UINT64_C(1) << 32) == 0;
+  ok &= (XV_CSR_READ(XV_EVCFG) >> 63) == 1;
+  ok &= xv_setvli(128, 0x10) == 128;
   XV_CSR_WRITE(XV_EFFLAGS, 0);
   XV_LOAD(1, one, 2);
   XV_LOAD(2, three, 2);
   XV_FDIV(3, 2, 1, 2);
   XV_STORE(3, result, 2);
   XV_FENCE();
-  int ok = XV_CSR_READ(XV_EFFLAGS) == 1;
+  ok &= XV_CSR_READ(XV_EFFLAGS) == 1;
   for (unsigned i = 0; i < 128; ++i) ok &= result[i] == 0x3eaaaaab;
   XV_LOAD(0, seed[0], 2);
   XV_LOAD(1, seed[1], 2);
@@ -64,32 +71,23 @@ static int csr_context_test_main(void) {
   xv_setvl(13, 0x0f); /* e16,mf2; save helpers must still preserve every VRF byte. */
   XV_CSR_WRITE(XV_EFFLAGS, 5);
   XV_CSR_WRITE(XV_EVXSAT, 1);
-  XV_CSR_WRITE(0x8d0, xv_descriptor(0, 8, -17, 1, 2));
-  XV_CSR_WRITE(0x8d1, xv_descriptor(1, 9, -17, 2, 2));
-  XV_CSR_WRITE(0x8d2, xv_descriptor(2, 10, -17, 3, 2));
-  XV_CSR_WRITE(0x8d3, xv_descriptor(3, 11, -17, 4, 2));
-  XV_CSR_WRITE(0x8d4, xv_descriptor(4, 12, -17, 5, 2));
-  XV_CSR_WRITE(0x8d5, xv_descriptor(5, 13, -17, 6, 2));
-  XV_CSR_WRITE(0x8d6, xv_descriptor(6, 14, -17, 7, 2));
-  XV_CSR_WRITE(0x8d7, xv_descriptor(7, 15, -17, 8, 2));
   if (xv_context_save(&saved)) { ok = 0; goto done; }
   xv_setvl(128, 0x10);
   XV_LOAD(0, three, 2);
   XV_FENCE();
   XV_CSR_WRITE(XV_EFFLAGS, 0);
   XV_CSR_WRITE(XV_EVXSAT, 0);
-  XV_CSR_WRITE(XV_EQDESC0, 0);
   if (xv_context_restore(&saved) || xv_context_save(&observed)) { ok = 0; goto done; }
   ok &= saved.cfg == observed.cfg && saved.fflags == observed.fflags && saved.vxsat == observed.vxsat;
   ok &= memcmp(saved.vr, observed.vr, sizeof(saved.vr)) == 0;
-  ok &= memcmp(saved.descriptors, observed.descriptors, sizeof(saved.descriptors)) == 0;
+  ok &= saved.abi == XV_CONTEXT_MAGIC && observed.abi == saved.abi;
 done:
   __asm__ volatile ("csrw mstatus, %0" :: "r"(core_status) : "memory");
   __asm__ volatile ("csrr %0, fcsr\ncsrr %1, vstart\ncsrr %2, vxsat\ncsrr %3, vxrm"
                     : "=r"(core_fcsr), "=r"(core_start), "=r"(core_sat), "=r"(core_rm));
   ok &= core_fcsr == 0x50 && core_start == 37 && core_sat == 0 && core_rm == 3;
   __asm__ volatile ("csrw vstart, zero" ::: "memory");
-  printf("EVU CSR/context %s: fixed RNE, core FS/VS Off, isolated flags/start, 32 VRFs and descriptors\n", ok ? "PASS" : "FAIL");
+  printf("EVU CSR/context ABI2 %s: fixed RNE, core FS/VS Off, isolated flags/start, 32 VRFs\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
 

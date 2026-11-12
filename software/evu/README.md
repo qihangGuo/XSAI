@@ -1,321 +1,144 @@
-# EVU Tests
+# Pure Long-Vector EVU Tests
 
-Run commands below from the XSAI repository root. These bare-metal tests target
-`DefaultExternalVectorMatrixConfig`, with VLEN=4096 and DLEN=256. Build guest
-programs on the server using its existing `AM_HOME` and LLVM toolchain.
+The current EVU provides ordinary long-vector execution with VLEN=4096,
+DLEN=512, MLEN=512 and a 16 KiB VRF built from 32 single-port 64x64 banks.
+The default configuration remains `DefaultExternalVectorMatrixConfig`; CUTE
+is an independent accelerator in that SoC configuration. There is no direct
+EVU/CUTE data connection, Launch, or dedicated quantization/dequantization path.
 
-## Directory
+All commands below run from the XSAI repository root, on the build server.
+Use the server's existing `AM_HOME`, RISC-V LLVM toolchain and NEMU checkout.
 
-```text
-software/evu/
-  *_test.c, *_example.c  Bare-metal test entry points
-  include/              EVU and AME instruction helpers
-  host/                 Native host tests for the NEMU reference
-  scripts/              Reference build/check helpers
-  docs/                 Reference limitations and failure diagnostics
-  build/                Generated binaries, disassembly and objects (ignored)
-```
+## Supported Tests
 
-| Program (`NAME`) | Coverage |
+| NAME | Coverage |
 | --- | --- |
-| `vector_add_evu_test` | e8/e16/e32 addition, copies, source aliases, RAW dependencies and guards |
-| `exp2_evu_test` | FP16/FP32 Exp2, exact powers of two, in-place writes and source preservation |
-| `online_softmax_evu_test` | Pure FP32 online update, matched to RVV four-row positive-scale/vector-alpha kernel; timed and checked |
-| `vector_memory_path_evu_test` | Standalone cache-state, bulk/state memory and register-resident compute diagnostics; no CUTE or FP64 |
-| `quanti8mma_evu_example` | INT8 CUTE MMA followed by EVU FP32 matrix-stream dequantization and stores |
-| `virtual_memory_evu_test` | S-mode Sv39 EVU memory access and matrix-stream output |
+| `vector_add_evu_test` | Integer e8/e16/e32 arithmetic, aliases, memory and guards |
+| `exp2_evu_test` | FP16/FP32 EXP2 and ordinary vector execution |
+| `csr_context_evu_test` | Independent EVU CSR ABI 2, returned VL and context restore |
+| `virtual_memory_evu_test` | Sv39 translation, permissions and precise memory faults |
+| `vector_memory_path_evu_test` | Bulk/state load-store patterns and cache-state diagnostics |
+| `online_softmax_evu_test` | Ordinary FP32 softmax, four-row scheduling and interval diagnostics |
+| `rvv_math_evu_test` | 15 RVV-mapped operations, m1/m2/mf2, E0, tails, flags and saturation |
+| `low_precision_evu_test` | Six low-precision operations, 88 directed cases, packing, tails, flags and guards |
+| `rmsnorm_nvfp4_evu_test` | EVU RMSNorm and full NVFP4 with final-output-only stores; 11 cases |
 
-The C entry points and binary names are unchanged. Shared headers now live in
-`include/`; the Makefile supplies the include path. Objects are isolated under
-`build/obj/<NAME>/` so old dependency files do not refer to moved headers.
-Existing generated files under `build/` are retained, but must not be treated
-as results from the current sources.
+`Makefile` defaults to `vector_add_evu_test`. The old fused FlashAttention and
+`quanti8mma_evu_example` programs are retired; their binaries cannot run on the
+pure-vector ISA. Historical documents and measurements are under
+[`docs/archive/matrix-vector/`](docs/archive/matrix-vector/README.md).
 
-## Build And Run
+## Server Build and Run
 
-Select a program with `NAME`; do not pass `SRCS` on the make command line,
-because Abstract Machine recursively builds its own libraries.
+For a committed checkout, initialize the pinned dependencies:
 
 ```sh
-make -C software/evu git_commit= ARCH=riscv64-xs TOOLCHAIN=LLVM NAME=vector_add_evu_test
-set -o pipefail
-./build/emu \
-  --diff /nfs/home/guoqihang/workspace/NEMU_evu/build/riscv64-nemu-interpreter-so \
-  -C 2000000 -i software/evu/build/vector_add_evu_test-riscv64-xs.bin \
-  2>&1 | tee run_vector_add_evu.log
+git submodule sync --recursive
+git submodule update --init --recursive
+bash software/evu/scripts/apply_pure_vector_difftest.sh
 ```
 
-EVU Difftest requires a matching `CONFIG_CUSTOM_EVU=y` NEMU reference with
-VLEN=4096/DLEN=256, and a common core/accelerator clock
-(`ACCELERATOR_CDC_ENABLE=0`). Rebuild EMU after changing RTL. ADD passing does
-not establish correctness of the FP or matrix paths.
+The dependency baseline is official XSAI commit `63c767f1`, with the ordinary
+EVU difftest extension applied to difftest `0fdb354a`. See the exact revisions
+and integration requirements in [`EVU_PURE_VECTOR_PLAN.md`](docs/EVU_PURE_VECTOR_PLAN.md).
+When synchronizing an uncommitted workspace, include the changed difftest
+sources and new/untracked files as well as the parent sources. An rsync that
+excludes `.git` does not update submodule HEADs or their tracked-file lists.
+The server must also use the pinned revisions in the plan. Do not run a
+blind submodule update against an older parent commit: that restores its old
+dependencies. Preserve server-side changes before switching revisions.
+The application script is idempotent and keeps the official difftest gitlink;
+`--check` verifies an already prepared checkout without modifying it.
 
-The standalone ADD, Exp2 and online softmax tests disable compiler loop/SLP
-vectorization and use volatile buffers, keeping initialization and numerical
-checking on the scalar core. Each test returns 1 on failure. Require its final
-PASS message and `HIT GOOD TRAP`; with Difftest, also require no mismatch and
-`pending=0` in the final EVU counters.
+Rebuild the reference, simulator and guest together after this ISA change:
 
-For ADD, failure output indices mean copy (0), add (1), alias with source 1
-(2), and alias with source 2 (3). The last result is `a + 2*b`; other sums are
-`a + b`. For Exp2, require both FP16 and FP32 PASS messages. BF16 is disabled.
+```sh
+make -C ../NEMU git_commit= riscv64-xs-evu-ref_defconfig
+make -C ../NEMU git_commit= clean
+make -C ../NEMU git_commit= -j8
+
+make emu CONFIG=DefaultExternalVectorMatrixConfig \
+  ACCELERATOR_CDC_ENABLE=0 EMU_THREADS=8 EMU_TRACE=fst -j16 2>&1 | tee xsai_build.log
+
+make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM NAME=vector_add_evu_test
+./build/emu --diff ../NEMU/build/riscv64-nemu-interpreter-so \
+  -C 100000000 -i software/evu/build/vector_add_evu_test-riscv64-xs.bin
+```
+
+For each supported test, require GOOD TRAP, no assertion/difftest failure and
+zero outstanding EVU commands. Ordinary stores complete only after real
+physical write acknowledgements. FENCE drains older EVU work. WAIT has been
+removed; selector 0x19 is illegal and old binaries must be rebuilt using
+`XV_FENCE()`. Each ordinary command publishes its own flags and errors.
+
+`XV_SLIDEUP(vd, offset, vs, sew)` and `XV_SLIDEDOWN(vd, offset, vs, sew)`
+take an unsigned 64-bit scalar offset. They map to Saturn's `.vx` forms;
+the old tentative VRF-element-zero offset convention no longer applies.
+See [slide and synchronization validation](docs/EVU_SLIDE_AND_FENCE.md).
 
 ## Online Softmax
 
-`online_softmax_evu_test.c` measures the same pure-vector online update as
-`softmax_online_rvv_vfexp2_4row_lmul4_positive_scale_vector_alpha` in
-`nexus-am/tests/exp2test/vendor/xsai_blas_rvv/`. Defaults are 32 rows, 256
-columns, stride 256, positive scale 1.0, four-row interleaving and compact
-FP32 row states. Input values and initial max/sum match the RVV comparison
-test exactly. There is no CUTE command, quantization, final normalization,
-or dedicated Softmax instruction.
-
-```text
-tile_max = max(scores) * scale
-m_new = first ? tile_max : max(m_old, tile_max)
-alpha = first ? 0 : exp2((m_old - m_new) * log2(e))
-scores[i] = exp2(scores[i] * (scale * log2(e)) - m_new * log2(e))
-l_new = alpha * l_old + sum(scores)
-```
-
-The EVU schedule is chosen for its own VRF and scalar-source instructions.
-At the default 256 columns, four complete rows occupy eight vector
-registers (4 KiB). Each score is loaded once and stays in the VRF through
-max, exp and sum; the two chunks' pairwise max/sum replace repeated
-accumulator initialization and updates. The default `wave4x2` schedule uses
-two alternating eight-register input buffers: four active rows and up to four
-prefetched rows (8 KiB of input). It advances two rows through max, state and
-EXP2 before submitting the next pair of max reductions. Head EXP2 is submitted
-before tail subtraction so the EXP2 and FMA paths can overlap. Next-batch
-loads are mixed with current-batch work; they still obey VMU ordering and may
-stall at the command head. This is scheduling opportunity, not eight-row
-simultaneous computation or guaranteed hardware overlap.
-
-States stay in element zero, using existing E0/scalar-source instructions.
-The default has one entry configuration, no scratch packing, no gather and
-no inner VL changes. In this RTL, EVCFG writes drain EVU; the old batched-state
-candidate had 33 such configurations. Each row retains its multiply, exp and
-sum arithmetic and rounding order. No FP contraction or new opcode is used.
-The wider buffers use 16 score registers; state temporaries and constants use
-another 15 architectural registers, leaving v26 unused. Larger VRF capacity
-does not imply additional arithmetic units or simultaneous SRAM accesses.
-
-The banner prints `sched=wave4x2 state=0 red=128` for the default schedule.
-`EVU_SOFTMAX_PIPELINE=0` restores the old `resident_pair2` schedule.
-`EVU_SOFTMAX_STATE_LOAD_BATCH=1` tests two 16-byte old-state loads per four
-rows, followed by eight register gathers, without scratch-memory packing.
-For default first=0 it reduces memory instructions from 293 to 245, but adds
-16 draining EVCFG writes and 64 gathers. It stays opt-in until measured;
-the default prints `loads4=0`, while this candidate prints `loads4=1`.
-First=1 has no carried-state loads and does not add these configurations.
-`EVU_SOFTMAX_STATE_BATCH=1` retains the scratch-packed VL=4 experiment;
-`EVU_SOFTMAX_REDUCE_VL=64/32` retains short-reduction experiments. These
-automatically disable the new pipeline and have separate object/image paths.
-The default is a source-validated candidate, not a measured fastest result. It also
-supports rows of 1..128 columns, with VL set once to the row length when
-state batching is disabled (the default for these non-256-column shapes).
-Other column counts use `sched=stream`, a two-pass fallback preserving
-accumulator tails for partial chunks; it also keeps alpha in registers.
-At the default shape, logical score reads fall from 64 KiB to 32 KiB per
-invocation; score writes stay at 32 KiB. These are software access counts,
-not measured bus traffic or a predicted cycle reduction. Multiply and add
-round separately; reduction order can differ from RVV. Inputs, outputs
-and accuracy limits match the RVV contract without requiring its schedule.
-
-The ordinary VMU now defaults to a four-command window with per-command
-translation/error ownership and disjoint-byte store combining across jobs.
-Rebuild both EMU and the NEMU reference library before testing these RTL
-changes; copying a new guest image alone does not enable them. Physical VRF
-banks remain 1RW. For optional cumulative VMU snapshots at completed XV_FENCE
-boundaries, append `-- +evu_mem_trace=1` after all EMU options. The `--` keeps
-the Verilator plusarg out of the emulator's option parser. See
-`docs/ONLINE_SOFTMAX_PERFORMANCE_ANALYSIS.md`, section 9, for counter meanings,
-limitations and the recommended correctness/performance comparison.
-
-To compare the two formal cases without padded fields, UART interleaving,
-warmup snapshots or global PERF output, summarize the complete log offline:
+Build the numerical-check variant first; the default runs both `first` modes:
 
 ```sh
-python3 software/evu/scripts/summarize_softmax_fences.py \
-  evu_softmax_512_before.log --format table
+make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM \
+  NAME=online_softmax_evu_test EVU_SOFTMAX_CHECK=1
 ```
 
-The default output remains compact key=value records for further processing.
-Missing counters are shown as `-` in the table; counter rows can overlap and
-must not be added. Neither format changes timing or requires an EMU/bin rebuild.
-Keep the raw log to inspect Difftest, GOOD TRAP and any errors.
-
-The default is performance-only (`EVU_SOFTMAX_CHECK=0`). No FP64 reference,
-numeric output scan, NMSE calculation or guard initialization/check is run.
-EVU error status and invalid/divide-by-zero/overflow flags are still checked;
-Difftest remains enabled by the EMU command. Input is generated once into
-an aligned template and restored with `memcpy` before every invocation,
-including after warmup. The template adds 32 KiB at the default shape and
-changes the reset's cache accesses; compare warm runs under the same setup.
-
-By default, `first=0` and `first=1` are measured independently, each with one
-warmup, a full input/state reset, and one timed invocation. The timer includes
-configuration, loads, arithmetic, stores, `XV_FENCE` and the final CPU memory
-fence. Initialization, reference evaluation, accuracy checks and printing are
-outside timing. Output is four short lines: configuration, each timed case,
-and DONE. `c` is kernel cycles, `i` instructions, `warm_c` warmup cycles,
-and `epc` elements/cycle. By default a separate, fully reset diagnostic
-invocation also reports `pre`, `full`, `drain=full-pre` and `empty` (an idle
-fence probe). The primary `c` run has no intermediate cycle probe. Diagnostic
-costs include cycle-read/control overhead and must not be subtracted from `c`.
-The pre-fence rdcycle also serializes core work and can permit some pending
-stores to drain before the fence; `drain` is a diagnostic tail interval, not
-an exact isolated memory-latency penalty.
-Set `EVU_SOFTMAX_DRAIN_DIAG=0` to omit that extra invocation on later fast runs.
-Require `err=0`, no invalid/divide-by-zero/overflow
-flags, GOOD TRAP, and no Difftest mismatch. DONE in performance-only mode
-does not report a numerical accuracy check.
-
-Build with `EVU_SOFTMAX_CHECK=1` to restore independent accuracy checks.
-That mode prints `check=1`, score/state NMSE times 1e12 (`sn12`/`stn12`)
-and ends in PASS on success. Its independent FP64 checker evaluates
-exponentials with polynomial-built
-tables and a small residual polynomial. It validates exponentials, exact
-row maxima, row sums, alpha, stride padding and guard bytes. Bounds remain
-`2e-8 + 2e-5 * abs(expected)` for exp/alpha and
-`1e-5 + 3e-5 * abs(expected)` for sums, with scores/state NMSE <= 1e-5.
-There is no requirement that the unnormalized output sum to one.
+Nondefault build options produce a variant-specific image path printed by the
+Makefile. Use that path for the correctness run. For the default performance
+image and formal FENCE interval counters:
 
 ```sh
-NAME=online_softmax_evu_test make -C software/evu git_commit= ARCH=riscv64-xs TOOLCHAIN=LLVM
-set -o pipefail
-./build/emu --diff ../NEMU/build/riscv64-nemu-interpreter-so -C 20000000 \
-  -i software/evu/build/online_softmax_evu_test-riscv64-xs.bin \
-  2>&1 | tee run_online_softmax_evu.log
+make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM NAME=online_softmax_evu_test
+./build/emu --diff ../NEMU/build/riscv64-nemu-interpreter-so \
+  -C 100000000 -i software/evu/build/online_softmax_evu_test-riscv64-xs.bin \
+  -- +evu_mem_trace=1 2>&1 | tee evu_softmax.log
+/usr/bin/python3 software/evu/scripts/summarize_softmax_fences.py evu_softmax.log
 ```
 
-Makefile controls are `EVU_SOFTMAX_ROWS`, `EVU_SOFTMAX_COLS`,
-`EVU_SOFTMAX_STRIDE`, `EVU_SOFTMAX_SCALE`, `EVU_SOFTMAX_FIRST` (-1 both,
-0 carried state, 1 initial tile), `EVU_SOFTMAX_WARMUP` (0 or 1), and
-`EVU_SOFTMAX_CHECK` (0 performance-only, 1 full numerical check),
-`EVU_SOFTMAX_STATE_BATCH` (default 0),
-`EVU_SOFTMAX_REDUCE_VL` (128/64/32,
-default 128), `EVU_SOFTMAX_PIPELINE` (default 1 for cols=256, state=0, red=128;
-otherwise 0), and `EVU_SOFTMAX_DRAIN_DIAG` (default 1).
-Rows must be a positive multiple of four. Nondefault configurations use
-distinct object directories and image names. For the existing RVV warm
-comparison use rows=32, cols/stride=256, scale=1 and first=0; the no-warmup
-`vfexp2_softmax_online_best` is a separate timing condition.
+The kernel contains no CUTE operation, dedicated quantization or final
+probability normalization. Compare identical software options, warmup and
+completion boundaries. Historical cycle counts are not new migration results.
 
-`tmp/doc/XSAI/softmax 优化.md` section 4.8 records 12,224 RVV cycles for
-the matched warm four-row positive-scale/vector-alpha case; section 4.9
-records 0.649 elements/cycle without warmup (approximately 12,620 cycles,
-not an exact cycle count). These are historical numbers. The RVV timer
-does not drain stores with an ending fence, whereas this asynchronous EVU
-test must wait for completion. A strict comparison needs the RVV timing
-boundary to include completed output stores too; do not omit EVU completion
-to make the reported number smaller.
+## Focused Validation
 
-### Matched RVV Test And Optional EVU Experiments
-
-The new `nexus-am/tests/exp2test/tests/performance/vfexp2_softmax_online_matched.c`
-keeps the historical tests and their kernels unchanged. It runs the existing
-four-row LMUL=4 positive-scale/vector-alpha kernel, with an ending CPU fence,
-the same reset template, first=0/1, and the same optional diagnostic interval.
-The EVU test uses `software/evu/include/online_softmax_bench.h`; the RVV test
-uses an identical copy in `nexus-am/tests/exp2test/include/`. These headers
-define input generation and accuracy bounds. EVU carries both benchmark headers
-in this repository and does not require the RVV test headers under `AM_HOME`.
-Keep the copies identical when changing the shared workload; the source schedule
-check verifies both headers against the sibling nexus-am checkout. Sync each
-test's headers and Makefile to the server, and use the same compiler and
-`-fno-fast-math -ffp-contract=off` for both images. Each matched RVV configuration
-has its own object directory, including
-the vendor kernels, so older FMA-enabled objects are not reused.
-
-EVU now defaults to `wave4x2`, per-row E0 states and reduction VL=128 for the
-default workload. This is the preferred next measurement candidate, not a
-server-measured winner. The previous schedules remain selectable.
-Optional configurations, selected at build time, are:
-
-| PIPELINE | STATE_BATCH | REDUCE_VL | Experiment |
-| --- | --- | --- | --- |
-| 1 | 0 | 128 | New default: paired wavefront and next-four-row prefetch |
-| 0 | 0 | 128 | Previous per-row-state baseline |
-| 0 | 1 | 128 | Previous scratch-packed four-row state candidate |
-| 0 | 0 / 1 | 64 / 32 | Short grouped reductions, optionally batched states |
-
-State batching uses VL=4 to load old max/sum, compute alpha/update states, and
-store max/sum/alpha. Reduction results are in separate registers; with the
-current software-visible ISA, they are packed using measured E0 scratch
-stores and a four-element load. Gather extracts each row's max for score
-arithmetic. All scratch, extraction and VL changes remain inside timing.
-This is an experiment, not an assumed speedup; first=1 may save less work.
-
-Short reductions retain all four complete rows and full-VL score arithmetic.
-After pairing the two 128-element chunks, indexed gathers collect subsequent
-32/64-element groups into a short accumulator, then max/sum reduces that
-accumulator. Index loads, gathers, FP32 additions and VL changes are timed.
-This changes sum association, not the elementwise exp operation, and currently
-requires cols=256. State batching supports the resident cases only.
-
-Build the new core test from `nexus-am/tests/exp2test` with target
-`vfexp2_softmax_online_matched` and the same toolchain overrides as EVU.
-Its controls have the `RVV_SOFTMAX_` prefix; defaults and meanings match the
-EVU controls except for the EVU-only PIPELINE/STATE_BATCH/REDUCE_VL. The default core
-image is `build/vfexp2_softmax_online_matched-riscv64-xs.bin`. The existing EVU
-build command now selects wave4x2/state=0/red=128 without editing source macros,
-and keeps the default image name `online_softmax_evu_test-riscv64-xs.bin`.
-Append `EVU_SOFTMAX_PIPELINE=0` to recover the old per-row-state baseline, or
-`EVU_SOFTMAX_REDUCE_VL=64` / `32` to try short reductions. Nondefault image names include the full
-configuration. Do not run an old default image after building a named variant.
-
-Compare the primary completed `c` fields for the same first value; use
-`pre/full/drain/empty` only to diagnose endpoint costs. Both default CHECK=0
-runs are performance-only. Before accepting a faster variant, build both
-with their CHECK=1 controls and retain the common accuracy thresholds.
-The fence/store path and CSR ordering have been inspected in source; the
-server's built RTL and new disassembly still need runtime confirmation.
-
-Source-level layout/schedule check (preprocessing and syntax checks only):
+Lightweight parser checks do not build or run hardware:
 
 ```sh
-/usr/bin/python3 software/evu/scripts/check_online_softmax_schedule.py
+/usr/bin/python3 -m unittest discover -s software/evu/scripts -p 'test_*.py'
 ```
 
-This checker uses ideal exp2 and a sequential FP32 reduction. It catches
-register clobbers, missed elements and out-of-range accesses, but does not
-prove RTL behavior, exact unordered reduction bits, or cycle improvements.
+Server-side reference/RTL tests are described in
+[`EVU_PURE_VECTOR_PLAN.md`](docs/EVU_PURE_VECTOR_PLAN.md).
+Retired funct7 values `0x18`, `0x50` and `0x5e` must trap at every encoded
+element width, including VL=0, with no memory or register effects. EVCAP bit 25
+reads zero. Other instruction encodings and the 13-word CSR snapshot stay at
+ABI 2. FAST/FORK reference modes and incomplete accelerator replay are rejected
+when the required EVU/reference-state support is unavailable.
 
-FReduceSum uses Saturn's unordered `fredusum`. The existing focused
-reference/RTL test still exercises the earlier seven-case blockwise
-algorithm, not this new benchmark schedule:
+Migration status, checks actually run and outstanding server validation are
+recorded in [`EVU_PURE_VECTOR_PROGRESS.md`](docs/EVU_PURE_VECTOR_PROGRESS.md).
 
-```sh
-bash software/evu/scripts/check_softmax_ref.sh ../NEMU
-```
+## RMSNorm / NVFP4 Performance Baseline
 
-This uses the built NEMU library and separate RTL harnesses to check
-reduction/flag semantics and the asynchronous completion/store Difftest ABI.
-It does not validate the new guest schedule. Full-core EMU validation of
-`online_softmax_evu_test` is required for that schedule, scalar retirement,
-CSR timing and HBL2 integration.
-See [the failure analysis](../../.github/evu-softmax-difftest.md).
-The FP64 bounds apply only to the independent accuracy checker; Difftest
-continues to require exact architectural bits and flags.
-
-## Reference Checks
-
-The matrix reference helper moved to `scripts/`:
-
-```sh
-bash software/evu/scripts/check_matrix_ref.sh \
-  /nfs/home/guoqihang/workspace/NEMU_evu --rebuild
-```
-
-`--rebuild` selects `riscv64-xs-evu-ref_defconfig` and cleans/rebuilds that
-NEMU checkout. Without it, the helper tests the existing library. It compiles
-a native host regression, not a RISC-V guest. Expected negative cases print
-mismatch diagnostics; success requires exit status zero and the final
-`EVU matrix reference PASS` message.
-
-The NEMU repository also provides `tools/evu-ref-test` for EVU computation
-checks. Read [matrix failure analysis](docs/MATRIX_REFERENCE_DEBUG.md) for the
-current `run_quanti8mma_evu.log` failure, and
-[server integration steps](../../.github/evu-launch-server.md) for reference
-configuration and full EMU reproduction.
+`rmsnorm_nvfp4_evu_test` measures `[4,512]` FP32 inputs with stage-level cycles,
+row-major versus four-row-interleaved EVU issue, and actual division by 512
+plus epsilon. Reciprocal square root uses only EVU sqrt followed by division.
+Complete RMSNorm is measured with VRF-resident input/output; full
+RMSNorm/NVFP4 includes input loads, block amax, EVU quantization and final
+output stores, with no intermediate-y stores.
+The default RTL has 16 FP32 divide/sqrt lanes. Quantization batches 16 block
+scales, uses continuous slides and paired block workspaces, and aggregates
+outputs into aligned 128-byte FP4 / 64-byte scale stores. The one-lane control
+configuration is `DefaultExternalVectorScalarDivMatrixConfig`.
+CPU arithmetic is used only outside timing for setup/checking. There are
+11 cases, each measured once without warmup by default, and no
+CPU-performance or rsqrt7/Newton cases. Native BF16 is not
+measured. `EVU_RMS_ONLY=1` selects the eight-case RMSNorm-only regression image.
+Six new instructions, independent XX8/MXFP issue paths and server acceptance
+are documented in [`EVU_LOW_PRECISION.md`](docs/EVU_LOW_PRECISION.md).
+See [`RMSNORM_NVFP4_BENCHMARK.md`](docs/RMSNORM_NVFP4_BENCHMARK.md) for numerical
+conventions, build/run commands, BF16-valued FP32 input mode and CSV summaries.
+The instruction extension and server validation sequence are documented in
+[`EVU_RVV_MATH.md`](docs/EVU_RVV_MATH.md).

@@ -27,6 +27,7 @@ class EvuSynchronousVrfSpec extends AnyFlatSpec with ChiselScalatestTester {
         ports.foreach { port =>
           port.req.valid.poke(false.B)
           port.req.bits.oldest.poke(false.B)
+          port.req.bits.lastOperand.poke(false.B)
         }
         dut.io.ll_writes(0).valid.poke(false.B)
         val reservation = dut.io.pipe_write_reqs(0)
@@ -139,7 +140,9 @@ class EvuSynchronousVrfSpec extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.prefetch.valid.poke(false.B)
       dut.io.prefetch.bits.eg.poke(0.U)
       dut.io.prefetch.bits.oldest.poke(false.B)
+      dut.io.prefetch.bits.lastOperand.poke(false.B)
       dut.io.client.req.bits.oldest.poke(false.B)
+      dut.io.client.req.bits.lastOperand.poke(false.B)
       dut.io.memory.req.ready.poke(true.B)
       dut.io.memory.resp.valid.poke(false.B)
       dut.io.memory.resp.bits.poke(0x111.U)

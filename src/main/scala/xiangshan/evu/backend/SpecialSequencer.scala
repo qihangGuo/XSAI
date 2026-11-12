@@ -12,6 +12,7 @@ class SpecialSequencerIO(implicit p: Parameters) extends SequencerIO(new Special
 
   val acc_data = Decoupled(UInt(dLen.W))
   val acc_other_data = Output(UInt(dLen.W))
+  val acc_return = Output(Bool())
   val acc_slot = Input(UInt(2.W))
   val acc_other_slot = Input(UInt(2.W))
   val acc_merge = Input(Bool())
@@ -157,10 +158,12 @@ class SpecialSequencer(exu_insns: Seq[VectorInstruction], context: Int = 0, cont
     getEgId(rs2, eidx, incr_eew, false.B)
   )
   io.rvs2.bits.oldest := oldest
+  io.rvs2.bits.lastOperand := false.B
 
   io.rvm.valid := valid && !data_hazard && renvm && !rvmCaptured
   io.rvm.bits.eg := getEgId(0.U, eidx, 0.U, true.B)
   io.rvm.bits.oldest := oldest
+  io.rvm.bits.lastOperand := false.B
 
   io.busy := valid
   io.head := Mux(acc, acc_e0, head)
@@ -203,6 +206,7 @@ class SpecialSequencer(exu_insns: Seq[VectorInstruction], context: Int = 0, cont
 
   val acc_resp_hit = io.acc_fu_resp.valid && io.acc_fu_resp_slot === io.acc_slot
   val acc_other_resp_hit = io.acc_fu_resp.valid && io.acc_fu_resp_slot === io.acc_other_slot
+  io.acc_return := acc_resp_hit || (io.acc_merge && acc_other_resp_hit)
   val acc_selected_busy = acc_busy(io.acc_slot) && !acc_resp_hit
   val acc_other_busy = acc_busy(io.acc_other_slot) && !acc_other_resp_hit
   io.acc_data.valid := valid && acc && !acc_e0 && !acc_selected_busy && (!io.acc_merge || !acc_other_busy)

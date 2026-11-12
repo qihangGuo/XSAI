@@ -47,15 +47,31 @@ object EvuOpcode {
   val FReduceMax = 0x44.U(8.W)
   val Load    = 0x10.U(8.W)
   val Store   = 0x11.U(8.W)
-  val Launch  = 0x18.U(8.W)
-  val Wait    = 0x19.U(8.W)
+  // 0x18 (Launch) is retired; it must not acquire a control context.
   val Fence   = 0x1a.U(8.W)
   val SetVli  = 0x45.U(8.W)
   val SetVl   = 0x46.U(8.W)
   val Gather  = 0x47.U(8.W)
   val Scatter = 0x48.U(8.W)
-  val FpQuantToCute = 0x50.U(8.W)
   val GatherImm = 0x51.U(8.W)
+  val FSqrt = 0x60.U(8.W)
+  val FRSqrt7 = 0x61.U(8.W)
+  val FRec7 = 0x64.U(8.W)
+  val FSgnjX = 0x66.U(8.W)
+  val FWCvtFF = 0x67.U(8.W)
+  val FNCvtFF = 0x68.U(8.W)
+  val FCvtXF = 0x69.U(8.W)
+  val FCvtFX = 0x6a.U(8.W)
+  val NClipImm = 0x6b.U(8.W)
+  val ZExt2 = 0x6c.U(8.W)
+  val SExt2 = 0x6d.U(8.W)
+  val NSrlImm = 0x6e.U(8.W)
+  val CvtI8F32 = 0x70.U(8.W)
+  val CvtE4M3F32 = 0x71.U(8.W)
+  val CvtE5M2F32 = 0x72.U(8.W)
+  val CvtF32E4M3 = 0x73.U(8.W)
+  val CvtMXFP8F32 = 0x74.U(8.W)
+  val CvtMXFP4F32 = 0x75.U(8.W)
   // Retired fixed-point QuantToCute (0x4c) and SETCFG (0x4e) are reserved.
   // Retired VRF quantization opcode 0x4f remains reserved.
 }
@@ -89,19 +105,15 @@ class EvuControlSequencerIO(p: EvuParams) extends Bundle {
   val flush      = Input(Bool())
   val busy       = Output(Bool())
   val blockYounger = Output(Bool())
-  val jobValid   = Input(Vec(p.commandDepth, Bool()))
-  val jobState   = Input(Vec(p.commandDepth, UInt(3.W)))
-  val matrixBusy = Input(Bool())
-  val matrixException = Input(Bool())
-  val matrixFflags    = Input(UInt(5.W))
+  val backendBusy = Input(Bool())
 }
 
 /**
-  * Serialized control sequencer for Launch, Wait, Fence and VL/VTYPE updates.
+  * Serialized control sequencer for Fence and VL/VTYPE updates.
   *
   * All vector arithmetic and memory traffic run through the Saturn subsystem.
-  * This module only tracks control-command completion and the matrix drain
-  * boundary required by the AMU command stream.
+  * FENCE waits for the vector backend and physical memory transactions.
+  * Arithmetic flags and faults are published by their owning commands.
   */
 class EvuControlSequencer(p: EvuParams) extends Module {
   val io = IO(new EvuControlSequencerIO(p))
@@ -109,23 +121,17 @@ class EvuControlSequencer(p: EvuParams) extends Module {
   private val active = RegInit(false.B)
   private val cmdReg = Reg(new EvuCommand(p))
 
-  private def isControl(cmd: EvuCommand): Bool = cmd.opcode === EvuOpcode.Launch ||
-    cmd.opcode === EvuOpcode.Wait || cmd.opcode === EvuOpcode.Fence ||
+  private def isControl(cmd: EvuCommand): Bool = cmd.opcode === EvuOpcode.Fence ||
     cmd.opcode === EvuOpcode.SetVli || cmd.opcode === EvuOpcode.SetVl
 
-  private val waitTargetId = cmdReg.base(log2Ceil(p.commandDepth) - 1, 0)
-  private val waitDone = cmdReg.opcode === EvuOpcode.Wait && (
-    waitTargetId === cmdReg.jobId || !io.jobValid(waitTargetId) || io.jobState(waitTargetId) >= 3.U)
-  private val fenceDone = cmdReg.opcode === EvuOpcode.Fence && !io.matrixBusy
-  private val immediateDone = cmdReg.opcode === EvuOpcode.Launch ||
-    cmdReg.opcode === EvuOpcode.SetVli || cmdReg.opcode === EvuOpcode.SetVl
-  private val completionDone = active && isControl(cmdReg) && (immediateDone || waitDone || fenceDone)
-  private val fenceResult = cmdReg.opcode === EvuOpcode.Fence
+  private val fenceDone = cmdReg.opcode === EvuOpcode.Fence && !io.backendBusy
+  private val immediateDone = cmdReg.opcode === EvuOpcode.SetVli || cmdReg.opcode === EvuOpcode.SetVl
+  private val completionDone = active && isControl(cmdReg) && (immediateDone || fenceDone)
 
   io.command.ready := !active && !io.flush
   // Unlike busy, this is registered-state-only: Top may use it to gate the
   // shared input without forming a command.valid -> busy combinational loop.
-  io.blockYounger := active && (cmdReg.opcode === EvuOpcode.Wait || cmdReg.opcode === EvuOpcode.Fence)
+  io.blockYounger := active && cmdReg.opcode === EvuOpcode.Fence
   when(io.command.fire) {
     cmdReg := io.command.bits
     active := true.B
@@ -137,11 +143,11 @@ class EvuControlSequencer(p: EvuParams) extends Module {
   io.completion.bits.tvalValid := false.B
   io.completion.bits.opcode := cmdReg.opcode
   io.completion.bits.vd := cmdReg.vd
-  io.completion.bits.exception := fenceResult && io.matrixException
-  io.completion.bits.fflags := Mux(fenceResult, io.matrixFflags, 0.U)
+  io.completion.bits.exception := false.B
+  io.completion.bits.fflags := 0.U
   io.completion.bits.vxsat := false.B
   io.completion.bits.dirtyVs := cmdReg.opcode === EvuOpcode.SetVli || cmdReg.opcode === EvuOpcode.SetVl
-  io.completion.bits.cause := Mux(fenceResult && io.matrixException, EvuFault.Access, EvuFault.None)
+  io.completion.bits.cause := EvuFault.None
   io.completion.bits.jobId := cmdReg.jobId
   io.completion.bits.epoch := cmdReg.epoch
 

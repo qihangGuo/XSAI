@@ -21,7 +21,7 @@ class EvuWidthConfigHarness extends Module {
     val illegal = Output(Bool())
     val configuredVl = Output(UInt(32.W))
   })
-  val (vl, _, illegal) = EvuVtype.configure(EvuParams(), true.B, io.sew, io.vl, io.aux)
+  val (vl, _, illegal) = EvuVtype.configure(EvuParams(), io.vl, io.aux)
   io.illegal := illegal
   io.configuredVl := vl
 }
@@ -58,7 +58,7 @@ class EvuElementWidthSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
     val factories = Seq(IntegerPipeFactory, IntegerMultiplyFactory(3, true), IntegerMultiplyFactory(3, false),
       ShiftPipeFactory, BitwisePipeFactory, BitmanipPipeFactory, PermuteUnitFactory, MaskUnitFactory(1),
       SIMDFPFMAFactory(4, false), SIMDFPFMAFactory(4, true), FPCmpFactory, FPConvFactory, FPDivSqrtFactory,
-      VFExp2Factory)
+      SIMDFPDivSqrtFactory, VFExp2Factory)
     for (factory <- factories) {
       for (insn <- factory.insns) {
         insn.lookup(SEW).mask should be(BigInt(3))

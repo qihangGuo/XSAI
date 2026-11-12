@@ -77,6 +77,7 @@ class EvuVrfBankMappingSpec extends AnyFlatSpec with ChiselScalatestTester with 
           port.req.valid.poke(false.B)
           port.req.bits.eg.poke(0.U)
           port.req.bits.oldest.poke(false.B)
+          port.req.bits.lastOperand.poke(false.B)
           port.speculative.poke(false.B)
         }
         val reservation = dut.io.pipe_write_reqs(0)

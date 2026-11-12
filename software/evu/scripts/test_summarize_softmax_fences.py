@@ -1,7 +1,7 @@
 import re
 import unittest
 
-from summarize_softmax_fences import format_table, summarize
+from summarize_softmax_fences import DIAGNOSTICS, format_table, summarize
 
 
 def case(first, base, warmup=1, diagnostic=1):
@@ -166,6 +166,66 @@ class SoftmaxFenceSummaryTest(unittest.TestCase):
         result = format_table(summarize(run + run))
         self.assertIn("Run 1", result)
         self.assertIn("Run 2", result)
+
+    def test_instruction_stage_and_memory_diagnostics(self):
+        lines = case(0, 0)
+        for fence in range(7):
+            for tag, (labels, keys) in DIAGNOSTICS.items():
+                values = {"path": "fp_fma", "stage": "fold", "op": "red_sum", "bucket": "2"}
+                text = " ".join(label + "=" + values[label] for label in labels)
+                text += " " + " ".join(key + "=" + str((i + 1) * fence) for i, key in enumerate(keys))
+                lines.append("[EVU-{}] fence={} {}\n".format(tag, fence, text))
+        result = summarize(["[OS] r=32 w=1 diag=1\n"] + lines)
+        self.assertIn("[OS-OP] first=0 op=red_sum inst=1 issue=2 e16=3 e32=4 dep=5 operand=6 feedback=7 completed=8 latency=9", result)
+        self.assertTrue(any("path=fp_fma stage=fold issue=1" in line for line in result))
+        self.assertTrue(any("bucket=2 load=1 store=2" in line for line in result))
+        table = format_table(result)
+        self.assertTrue(any("red_sum mean cycles" in line and "1.1" in line for line in table))
+        missing = [line for line in lines if not line.startswith("[EVU-READ] fence=3 ")]
+        with self.assertRaisesRegex(ValueError, "incomplete formal diagnostic"):
+            summarize(["[OS] r=32 w=1 diag=1\n"] + missing)
+
+    def test_new_records_reconnect_interrupted_uart_and_preserve_dispatch(self):
+        lines = case(0, 0)
+        for i, line in enumerate(lines):
+            if line.startswith("[EVU-FU]"):
+                lines[i] = line.rstrip() + " dispatch={}\n".format(i // 5)
+        keys = DIAGNOSTICS["SCHED"][1]
+        for fence in range(7):
+            text = " ".join(key + "=" + str(fence) for key in keys)
+            lines.append("[EVU-SCHED] fence={} path=fp_fma {}\n".format(fence, text))
+        text = "".join(["[OS] r=32 w=1 diag=1\n"] + lines)
+        text = text.replace("ordinary_idle=3", "ordinary_[OS] DONE\nidle=3")
+        result = summarize(text.splitlines(keepends=True))
+        self.assertIn("dispatch=1", result[3])
+        self.assertTrue(any("ordinary_idle=1" in line for line in result))
+
+    def test_geometry_is_not_differenced_and_must_match(self):
+        lines = case(0, 0)
+        for fence in range(7):
+            lines.append("[EVU-CONFIG] fence={} dlen=512 mlen=512 vlen=4096 fma_contexts=2 reduction_contexts=2\n".format(fence))
+        result = summarize(["[OS] r=32 w=1 diag=1\n"] + lines)
+        self.assertIn("[OS-CONFIG] first=0 dlen=512 mlen=512 vlen=4096 fma_contexts=2 reduction_contexts=2", result)
+        changed = [line.replace("dlen=512", "dlen=256") if line.startswith("[EVU-CONFIG] fence=3 ") else line
+                   for line in lines]
+        with self.assertRaisesRegex(ValueError, "configuration changed"):
+            summarize(["[OS] r=32 w=1 diag=1\n"] + changed)
+
+    def test_read_hints_use_formal_deltas_and_retired_matrix_records_are_ignored(self):
+        lines = case(0, 0)
+        for fence in range(7):
+            lines.append("[EVU-BRIDGE] fence={} mte_block={} evu_block={} bridge_block={} "
+                         "occ0={} occ1={} occ2={} tiles={} gap1={} gap2_3={} gap4_7={} gap8={}\n".format(
+                             fence, *([fence * 3] * 11)))
+            lines.append("[EVU-HANDOFF] fence={} path=fp_exp eligible={} idle={}\n".format(fence, fence * 4, fence))
+            lines.append("[EVU-TAIL] fence={} path=fp_fma stage=fold ready_wait={} return_issue={}\n".format(
+                fence, fence * 5, fence * 2))
+            lines.append("[EVU-MATRIX-TASK] task={} peak=2 full=12 burst=3\n".format(fence))
+        result = summarize(["[OS] r=32 w=1 diag=1\n"] + lines)
+        self.assertFalse(any("[OS-BRIDGE]" in line for line in result))
+        self.assertTrue(any("path=fp_exp eligible=4 idle=1" in line for line in result))
+        self.assertTrue(any("stage=fold ready_wait=5 return_issue=2" in line for line in result))
+        self.assertFalse(any("peak=" in line for line in result))
 
 
 if __name__ == "__main__":
