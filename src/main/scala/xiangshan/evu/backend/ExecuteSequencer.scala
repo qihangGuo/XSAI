@@ -92,6 +92,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   val vs3_eew   = Reg(UInt(2.W))
   val vd_eew    = Reg(UInt(2.W))
   val slide     = Reg(Bool())
+  val aligned_slide = RegInit(false.B)
   val slide_up  = Reg(Bool())
   val slide1    = Reg(Bool())
   val slide_offset = Reg(UInt((1+log2Ceil(maxVLMax)).W))
@@ -118,17 +119,26 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   val acc_merge = Reg(Bool())
   val acc_merge_id = Reg(UInt(2.W))
   val acc_stream_groups = Reg(UInt(3.W))
+  val minmax_input_seen = RegInit(false.B)
 
   val compress = inst.opmf6 === OPMFunct6.compress && usesCompress.B
   val acc_copy = elementwise
-  val acc_last = acc_fold_id + 1.U === log2Ceil(dLenB).U - vd_eew || acc_copy
+  val fp32_minmax = inst.isOpf && vd_eew === 2.U &&
+    inst.opff6.isOneOf(OPFFunct6.fredmin, OPFFunct6.fredmax)
+  val acc_tree = vParams.fp32MinMaxTree.B && fp32_minmax && acc_fold
+  val acc_empty = fp32_minmax && acc_fold && !minmax_input_seen
+  val acc_last = acc_tree || acc_empty || acc_fold_id + 1.U === log2Ceil(dLenB).U - vd_eew || acc_copy
+  val effective_pipe_stages = Mux(acc_tree, (VectorFastPaths.minMaxTreeDepth(dLen) - 1).U, pipe_stages)
   val uscalar  = Mux(inst.funct3(2), inst.rs1_data, inst.imm5)
   val sscalar  = Mux(inst.funct3(2), inst.rs1_data, inst.imm5_sext)
   val rgather    = inst.opif6 === OPIFunct6.rgather && usesPerm.B
   val rgather_ix = rgather && inst.funct3.isOneOf(OPIVX, OPIVI)
   val rgather_v  = rgather && inst.funct3.isOneOf(OPIVV)
   val renv1    = inst.renv1 && !inst.reduction
-  val renv2    = Mux(rgather_ix, head, inst.renv2) && (!inst.reduction || (!acc_fold && !acc_merge))
+  val slide_source_index = Mux(slide_up, eidx - slide_offset, eidx +& slide_offset)
+  val slide_source_valid = slide_source_index < inst.vconfig.vtype.vlMax
+  val renv2    = Mux(rgather_ix, head, inst.renv2) && (!inst.reduction || (!acc_fold && !acc_merge)) &&
+    (!aligned_slide || slide_source_valid)
   val renvd    = inst.renvd && usesRvd.B
   val renvm    = inst.renvm
   val renacc   = inst.reduction && usesAcc.B
@@ -171,6 +181,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     val dis_slide1       = !dis_inst.isOpi
     val dis_uscalar      = Mux(dis_inst.funct3(2), dis_inst.rs1_data, dis_inst.imm5)
     val dis_slide_offset = Mux(!dis_slide1, get_max_offset(dis_uscalar, dis_sew), 1.U)
+    val dis_aligned_slide = usesPerm.B && VectorFastPaths.alignedSlide(dis_inst, dLen, vParams.alignedSlide)
     val dis_tail         = dis_next_eidx === dis_vl
     val dis_rgatherei16  = dis_inst.funct3 === OPIVV && dis_inst.opif6 === OPIFunct6.rgatherei16 && usesPerm.B
     val dis_rgather_eew  = Mux(dis_inst.opif6 === OPIFunct6.rgatherei16, 1.U, dis_sew)
@@ -202,14 +213,16 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
 
     val dis_exp2 = dis_inst.isOpf && dis_inst.opff6 === OPFFunct6.funary1 &&
       dis_inst.rs1 === FEXP2_V.selector.U
-    val dis_start = Mux(dis_exp2, dis_inst.vstart, 0.U)
+    val dis_start = Mux(dis_aligned_slide && dis_slide_up, dis_slide_offset,
+      Mux(dis_exp2, dis_inst.vstart, 0.U))
     assert(dis_inst.vstart === 0.U || dis_exp2)
     valid         := true.B
     inst          := io.dis.bits
+    inst.renv2    := dis_inst.renv2 || dis_aligned_slide
     eidx          := dis_start
     wvd_mask      := Mux(dis_inst.wvd               , FillInterleaved(egsPerVReg, dis_vd_arch_mask), 0.U)
     rvs1_mask     := Mux(dis_inst.renv1             , FillInterleaved(egsPerVReg, dis_vs1_arch_mask), 0.U)
-    rvs2_mask     := Mux(dis_inst.renv2             , FillInterleaved(egsPerVReg, dis_vs2_arch_mask), 0.U)
+    rvs2_mask     := Mux(dis_inst.renv2 || dis_aligned_slide, FillInterleaved(egsPerVReg, dis_vs2_arch_mask), 0.U)
     rvd_mask      := Mux(dis_inst.renvd && usesRvd.B, FillInterleaved(egsPerVReg, dis_vd_arch_mask), 0.U)
     rvm_mask      := Mux(dis_inst.renvm             , ~(0.U(egsPerVReg.W)), 0.U)
     head          := true.B
@@ -218,6 +231,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     parallel_acc  := dis_inst.opff6.isOneOf(OPFFunct6.fredusum, OPFFunct6.fredmin, OPFFunct6.fredmax)
     acc_stream_slot := 0.U
     acc_stream_groups := 0.U
+    minmax_input_seen := false.B
     acc_merge     := false.B
     acc_merge_id  := 1.U
     sets_wmask    := dis_ctrl.bool(SetsWMask)
@@ -228,6 +242,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     pipe_stages   := dis_ctrl.uint(PipelineStagesMinus1)
     fu_sel        := dis_ctrl.uint(FUSel(nFUs))
     slide         := dis_slide
+    aligned_slide := dis_aligned_slide
     rgatherei16   := dis_rgatherei16
     mvnrr         := dis_mvnrr
     vs1_eew       := dis_vs1_eew
@@ -313,7 +328,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   io.rvs1.req.bits.eg := getEgId(inst.rs1, Mux(inst.scalarVrfSource, 0.U, eidx), vs1_eew, inst.reads_vs1_mask)
   io.rvs2.req.bits.eg := Mux(rgather || rgatherei16,
     getEgId(inst.rs2, rgather_eidx, vs2_eew, false.B),
-    getEgId(inst.rs2, eidx        , vs2_eew, inst.reads_vs2_mask)
+    getEgId(inst.rs2, Mux(aligned_slide, slide_source_index, eidx), vs2_eew, inst.reads_vs2_mask)
   )
   io.rvd.req.bits.eg  := getEgId(inst.rd , eidx     , vs3_eew, false.B)
   io.rvm.req.bits.eg  := getEgId(0.U     , eidx     , 0.U    , true.B)
@@ -396,11 +411,11 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   val exu_scheduler = Module(new PipeScheduler(1, maxPipeDepth))
   exu_scheduler.io.reqs(0).request := valid && pipelined
   exu_scheduler.io.reqs(0).fire := io.iss.fire
-  exu_scheduler.io.reqs(0).depth := pipe_stages
+  exu_scheduler.io.reqs(0).depth := effective_pipe_stages
 
   val destIndex = Mux(lowPrecision && EvuLowPrecision.packed(inst.funct6), eidx >> 1, eidx)
   val wvd_eg = getEgId(inst.rd, Mux(inst.reduction, 0.U, destIndex), vd_eew, inst.writes_mask)
-  val read_slide_buffer = slide && Mux(slide_up,
+  val read_slide_buffer = slide && !aligned_slide && Mux(slide_up,
     next_eidx > slide_offset,
     eidx +& slide_offset < inst.vconfig.vtype.vlMax)
   val read_eidx_buffer = rgather_v || rgatherei16
@@ -436,7 +451,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   // reduction producing its operands, especially when both share one FU.
   io.pipe_write_req.request := operandsReady && pipelined && exu_scheduler.io.reqs(0).available
   io.pipe_write_req.bank_sel := (if (vrfBankBits == 0) 1.U else UIntToOH(vrfBank(wvd_eg), vParams.vrfBanking))
-  io.pipe_write_req.pipe_depth := pipe_stages
+  io.pipe_write_req.pipe_depth := effective_pipe_stages
   io.pipe_write_req.oldest := oldest
   io.pipe_write_req.fire := io.iss.fire
 
@@ -475,7 +490,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   io.iss.bits.vm        := inst.vm
   io.iss.bits.rm        := inst.rm
   io.iss.bits.iterative := !pipelined
-  io.iss.bits.pipe_depth := pipe_stages
+  io.iss.bits.pipe_depth := effective_pipe_stages
   io.iss.bits.fu_sel    := fu_sel
 
   val dlen_mask = ~(0.U(dLenB.W))
@@ -500,25 +515,34 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
       ~(0.U(dLenB.W)) >> (0.U(dLenOffBits.W) - ((inst.vconfig.vtype.vlMax - slide_offset) << vs2_eew))(dLenOffBits-1,0)),
     ~(0.U(dLenB.W)))
   val slide_down_bit_mask = FillInterleaved(8, slide_down_byte_mask)
-  io.iss.bits.use_slide_rvs2 := slide
+  io.iss.bits.use_slide_rvs2 := slide && !aligned_slide
   io.iss.bits.slide_data := io.vgu.slide_data & slide_down_bit_mask
 
   io.iss.bits.use_scalar_rvs1 := inst.funct3.isOneOf(OPIVI, OPIVX, OPMVX, OPFVF) || rgather_v || rgatherei16
   io.iss.bits.scalar := Mux(rgather_v || rgatherei16,
     rgather_eidx,
     Mux(zext_imm5, uscalar, sscalar))
-  io.iss.bits.use_zero_rvs2 := rgather_zero && (rgather || rgatherei16)
+  io.iss.bits.use_zero_rvs2 := (rgather_zero && (rgather || rgatherei16)) ||
+    (aligned_slide && !slide_source_valid)
 
   io.iss.bits.acc       := inst.reduction && usesAcc.B
   io.iss.bits.acc_merge := acc_merge
   io.iss.bits.acc_slot  := Mux(acc_merge || acc_fold || !parallel_acc, 0.U, acc_stream_slot)
   io.iss.bits.acc_copy  := acc_copy
   io.iss.bits.acc_fold  := acc_fold
+  io.iss.bits.acc_tree  := acc_tree
+  io.iss.bits.acc_empty := acc_empty
   io.iss.bits.acc_fold_id := acc_fold_id
   io.iss.bits.acc_ew      := elementwise
   io.acc_slot := io.iss.bits.acc_slot
   io.acc_other_slot := acc_merge_id
   io.acc_merge := acc_merge
+
+  val minmax_stream_mask = Mux(inst.vm, ~(0.U(dLenB.W)), get_vm_mask(io.rvm_data, eidx, vd_eew, dLen))
+  val minmax_input_active = (io.iss.bits.eidx_mask & minmax_stream_mask).orR
+  when(io.iss.fire && renacc && !acc_fold && !acc_merge && fp32_minmax) {
+    minmax_input_seen := minmax_input_seen || minmax_input_active
+  }
 
 
   when (io.iss.fire && !tail) {
@@ -537,7 +561,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
           val wvd_clr_mask = UIntToOH(io.iss.bits.wvd_eg)
           wvd_mask  := wvd_mask  & ~wvd_clr_mask
         }
-        when (next_is_new_eg(eidx, next_eidx, vs2_eew, inst.reads_vs2_mask) && !(inst.reduction && head) && !rgather_v && !rgatherei16) {
+        when (next_is_new_eg(eidx, next_eidx, vs2_eew, inst.reads_vs2_mask) && !(inst.reduction && head) && !rgather_v && !rgatherei16 && !aligned_slide) {
           rvs2_mask := rvs2_mask & ~UIntToOH(io.rvs2.req.bits.eg)
         }
         when (rgather_ix) {
@@ -563,7 +587,8 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
           acc_stream_slot := acc_stream_slot + 1.U
           when(acc_stream_groups < 4.U) { acc_stream_groups := acc_stream_groups + 1.U }
           when (eidx_tail) {
-            when (parallel_acc && acc_stream_groups =/= 0.U) {
+            when (parallel_acc && acc_stream_groups =/= 0.U &&
+              (!fp32_minmax || minmax_input_seen || minmax_input_active)) {
               acc_merge := true.B
               acc_merge_id := 1.U
             } .otherwise {

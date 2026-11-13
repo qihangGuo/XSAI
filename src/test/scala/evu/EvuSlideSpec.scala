@@ -120,15 +120,17 @@ class EvuSlideSpec extends AnyFlatSpec with ChiselScalatestTester with Matchers 
         }
         val input = (0 until 2 * ep.vlenBytes).map(byte => (byte * 29 + byte / 251 + 7) & 255)
         val sentinel = Seq.fill(ep.vlenBytes)(0xa5)
-        for (sew <- 0 to 2; lmul <- Seq(0, 1, 7); down <- Seq(false, true); scenario <- 0 until 12) {
+        for (sew <- 0 to 2; lmul <- Seq(0, 1, 7); down <- Seq(false, true); scenario <- 0 until 16) {
           val width = 1 << sew
           val vlmax = (ep.vlenBytes / width) * (if (lmul == 1) 2 else 1) / (if (lmul == 7) 2 else 1)
           val offsets = Seq(BigInt(0), BigInt(1), BigInt(ep.dlenBytes / width - 1),
             BigInt(ep.dlenBytes / width), BigInt(ep.dlenBytes / width + 1), BigInt(vlmax - 1),
-            BigInt(vlmax), BigInt(vlmax + 1), BigInt(1) << 32, (BigInt(1) << 64) - 1, BigInt(1), BigInt(1))
+            BigInt(vlmax), BigInt(vlmax + 1), BigInt(1) << 32, (BigInt(1) << 64) - 1, BigInt(1), BigInt(1),
+            BigInt(ep.dlenBytes / width), BigInt(2 * ep.dlenBytes / width),
+            BigInt(vlmax - ep.dlenBytes / width), BigInt(0))
           val offset = offsets(scenario)
-          val vl = if (scenario == 10) 0 else if (scenario == 0 || scenario == 11) vlmax else vlmax - 3
-          val alias = down && scenario == 11
+          val vl = if (scenario == 10) 0 else if (scenario == 0 || scenario == 11 || scenario >= 12) vlmax else vlmax - 3
+          val alias = down && (scenario == 11 || scenario == 12)
           val dest = if (alias) 4 else 8
           withClue(s"sew=$sew lmul=$lmul down=$down scenario=$scenario: ") {
             dut.io.lmul.get.poke(0.U)

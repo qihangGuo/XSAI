@@ -375,6 +375,8 @@ case class VectorParams(
   fmaOrdinaryContexts: Int = 1,
   parallelFp32Div: Boolean = false,
   interleaveReductions: Boolean = false,
+  fp32MinMaxTree: Boolean = false,
+  alignedSlide: Boolean = false,
 
   issStructure: VectorIssueStructure = VectorIssueStructure.Unified,
 

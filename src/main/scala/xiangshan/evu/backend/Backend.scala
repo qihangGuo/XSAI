@@ -215,7 +215,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     vxissq.io.enq.bits.reads_vs1_mask := dis_ctrl.bool(ReadsVS1AsMask)
     vxissq.io.enq.bits.reads_vs2_mask := dis_ctrl.bool(ReadsVS2AsMask)
     vxissq.io.enq.bits.renv1 := dis_ctrl.bool(ReadsVS1) && !dis_ctrl.bool(Reduction)
-    vxissq.io.enq.bits.renv2 := dis_ctrl.bool(ReadsVS2)
+    vxissq.io.enq.bits.renv2 := dis_ctrl.bool(ReadsVS2) ||
+      VectorFastPaths.alignedSlide(vdq.io.deq.bits, dLen, vParams.alignedSlide)
     vxissq.io.enq.bits.renvd := dis_ctrl.bool(ReadsVD)
     vxissq.io.enq.bits.renvm := (!vdq.io.deq.bits.vm && dis_ctrl.bool(VMBitReadsVM)) || dis_ctrl.bool(AlwaysReadsVM)
     vxissq.io.enq.bits.wvd := !dis_ctrl.bool(WritesScalar)
@@ -500,7 +501,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
         // (e.g. an inactive tail sNaN retained in an upper accumulator lane).
         val foldMask = VecInit.tabulate(log2Ceil(dLenB))(i =>
           ((BigInt(1) << (dLenB >> (i + 1))) - 1).U(dLenB.W))(acc_fold_id)
-        vxu_iss.wmask := Mux(vxs_iss.acc_copy, eewByteMask(vxs_iss.vd_eew), foldMask)
+        vxu_iss.wmask := Mux(vxs_iss.acc_copy || vxs_iss.acc_tree || vxs_iss.acc_empty,
+          eewByteMask(vxs_iss.vd_eew), foldMask)
         vxu_iss.rvs1_elem := Mux(vxs_iss.acc_copy, acc_init, folded)
         vxu_iss.rvs1_data := Mux(vxs_iss.acc_copy, acc_init, folded)
         vxu_iss.rvs1_eew := vxs_iss.vd_eew

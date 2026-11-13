@@ -84,7 +84,9 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
     io.tagged_fflags(i).valid := fu.io.set_fflags.valid
     io.tagged_fflags(i).bits.flags := fu.io.set_fflags.bits
     io.tagged_fflags(i).bits.vat := (fu match {
-      case f: PipelinedFunctionalUnit => f.io.pipe(f.depth - 1).bits.vat
+      case f: PipelinedFunctionalUnit => Mux1H(f.io.pipe.zipWithIndex.map { case (stage, index) =>
+        (stage.valid && stage.bits.pipe_depth === index.U) -> stage.bits.vat
+      })
       case f: IterativeFunctionalUnit => f.io.hazard.bits.vat
     })
   }

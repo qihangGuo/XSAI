@@ -219,6 +219,8 @@ class ExecuteMicroOp(nFUs: Int)(implicit p: Parameters) extends CoreBundle()(p) 
   val acc_slot  = UInt(2.W)
   val acc_copy  = Bool()
   val acc_fold  = Bool()
+  val acc_tree  = Bool()
+  val acc_empty = Bool()
   val acc_fold_id = UInt(log2Ceil(dLenB).W)
   val acc_ew   = Bool()
 

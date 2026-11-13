@@ -6,8 +6,13 @@ The full timed path uses EVU for every numerical step. CPU arithmetic is
 limited to untimed setup and correctness checks. No rsqrt7 or CPU-performance
 case is included; reciprocal square root is EVU sqrt followed by division.
 
-The new low-precision RTL and software still require server compilation and
-execution. Source-level checks are not measured performance or an RTL PASS.
+The overlapped software schedule still requires server guest compilation and
+execution on the existing low-precision RTL. Source-level checks are not
+measured performance or an RTL PASS.
+
+The subsequent default min/max-tree and aligned-slide RTL optimizations require
+a new server EMU build; see `EVU_REDUCTION_SLIDE_FASTPATHS.md`. Compare the same
+format-8 guest image before and after that hardware change.
 
 ## Cases and timing
 
@@ -24,7 +29,7 @@ execution. Source-level checks are not measured performance or an RTL PASS.
 The benchmark runs exactly 11 cases, with no warmup and one timed
 execution per case by default (11 kernel invocations). Default guest printing
 is 13 lines: config, 11 results, PASS. The header identifies this layout
-as `samples=1 warmup=0 cases=11 format=7 quant_batch=16`. Each result covers
+as `samples=1 warmup=0 cases=11 format=8 quant_batch=16 quant_vl=16 quant_sew=32 quant_schedule=overlap`. Each result covers
 all four rows and reports `cycles`, retired CPU `inst` and `errors`, without
 min/median/max statistics. Instructions include dispatch and timestamp probes.
 `empty` is not subtracted; separately prepared stage costs are not additive.
@@ -37,18 +42,25 @@ amax cases are removed. Normalization and amax still run inside the full
 operators and are checked; the timed quantization paths store only the
 final FP4 data and E4M3 scales. Full RMSNorm still uses multiplication by
 1/512, while `scale_div_eps` explicitly measures division plus epsilon.
-The summary tools also accept historical format-5/6 8/11-case and 17/23-case logs.
+The summary tools also accept historical format-5/6/7/8 8/11-case and 17/23-case logs.
 
 Every measured interval starts after a drain and includes its final EVU
 FENCE and scalar memory fence. Check stores and CPU reference computations
-are outside timing. `EVU_RMS_VERBOSE=1` also prints each sample with its exact
+are outside timing. Since quantization reuses consumed input registers, the
+fused checker recomputes RMSNorm outside timing to recover its exact EVU y
+values before byte-for-byte FP4/scale checking. The standalone quantization
+checker uses its original reference_y input directly. No additional timed
+kernel executions or intermediate-y stores are introduced.
+`EVU_RMS_VERBOSE=1` also prints each sample with its exact
 hardware FENCE pair (`fences=start:end`). The counter parser differences
 these snapshots to exclude setup and validation traffic.
 
 `rms_evu` has no EVU data memory traffic in its timed kernel. `quant_evu` and
 `fused_nvfp4` store exactly 1,024 packed FP4 bytes and 128 E4M3 bytes, without
 storing y. They load constants but no gather-index tables. Final outputs use
-eight aligned 128-byte stores and two aligned 64-byte scale stores. Physical
+sixteen aligned 64-byte FP4 stores and two aligned 64-byte scale stores. The
+logical store count rises from 10 to 18, but the payload remains 1,152 bytes
+and 18 aligned 64-byte groups. Physical
 memory traffic can exceed logical output bytes: logical stores
 do not imply HBM transactions. Setup, earlier cases and CPU checking affect
 cache state. Removing warmup changes cache conditions, so these results
@@ -60,22 +72,45 @@ RMSNorm uses v0..v15 for four chunks per row, v16..v19 for gamma,
 v20..v23 for square scratch, v24..v27 for row scalars, and v28..v31 for
 constants. VL=128/e32/m1 processes each chunk.
 
-Quantization keeps all normalized y in v0..v15. Each batch covers 16 blocks
-(256 elements, two source registers). Two block workspaces interleave
-continuous slides, absolute values, reductions and packed conversions.
+Quantization starts with all normalized y in v0..v15. Each row is consumed
+as two batches of 16 blocks (256 elements, two source registers per batch).
+After batch 0 is packed, v0/v1 are dead and become a second inverse/mask
+context. Other source registers remain untouched until their data is consumed.
+The RMSNorm row-major/wave4 schedules and input loading are unchanged.
 `include/rmsnorm_nvfp4_batch.h` contains the actual shared schedule.
+
+VL=16/e32/m1 remains fixed for the whole quantizer. A packed 16-element FP4
+block is eight bytes, treated as two raw 32-bit words for slides, not converted
+to FP32. Eight blocks fill a 64-byte output group. Four raw words similarly
+carry each batch's 16 E4M3 bytes into the scale buffer. Garbage above each
+narrow conversion payload is overwritten by the following insertions before
+storage. Quantization configuration commands drop from 209 to one; total
+expanded XV/configuration commands drop from 1,750 to 1,536. These are static
+counts, not measured cycle improvements or retired CPU instruction counts.
+
+The prologue computes batch 0 scales while collecting batch 1 maxima, then
+packs batch 0 to release v0/v1. It computes batch 1 scales alongside batch 2
+maxima. Steady state interleaves three phases: next-batch maximum reduction,
+current-batch scale divisions/XX8 conversion, and previous-batch multiply,
+MXFP4 conversion, packing and stores. The two scale contexts alternate;
+division waits contain independent maximum/packing instructions. The final
+batch drains the pipeline. Sharing the four block work registers still
+creates dependencies, so the schedule exposes overlap rather than guaranteeing
+that all FUs execute simultaneously. Confirm cycle changes with server EMU.
 
 | Register | Content |
 | --- | --- |
-| v16, v17 | Two contiguous 16-element FP32 blocks |
-| v18, v19 | Two absolute-value/z workspaces; v18 temporarily broadcasts six |
-| v20 | First amax result, then 16 candidate scales, then 128 packed output bytes |
-| v21 | Second amax result, then 16 nonzero-block masks |
-| v22 | Collected 16 amax values, then first block's inverse/mask/packed scratch |
-| v23 | 16 E4M3 scale bytes, then second block's inverse/mask/packed scratch |
+| v0, v1 | Initially y chunks 0/1; after batch 0, second inverse/mask context |
+| v2..v15 | Remaining y chunks; read-only during quantization |
+| v16, v17 | Two contiguous FP32 blocks, then reduction/z scratch; v16 also holds E4M3 codes |
+| v18, v19 | Absolute values, broadcast inverse/mask and packed FP4 scratch |
+| v20 | 64-byte FP4 output buffer for eight blocks |
+| v21 | First context's 16 nonzero-block masks |
+| v22 | Collected 16 maxima for the next scale calculation |
+| v23 | Broadcast FP32 constant six |
 | v24 | 64-byte scale buffer accumulated across four batches |
 | v25..v30 | Alpha, one, minimum scale, zero, integer one, factor=127 |
-| v31 | 16 decoded scales, actual scales d, then reciprocals inv_d |
+| v31 | First context's candidates, decoded scales, d, then inv_d |
 
 The finite-input quantization policy matches the existing reference helpers:
 candidate=(m/6)/alpha, E4M3 RNE and saturation at 448, nonzero blocks get at
@@ -98,8 +133,8 @@ FP32 arithmetic order. E4M3 encode/decode also process 16 scales together.
 Scale insertion/stores and subsequent block extraction can proceed while
 the final reciprocal division runs. Pairwise workspaces expose overlap among
 permutation, comparison/FMA and MXFP paths; actual overlap depends on the
-shared queues, dependencies and VRF. Batches retain amax/scaling/packing phases;
-they are not a fully overlapped pipeline across independent batches.
+shared queues, dependencies and VRF. Unlike format 7, the steady-state issue
+stream interleaves amax/scaling/packing from different batches.
 
 Both fused schedules use this same contiguous, row-major quantization kernel.
 `wave4` changes the RMSNorm/input-load scheduling only. `quant_evu` remains one
@@ -109,9 +144,11 @@ divider throughput from the software scheduling improvements.
 ## Correctness and comparison
 
 Floating output is checked against scalar FP32 RMSNorm with tolerance
-`2e-5*(1+abs(reference))`. After timing, y is stored for checking; quantization
-is compared against the CPU reference applied to the actual checked y, so
-valid reduction-order differences at quantization thresholds are tolerated.
+`2e-5*(1+abs(reference))`. After fused timing, RMSNorm is replayed and y is
+stored for checking; quantization is compared against the CPU reference
+applied to this deterministic EVU y, so valid reduction-order differences at
+quantization thresholds are tolerated. Standalone quantization is checked
+directly against its reference_y input.
 Packed data and scale codes must match exactly, and buffer guards are checked.
 NV/DZ and EVU errors fail. Quantization may legitimately report OF/NX on
 finite-saturating conversions; the bit-exact instruction tests check flags.
@@ -121,7 +158,7 @@ The independent quantization helper oracle remains a server-side test.
 storing and processing them as FP32. It does not measure native BF16 bandwidth.
 NaN/Inf inputs are covered by instruction tests, not the full RMSNorm workload.
 
-`EVU_RMS_ONLY=1` selects the eight non-quantization cases (`cases=8 format=7`)
+`EVU_RMS_ONLY=1` selects the eight non-quantization cases (`cases=8 format=8`)
 and needs capability
 bit28 only. Build this image once and run the identical image on old/new
 emulators (each with its matching NEMU) to assess conversion-FU integration
@@ -139,11 +176,11 @@ merge only accumulator slots that received input groups.
 
 No xv encoding or NEMU arithmetic semantics change. Use the existing updated
 NEMU checkout, including its previously added slide and low-precision support.
-Rebuild the emulator and guest on the server:
+This software-only schedule change does not require rebuilding EMU or NEMU
+when the previous 16-lane/low-precision hardware is already available. Rebuild
+only the guest on the server:
 
 ```sh
-make emu CONFIG=DefaultExternalVectorMatrixConfig \
-  ACCELERATOR_CDC_ENABLE=0 EMU_THREADS=8 EMU_TRACE=fst -j16
 make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM NAME=rmsnorm_nvfp4_evu_test
 ./build/emu --diff ../NEMU_evu/build/riscv64-nemu-interpreter-so \
   -C 100000000 -i software/evu/build/rmsnorm_nvfp4_evu_test-riscv64-xs.bin
@@ -159,9 +196,10 @@ mill -i evuCheck.test.testOnly evu.EvuInterleavedReductionSpec -- -z "short FP32
 The lightweight `test_rmsnorm_batch_schedule` uses only C preprocessing and a
 Python instruction model, not a compiled guest or RTL simulation. It executes
 the actual batch macros against an independent scalar quantization oracle,
-checks resident-y preservation and requires exactly 24 VL=16 divides and 10
-aligned stores totaling 1152 bytes. It complements, but does not replace, server
-NEMU/RTL validation.
+checks live input preservation, safe reuse of v0/v1 and cross-batch issue
+ordering. It requires one VL=16/e32 configuration, exactly 24 VL=16 divides
+and 18 aligned stores totaling 1152 bytes. It complements, but does not
+replace, server NEMU/RTL validation.
 
 See `EVU_LOW_PRECISION.md` for source sync, RTL/reference checks and build.
 After building the new emulator, the following server script runs instruction

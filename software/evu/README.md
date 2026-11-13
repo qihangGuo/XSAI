@@ -129,8 +129,10 @@ Complete RMSNorm is measured with VRF-resident input/output; full
 RMSNorm/NVFP4 includes input loads, block amax, EVU quantization and final
 output stores, with no intermediate-y stores.
 The default RTL has 16 FP32 divide/sqrt lanes. Quantization batches 16 block
-scales, uses continuous slides and paired block workspaces, and aggregates
-outputs into aligned 128-byte FP4 / 64-byte scale stores. The one-lane control
+scales, keeps VL=16/e32 throughout, and overlaps next-batch amax, current-batch
+scale computation and previous-batch FP4 packing. Consumed input registers
+provide a second scale/mask context. Outputs use aligned 64-byte FP4/scale
+stores; format 8 identifies the fixed-VL quantization schedule. The one-lane control
 configuration is `DefaultExternalVectorScalarDivMatrixConfig`.
 CPU arithmetic is used only outside timing for setup/checking. There are
 11 cases, each measured once without warmup by default, and no
@@ -142,3 +144,5 @@ See [`RMSNORM_NVFP4_BENCHMARK.md`](docs/RMSNORM_NVFP4_BENCHMARK.md) for numerica
 conventions, build/run commands, BF16-valued FP32 input mode and CSV summaries.
 The instruction extension and server validation sequence are documented in
 [`EVU_RVV_MATH.md`](docs/EVU_RVV_MATH.md).
+The default FP32 min/max reduction tree and parameterized aligned-slide bypass
+are documented in [`EVU_REDUCTION_SLIDE_FASTPATHS.md`](docs/EVU_REDUCTION_SLIDE_FASTPATHS.md).

@@ -87,7 +87,9 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     reductionContexts = p.reductionContexts,
     fmaOrdinaryContexts = p.fmaOrdinaryContexts,
     parallelFp32Div = p.parallelFp32Div,
-    interleaveReductions = p.interleaveReductions
+    interleaveReductions = p.interleaveReductions,
+    fp32MinMaxTree = p.fp32MinMaxTree,
+    alignedSlide = p.alignedSlide
   )
   private implicit val saturnP: Parameters = EvuVectorParameters(
     xsParameters,

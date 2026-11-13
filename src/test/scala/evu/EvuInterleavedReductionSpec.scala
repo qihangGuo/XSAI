@@ -21,7 +21,8 @@ import xiangshan.evu.exu._
 /** Exercise production sequencers/FMA without elaborating unrelated backend FUs.
   * Source responses are a test fixture, not a replacement VRF implementation.
   */
-class EvuSharedReductionHarness(maximum: Boolean = false)(implicit p: Parameters) extends CoreModule with HasVectorParams {
+class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean = false)(implicit p: Parameters)
+    extends CoreModule with HasVectorParams {
   val io = IO(new Bundle {
     val command = Vec(2, Flipped(Decoupled(new BackendIssueInst)))
     val sourceReady = Input(Vec(2, Bool()))
@@ -30,6 +31,10 @@ class EvuSharedReductionHarness(maximum: Boolean = false)(implicit p: Parameters
     val switched = Output(UInt(32.W))
     val flags = Output(UInt(5.W))
     val merges = Output(Vec(2, UInt(32.W)))
+    val folds = Output(Vec(2, UInt(32.W)))
+    val source = Input(Vec(2, UInt(dLen.W)))
+    val seed = Input(Vec(2, UInt(32.W)))
+    val mask = Input(Vec(2, UInt(dLen.W)))
   })
   val factory: FunctionalUnitFactory = if (maximum) FPCmpFactory else SIMDFPFMAFactory(4, true)
   val insns = VXSequencerParams("fp_fma", Seq(factory)).insns
@@ -52,9 +57,14 @@ class EvuSharedReductionHarness(maximum: Boolean = false)(implicit p: Parameters
   io.flags := flags
   val merges = RegInit(VecInit.fill(2)(0.U(32.W)))
   io.merges := merges
+  val folds = RegInit(VecInit.fill(2)(0.U(32.W)))
+  io.folds := folds
   for (context <- 0 until 2) {
     when(fu.io.iss.fire && fu.io.iss.bits.acc_merge && fu.io.iss.bits.vat === (context + 1).U) {
       merges(context) := merges(context) + 1.U
+    }
+    when(fu.io.iss.fire && fu.io.iss.bits.acc_fold && fu.io.iss.bits.vat === (context + 1).U) {
+      folds(context) := folds(context) + 1.U
     }
   }
   val previousVat = RegEnable(fu.io.iss.bits.vat, fu.io.iss.fire)
@@ -82,13 +92,15 @@ class EvuSharedReductionHarness(maximum: Boolean = false)(implicit p: Parameters
     seq.io.vgu.slide_data := 0.U
     seq.io.vgu.gather_eidx.valid := false.B
     seq.io.vgu.gather_eidx.bits := 0.U
-    for (read <- Seq(seq.io.rvs1, seq.io.rvs2, seq.io.rvd, seq.io.rvm)) {
+    for ((read, port) <- Seq(seq.io.rvs1, seq.io.rvs2, seq.io.rvd, seq.io.rvm).zipWithIndex) {
       read.req.ready := io.sourceReady(i)
-      read.resp := Fill(dLen / 32, (if (i == 0) 0x3f800000L else 0x40000000L).U(32.W))
+      read.resp := (if (operandInputs) {
+        if (port == 3) io.mask(i) else io.source(i)
+      } else Fill(dLen / 32, (if (i == 0) 0x3f800000L else 0x40000000L).U(32.W)))
     }
     acc.io.rvs2.ready := io.sourceReady(i)
     acc.io.rvm.ready := io.sourceReady(i)
-    acc.io.acc_init_resp := 0.U
+    acc.io.acc_init_resp := (if (operandInputs) io.seed(i) else 0.U)
     acc.io.rvm_resp := 0.U
     acc.io.iss.ready := false.B
     acc.io.acc_slot := seq.io.acc_slot
@@ -112,7 +124,9 @@ class EvuSharedReductionHarness(maximum: Boolean = false)(implicit p: Parameters
     candidate.bits.rvs1_elem := acc.io.acc_data.bits
     candidate.bits.rvs2_data := seq.io.rvs2_data
     candidate.bits.rvs2_elem := seq.io.rvs2_data
-    candidate.bits.wmask := seq.io.iss.bits.eidx_mask
+    val vm = if (operandInputs) FillInterleaved(4,
+      (io.mask(i) >> seq.io.iss.bits.eidx)(dLen / 32 - 1, 0)) else Fill(dLenB, 1.U(1.W))
+    candidate.bits.wmask := seq.io.iss.bits.eidx_mask & Mux(seq.io.iss.bits.vm, Fill(dLenB, 1.U(1.W)), vm)
     candidate.bits.rmask := Fill(dLenB, 1.U(1.W))
     candidate.bits.rvs1_eew := seq.io.iss.bits.vd_eew
     when(seq.io.iss.bits.acc_merge) {
@@ -125,7 +139,7 @@ class EvuSharedReductionHarness(maximum: Boolean = false)(implicit p: Parameters
         acc.io.acc_data.bits((dLen >> j) - 1, dLen >> (j + 1)))(seq.io.iss.bits.acc_fold_id)
       val mask = VecInit.tabulate(log2Ceil(dLenB))(j =>
         ((BigInt(1) << (dLenB >> (j + 1))) - 1).U(dLenB.W))(seq.io.iss.bits.acc_fold_id)
-      candidate.bits.wmask := mask
+      candidate.bits.wmask := Mux(seq.io.iss.bits.acc_tree || seq.io.iss.bits.acc_empty, 15.U, mask)
       candidate.bits.rvs1_data := folded
       candidate.bits.rvs1_elem := folded
       candidate.bits.rvs2_data := acc.io.acc_data.bits
@@ -139,7 +153,8 @@ class EvuSharedReductionHarness(maximum: Boolean = false)(implicit p: Parameters
   }
 }
 
-class EvuSharedReductionShell(val maximum: Boolean = false)(implicit p: Parameters) extends LazyModule {
+class EvuSharedReductionShell(val maximum: Boolean = false, val operandInputs: Boolean = false)(implicit p: Parameters)
+    extends LazyModule {
   val client = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1("shared-fma-test")))))
   val sink = TLManagerNode(Seq(TLSlavePortParameters.v1(Seq(TLSlaveParameters.v1(
     address = Seq(AddressSet(0, 0xffffffffL)), supportsGet = TransferSizes(1, 64))), beatBytes = 64)))
@@ -149,7 +164,9 @@ class EvuSharedReductionShell(val maximum: Boolean = false)(implicit p: Paramete
 
 class EvuSharedReductionShellImp(outer: EvuSharedReductionShell)(implicit p: Parameters)
     extends LazyModuleImp(outer) {
-  val harness = Module(new EvuSharedReductionHarness(outer.maximum)(p.alterPartial { case TileVisibilityNodeKey => outer.client }))
+  val harness = Module(new EvuSharedReductionHarness(outer.maximum, outer.operandInputs)(p.alterPartial {
+    case TileVisibilityNodeKey => outer.client
+  }))
   val io = IO(chiselTypeOf(harness.io))
   io <> harness.io
 }
@@ -271,9 +288,10 @@ class EvuInterleavedReductionSpec extends AnyFlatSpec with ChiselScalatestTester
   }
 
   it should "reduce short FP32 sums and maxima without merging unused accumulator slots" in {
-    implicit val parameters: Parameters = EvuVectorParameters(base, 4096, 512, 512,
-      VectorParams.lgvParams.copy(reductionContexts = 2, interleaveReductions = true))
-    for (maximum <- Seq(false, true)) {
+    for (maximum <- Seq(false, true); tree <- Seq(false, true)) {
+      implicit val parameters: Parameters = EvuVectorParameters(base, 4096, 512, 512,
+        VectorParams.lgvParams.copy(reductionContexts = 2, interleaveReductions = true,
+          fp32MinMaxTree = tree))
       test(LazyModule(new EvuSharedReductionShell(maximum)).module)
         .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
           def clear(data: Data): Unit = data match {
@@ -307,12 +325,17 @@ class EvuInterleavedReductionSpec extends AnyFlatSpec with ChiselScalatestTester
             }
             dut.clock.step()
             dut.io.command.foreach(_.valid.poke(false.B))
-            dut.clock.step(160)
+            for (cycle <- 0 until 200) {
+              dut.io.sourceReady(0).poke((cycle % 7 != 0).B)
+              dut.io.sourceReady(1).poke((cycle % 5 != 0).B)
+              dut.clock.step()
+            }
             dut.io.completed.foreach(_.expect(true.B))
             for (context <- 0 until 2) {
               val expected = ((if (maximum) 1 else length) * (context + 1)).toFloat
               dut.io.result(context).expect((java.lang.Float.floatToRawIntBits(expected).toLong & 0xffffffffL).U)
               dut.io.merges(context).expect((math.min(4, (length + 15) / 16) - 1).U)
+              dut.io.folds(context).expect((if (maximum && tree) 1 else 4).U)
             }
             dut.io.flags.expect(0.U)
           }

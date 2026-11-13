@@ -29,6 +29,23 @@ def complete_log(samples=3, compact=False, cases=11, single=False):
 
 
 class RmsnormSummaryTest(unittest.TestCase):
+    def test_overlapped_e32_output(self):
+        metadata = 'format=8 quant_batch=16 quant_vl=16 quant_sew=32 quant_schedule=overlap'
+        for cases in (8, 11):
+            with self.subTest(cases=cases):
+                previous = complete_log(samples=1, cases=cases, single=True)
+                current = previous.replace('format=6', metadata)
+                self.assertEqual(summarize(current), summarize(previous))
+                repeated = complete_log(cases=cases, compact=True).replace('format=5', metadata)
+                repeated = repeated.replace('warmup=1', 'warmup=0')
+                self.assertEqual(summarize(repeated), summarize(complete_log(cases=cases, compact=True)))
+                for field, invalid in (('quant_vl=16', 'quant_vl=128'),
+                                       ('quant_sew=32', 'quant_sew=8'),
+                                       ('quant_schedule=overlap', 'quant_schedule=serial'),
+                                       ('quant_batch=16', ''), ('warmup=0', 'warmup=1')):
+                    with self.subTest(field=field), self.assertRaises(ValueError):
+                        summarize(current.replace(field, invalid))
+
     def test_batched_output(self):
         for cases in (8, 11):
             previous = complete_log(samples=1, cases=cases, single=True)

@@ -32,7 +32,8 @@ class SpecialSequencer(exu_insns: Seq[VectorInstruction], context: Int = 0, cont
     val needs_mask = inst.vmu && (!inst.vm && inst.mop =/= mopUnit)
     val needs_index = inst.vmu && inst.mop(0)
     val ctrl = new VectorDecoder(inst, exu_insns, Seq(UsesGatherUnit, Reduction))
-    val gather = !inst.vmu && ctrl.bool(UsesGatherUnit)
+    val gather = !inst.vmu && ctrl.bool(UsesGatherUnit) &&
+      !VectorFastPaths.alignedSlide(inst, dLen, vParams.alignedSlide)
     val reduction = !inst.vmu && ctrl.bool(Reduction)
     ((needs_mask || needs_index || gather) && (context == 0).B) ||
       (reduction && (dynamicContext.B || (inst.vat % contexts.U) === context.U))
@@ -122,7 +123,9 @@ class SpecialSequencer(exu_insns: Seq[VectorInstruction], context: Int = 0, cont
     )).asTypeOf(Vec(dLenB, UInt(8.W)))
     for (i <- 0 until 4) {
       acc_busy(i) := false.B
-      acc_regs(i) := dis_acc_init
+      acc_regs(i) := Mux(dis_inst.isOpf && dis_vd_eew === 2.U &&
+        (acc_init_fp_pos || acc_init_fp_neg), Fill(dLen / 32, "h7fc00000".U(32.W)),
+        dis_acc_init.asUInt).asTypeOf(acc_regs(i))
     }
 
     acc_init_sel(0) := dis_ctrl.bool(AccInitZeros)

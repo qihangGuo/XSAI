@@ -21,7 +21,9 @@ case object FPCmpFactory extends FunctionalUnitFactory {
   def generate(implicit p: Parameters) = new FPCompPipe()(p)
 }
 
-class FPCompPipe(implicit p: Parameters) extends PipelinedFunctionalUnit(2)(p) with HasFPUParameters {
+class FPCompPipe(implicit p: Parameters)
+    extends PipelinedFunctionalUnit(if (p(VectorParamsKey).fp32MinMaxTree)
+      VectorFastPaths.minMaxTreeDepth(p(VectorParamsKey).dLen) else 2)(p) with HasFPUParameters {
   val supported_insns = FPCmpFactory.insns
 
   io.stall := false.B
@@ -74,7 +76,11 @@ class FPCompPipe(implicit p: Parameters) extends PipelinedFunctionalUnit(2)(p) w
       } .otherwise {
         minmax_out := Mux((!ctrl.bool(FPCompMin) && comp.gt) || (ctrl.bool(FPCompMin) && comp.lt), rvs2, rvs1)
       }
-      minmax_out
+      if (eew == 2) {
+        val bothZero = !rvs2(30, 0).orR && !rvs1(30, 0).orR
+        val zeroSign = Mux(ctrl.bool(FPCompMin), rvs2(31) || rvs1(31), rvs2(31) && rvs1(31))
+        Mux(io.pipe(0).bits.acc && bothZero, Cat(zeroSign, 0.U(31.W)), minmax_out)
+      } else minmax_out
     }
     minmax_results(eew - 1) := minmax.asUInt
 
@@ -95,7 +101,14 @@ class FPCompPipe(implicit p: Parameters) extends PipelinedFunctionalUnit(2)(p) w
     }
     comp_results_eew(eew) := comparisons.asUInt
 
-    exceptions(eew - 1) := gen_compares.map {case(comp, rvs2, rvs2_nan, rvs1, rvs1_nan) => comp.exceptionFlags}.reduce(_ | _)
+    exceptions(eew - 1) := gen_compares.zipWithIndex.map {
+      case ((comp, rvs2, rvs2_nan, rvs1, rvs1_nan), lane) =>
+        val flags = if (eew == 2) {
+          val invalid = (rvs2_nan && !rvs2(22)) || (rvs1_nan && !rvs1(22))
+          Mux(io.pipe(0).bits.acc, Cat(invalid, 0.U(4.W)), comp.exceptionFlags)
+        } else comp.exceptionFlags
+        Mux(io.pipe(0).bits.wmask(lane << eew), flags, 0.U(5.W))
+    }.reduce(_ | _)
   }
 
 
@@ -134,7 +147,7 @@ class FPCompPipe(implicit p: Parameters) extends PipelinedFunctionalUnit(2)(p) w
   val s1_sign_injection = RegEnable(ctrl.bool(FPSgnj), io.pipe(0).valid)
 
 
-  io.write.valid := io.pipe(1).valid
+  io.write.valid := io.pipe(1).valid && !io.pipe(1).bits.acc_tree
   io.write.bits.eg := io.pipe(1).bits.wvd_eg
   io.write.bits.mask := Mux(s1_writes_as_mask, mask_write_mask, FillInterleaved(8, io.pipe(1).bits.wmask))
   io.write.bits.data := RegEnable(out, io.pipe(0).valid)
@@ -142,6 +155,27 @@ class FPCompPipe(implicit p: Parameters) extends PipelinedFunctionalUnit(2)(p) w
   io.set_fflags.valid := io.write.valid
   io.set_fflags.bits := Mux(s1_sign_injection, 0.U,
     Mux(io.pipe(1).bits.rvd_eew === 2.U, s1_exceptions(1), s1_exceptions(0)))
+  when(io.pipe(1).valid && io.pipe(1).bits.acc_empty && !io.pipe(1).bits.acc_tree) {
+    io.write.bits.data := io.pipe(1).bits.rvs2_data(31, 0)
+    io.write.bits.mask := 0xffffffffL.U(dLen.W)
+    io.set_fflags.bits := 0.U
+  }
   io.scalar_write.valid := false.B
   io.scalar_write.bits := DontCare
+
+  if (vParams.fp32MinMaxTree) {
+    val tree = Module(new FPMinMaxTree(dLen))
+    tree.io.valid := io.iss.valid && io.iss.op.acc_tree
+    tree.io.source := io.iss.op.rvs2_data
+    tree.io.minimum := io.iss.op.opff6 === OPFFunct6.fredmin
+    val treeOutput = io.pipe(depth - 1)
+    when(treeOutput.valid && treeOutput.bits.acc_tree) {
+      io.write.valid := true.B
+      io.write.bits.eg := treeOutput.bits.wvd_eg
+      io.write.bits.mask := 0xffffffffL.U(dLen.W)
+      io.write.bits.data := Mux(treeOutput.bits.acc_empty, treeOutput.bits.rvs2_data(31, 0), tree.io.result)
+      io.set_fflags.valid := true.B
+      io.set_fflags.bits := Mux(treeOutput.bits.acc_empty, 0.U, tree.io.flags)
+    }
+  }
 }

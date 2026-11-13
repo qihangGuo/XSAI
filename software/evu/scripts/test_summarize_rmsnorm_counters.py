@@ -23,6 +23,14 @@ def counter_log(cases=11):
 
 
 class RmsnormCountersTest(unittest.TestCase):
+    def test_overlapped_run_keeps_the_same_logical_output_size(self):
+        text = counter_log().replace('format=6',
+                                     'format=8 quant_batch=16 quant_vl=16 quant_sew=32 quant_schedule=overlap')
+        rows = summarize_counters(text)
+        self.assertEqual(len(rows), 11)
+        self.assertTrue(all(row['logical_store_bytes'] == 1152 for row in rows
+                            if row['stage'] in ('quant_evu', 'fused_nvfp4')))
+
     def test_batched_run_keeps_the_same_logical_output_size(self):
         text = counter_log().replace("format=6", "format=7 quant_batch=16")
         rows = summarize_counters(text)

@@ -216,12 +216,74 @@ class RmsnormBatchScheduleTest(unittest.TestCase):
                 expected_packed, expected_scales = scalar_quantize(values, alpha)
                 self.assertEqual(machine.output['packed'], expected_packed)
                 self.assertEqual(machine.output['scales'], expected_scales)
-                self.assertEqual(machine.registers[:16], resident)
+                self.assertEqual(machine.registers[2:16], resident[2:])
                 self.assertEqual(machine.divisions, [16] * 24)
-                self.assertEqual(len(machine.stores), 10)
+                self.assertEqual(len(machine.stores), 18)
+                self.assertTrue(all(length == 64 for _, _, length in machine.stores))
                 self.assertEqual(sum(length for _, _, length in machine.stores), 1152)
                 self.assertEqual(len(machine.written['packed']), 1024)
                 self.assertEqual(len(machine.written['scales']), 128)
+
+    def test_quantization_uses_one_fixed_configuration(self):
+        configurations = [tuple(map(integer, arguments)) for operation, *arguments in self.trace
+                          if operation == 'xv_setvli']
+        self.assertEqual(configurations, [(16, 0x10)])
+        for operation, *arguments in self.trace:
+            if operation in ('XV_STORE', 'XV_SLIDEDOWN', 'XV_SLIDEUP'):
+                self.assertEqual(integer(arguments[-1]), 2)
+        self.assertEqual(len(self.trace), 1536)
+
+    def test_zero_and_varied_blocks_ignore_old_conversion_tail_bytes(self):
+        patterns = [[-0.0] * 2048,
+                    [fp32((element % 16 - 7.5) * 2 ** ((element // 16) % 48 - 24))
+                     for element in range(2048)]]
+        for pattern_index, values in enumerate(patterns):
+            expected = scalar_quantize(values, fp32(1 / 448))
+            for seed in (7, 512, 4096):
+                with self.subTest(pattern=pattern_index, seed=seed):
+                    machine = BatchMachine(values, fp32(1 / 448))
+                    generator = random.Random(seed)
+                    for register in machine.registers[16:]:
+                        register[:] = bytes(generator.getrandbits(8) for _ in register)
+                    for instruction in self.trace:
+                        machine.execute(*instruction)
+                    self.assertEqual(machine.output['packed'], expected[0])
+                    self.assertEqual(machine.output['scales'], expected[1])
+
+    def test_scale_divides_overlap_next_maxima_and_previous_packing(self):
+        divisions = [(index, tuple(map(integer, arguments)))
+                     for index, (operation, *arguments) in enumerate(self.trace)
+                     if operation == 'XV_FDIV']
+        self.assertEqual(len(divisions), 24)
+        for batch in range(8):
+            begin, alpha, reciprocal = divisions[3 * batch:3 * batch + 3]
+            self.assertEqual([entry[1][1] for entry in (begin, alpha, reciprocal)],
+                             [23, 25, begin[1][0]])
+            self.assertEqual(reciprocal[1][2], 26)
+            if batch < 7:
+                next_maximum = next(index for index, (operation, *arguments) in enumerate(self.trace)
+                                    if operation == 'XV_SLIDEDOWN' and
+                                    tuple(map(integer, arguments)) == (16, 0, 2 * (batch + 1), 2))
+                self.assertLess(begin[0], next_maximum)
+                self.assertLess(next_maximum, alpha[0])
+            if batch >= 2:
+                for start, end in ((begin[0], alpha[0]), (alpha[0], reciprocal[0])):
+                    self.assertTrue(any(operation == 'XV_CVT_MXFP4_F32'
+                                        for operation, *_ in self.trace[start + 1:end]))
+
+    def test_consumed_first_batch_registers_are_reused_only_after_store(self):
+        first_batch_stored = next(index for index, (operation, *arguments) in enumerate(self.trace)
+                                 if operation == 'XV_STORE' and
+                                 arguments[1] == '&packed.data[64 * (2 * (0) + (1))]')
+        reused = []
+        for index, (operation, *arguments) in enumerate(self.trace):
+            if operation in ('xv_setvli', 'XV_STORE'):
+                continue
+            destination = integer(arguments[1] if operation == 'XV_BINARY' else arguments[0])
+            if destination in (0, 1):
+                reused.append(index)
+        self.assertTrue(reused)
+        self.assertGreater(min(reused), first_batch_stored)
 
     def test_minimum_scale_reordering_preserves_e4m3_boundaries(self):
         boundaries = [0.0, floating(1)] + LEVELS8

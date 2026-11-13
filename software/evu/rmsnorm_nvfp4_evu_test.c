@@ -346,13 +346,18 @@ static unsigned check(enum Stage stage, unsigned wave) {
     errors += compare_floats(reciprocals, reference_reciprocals, ROWS);
   }
   if (stage >= QUANT_EVU) {
-    (void)xv_setvli(CHUNK, 0x10);
-    store_vectors(wave);
-    synchronize();
-    errors += compare_floats(normalized.data, reference_y, ELEMENTS);
-    rn_block_amax(normalized.data, reference_maxima, BLOCKS);
+    const float *quant_input = reference_y;
+    if (stage == FUSED_NVFP4) {
+      load_operands(wave);
+      rmsnorm(wave);
+      store_vectors(wave);
+      synchronize();
+      errors += compare_floats(normalized.data, reference_y, ELEMENTS);
+      quant_input = normalized.data;
+    }
+    rn_block_amax(quant_input, reference_maxima, BLOCKS);
     rn_block_scales(reference_maxima, alpha, reference_scales, reference_inverses, BLOCKS);
-    rn_pack_fp4(normalized.data, reference_inverses, reference_packed, BLOCKS);
+    rn_pack_fp4(quant_input, reference_inverses, reference_packed, BLOCKS);
     errors += memcmp(scales.data, reference_scales, sizeof(reference_scales)) != 0;
     errors += memcmp(packed.data, reference_packed, sizeof(reference_packed)) != 0;
   }
@@ -404,7 +409,7 @@ __attribute__((used, noinline)) static int rmsnorm_nvfp4_test_main(void) {
   const unsigned stage_count = EVU_RMS_ONLY ? QUANT_EVU : STAGES;
   unsigned cases = 0;
   for (enum Stage stage = EMPTY; (unsigned)stage < stage_count; ++stage) cases += schedule_count(stage);
-  printf("[RN] config rows=4 cols=512 samples=%u input=%s alpha_bits=%08x eps_bits=%08x warmup=0 cases=%u format=7 quant_batch=16 workload=%s quantization=%s\n",
+  printf("[RN] config rows=4 cols=512 samples=%u input=%s alpha_bits=%08x eps_bits=%08x warmup=0 cases=%u format=8 quant_batch=16 quant_vl=16 quant_sew=32 quant_schedule=overlap workload=%s quantization=%s\n",
     (unsigned)EVU_RMS_SAMPLES, EVU_RMS_BF16_INPUT ? "bf16_rounded_fp32" : "fp32",
     rn_float_bits(alpha), rn_float_bits(epsilon), cases,
     EVU_RMS_ONLY ? "rmsnorm_evu" : "rmsnorm_nvfp4_evu", EVU_RMS_ONLY ? "not_measured" : "evu");
