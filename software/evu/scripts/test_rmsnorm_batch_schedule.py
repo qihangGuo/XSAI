@@ -39,7 +39,7 @@ def integer(expression):
     return evaluate(ast.parse(expression, mode='eval').body)
 
 
-def instruction_trace():
+def instruction_trace(rename=1, banked=1):
     compiler = shutil.which('clang') or shutil.which('cc')
     if not compiler:
         raise unittest.SkipTest('a C preprocessor is required; no binary is built')
@@ -50,8 +50,14 @@ def instruction_trace():
     source = '\n'.join(f'#define {name}(...) TRACE({name}, __VA_ARGS__)' for name in names)
     source += '\n#include "rmsnorm_nvfp4_batch.h"\nRN_QUANT_INITIALIZE(); RN_QUANT_BATCHES();\n'
     include = Path(__file__).resolve().parents[1] / 'include'
-    text = subprocess.run([compiler, '-E', '-P', '-x', 'c', '-I' + str(include), '-'],
+    text = subprocess.run([compiler, '-E', '-P', '-x', 'c', '-I' + str(include),
+                           '-DEVU_RMS_QUANT_RENAME=' + str(rename),
+                           '-DEVU_RMS_QUANT_BANKED=' + str(banked), '-'],
                           input=source, text=True, capture_output=True, check=True).stdout
+    return parse_trace(text)
+
+
+def parse_trace(text):
     trace = []
     for match in re.finditer(r'\bTRACE\(', text):
         depth, end = 1, match.end()
@@ -60,6 +66,19 @@ def instruction_trace():
             end += 1
         trace.append(tuple(part.strip() for part in text[match.end():end - 1].split(',')))
     return trace
+
+
+def first_group_bank(register):
+    return (register ^ (register >> 2) ^ (register >> 4)) & 3
+
+
+def binary_sources(instruction):
+    operation, *arguments = instruction
+    if operation == 'XV_BINARY':
+        return tuple(map(integer, arguments[2:4]))
+    if operation in ('XV_FMUL', 'XV_FDIV', 'XV_FMAX', 'XV_FREDUCE_MAX', 'XV_CVT_MXFP4_F32'):
+        return tuple(map(integer, arguments[1:3]))
+    return ()
 
 
 LEVELS8 = [fraction / 512 if exponent == 0 else (1 + fraction / 8) * 2 ** (exponent - 7)
@@ -216,7 +235,7 @@ class RmsnormBatchScheduleTest(unittest.TestCase):
                 expected_packed, expected_scales = scalar_quantize(values, alpha)
                 self.assertEqual(machine.output['packed'], expected_packed)
                 self.assertEqual(machine.output['scales'], expected_scales)
-                self.assertEqual(machine.registers[2:16], resident[2:])
+                self.assertEqual(machine.registers[4:16], resident[4:])
                 self.assertEqual(machine.divisions, [16] * 24)
                 self.assertEqual(len(machine.stores), 18)
                 self.assertTrue(all(length == 64 for _, _, length in machine.stores))
@@ -251,6 +270,8 @@ class RmsnormBatchScheduleTest(unittest.TestCase):
                     self.assertEqual(machine.output['scales'], expected[1])
 
     def test_scale_divides_overlap_next_maxima_and_previous_packing(self):
+        six = next(integer(args[0]) for operation, *args in self.trace
+                   if operation == 'XV_LOAD_E0' and args[1] == '&quant_constants[0]')
         divisions = [(index, tuple(map(integer, arguments)))
                      for index, (operation, *arguments) in enumerate(self.trace)
                      if operation == 'XV_FDIV']
@@ -258,12 +279,13 @@ class RmsnormBatchScheduleTest(unittest.TestCase):
         for batch in range(8):
             begin, alpha, reciprocal = divisions[3 * batch:3 * batch + 3]
             self.assertEqual([entry[1][1] for entry in (begin, alpha, reciprocal)],
-                             [23, 25, begin[1][0]])
-            self.assertEqual(reciprocal[1][2], 26)
+                             [six, 25, begin[1][0]])
+            self.assertEqual(reciprocal[1][2], 29)
             if batch < 7:
                 next_maximum = next(index for index, (operation, *arguments) in enumerate(self.trace)
                                     if operation == 'XV_SLIDEDOWN' and
-                                    tuple(map(integer, arguments)) == (16, 0, 2 * (batch + 1), 2))
+                                    tuple(map(integer, arguments)) ==
+                                    (2 if batch >= 3 else 16, 0, 2 * (batch + 1), 2))
                 self.assertLess(begin[0], next_maximum)
                 self.assertLess(next_maximum, alpha[0])
             if batch >= 2:
@@ -284,6 +306,86 @@ class RmsnormBatchScheduleTest(unittest.TestCase):
                 reused.append(index)
         self.assertTrue(reused)
         self.assertGreater(min(reused), first_batch_stored)
+
+    def test_steady_maxima_reuse_only_consumed_inputs_and_not_packing_scratch(self):
+        last_read = {}
+        first_write = {}
+        for index, (operation, *arguments) in enumerate(self.trace):
+            if operation == 'XV_SLIDEDOWN':
+                last_read[integer(arguments[2])] = index
+            if operation not in ('xv_setvli', 'XV_STORE'):
+                destination = integer(arguments[1] if operation == 'XV_BINARY' else arguments[0])
+                first_write.setdefault(destination, index)
+        for register in (2, 3):
+            self.assertGreater(first_write[register], last_read[register])
+        maxima = [tuple(map(integer, arguments)) for operation, *arguments in self.trace
+                  if operation == 'XV_FREDUCE_MAX']
+        self.assertEqual(len(maxima), 128)
+        self.assertTrue(all(destination in (2, 3) and source == destination
+                            for destination, _, source, _ in maxima[-64:]))
+
+    def test_new_and_baseline_schedules_produce_identical_bytes(self):
+        values = [fp32((index % 47 - 23) * 2 ** (index % 19 - 9)) for index in range(2048)]
+        outputs = []
+        for banked in (0, 1):
+            for rename in (0, 1):
+                with self.subTest(banked=banked, rename=rename):
+                    trace = instruction_trace(rename, banked)
+                    machine = BatchMachine(values, fp32(1 / 448))
+                    resident = [bytes(register) for register in machine.registers[:16]]
+                    last_read = {}
+                    for index, instruction in enumerate(trace):
+                        if instruction[0] == 'XV_SLIDEDOWN':
+                            last_read[integer(instruction[3])] = index
+                    for index, instruction in enumerate(trace):
+                        machine.execute(*instruction)
+                        for register in range(16):
+                            if index < last_read[register]:
+                                self.assertEqual(machine.registers[register], resident[register])
+                    self.assertEqual(len(trace), 1536)
+                    self.assertEqual(machine.divisions, [16] * 24)
+                    self.assertEqual(len(machine.stores), 18)
+                    outputs.append(machine.output)
+        expected = scalar_quantize(values, fp32(1 / 448))
+        self.assertTrue(all(output == {'packed': expected[0], 'scales': expected[1]} for output in outputs))
+
+    def test_banked_sources_remove_same_bank_pairs_without_adding_instructions(self):
+        for rename in (0, 1):
+            baseline = instruction_trace(rename, 0)
+            optimized = instruction_trace(rename, 1)
+            baseline_conflicts = [instruction for instruction in baseline
+                                  if len(set(binary_sources(instruction))) == 2 and
+                                  len({first_group_bank(source) for source in binary_sources(instruction)}) == 1]
+            self.assertTrue(baseline_conflicts)
+            self.assertEqual(sum(instruction[0] == 'XV_CVT_MXFP4_F32'
+                                 for instruction in baseline_conflicts), 64)
+            for instruction in optimized:
+                sources = set(binary_sources(instruction))
+                self.assertEqual(len({first_group_bank(source) for source in sources}), len(sources), instruction)
+
+    def test_steady_pairs_issue_packing_before_dependent_maximum_reductions(self):
+        pairs = 0
+        for instruction_index, (operation, *arguments) in enumerate(self.trace):
+            if operation != 'XV_SLIDEDOWN' or integer(arguments[0]) != 2:
+                continue
+            pair = self.trace[instruction_index:instruction_index + 22]
+            pairs += 1
+            self.assertEqual(sum(op == 'XV_FREDUCE_MAX' for op, *_ in pair), 2)
+            self.assertEqual(sum(op == 'XV_CVT_MXFP4_F32' for op, *_ in pair), 2)
+            first_multiply = next(index for index, (op, *_) in enumerate(pair) if op == 'XV_FMUL')
+            first_reduce = next(index for index, (op, *_) in enumerate(pair) if op == 'XV_FREDUCE_MAX')
+            self.assertLess(first_multiply, first_reduce)
+        self.assertEqual(pairs, 32)
+
+    def test_reciprocal_and_minimum_sources_do_not_share_first_group_banks(self):
+        reciprocal_divisions = [tuple(map(integer, arguments)) for operation, *arguments in self.trace
+                                if operation == 'XV_FDIV'][2::3]
+        for _, denominator, numerator, _ in reciprocal_divisions:
+            self.assertNotEqual(first_group_bank(denominator), first_group_bank(numerator))
+        for operation, *arguments in self.trace:
+            if operation == 'XV_FMAX':
+                _, source1, source2, _ = map(integer, arguments)
+                self.assertNotEqual(first_group_bank(source1), first_group_bank(source2))
 
     def test_minimum_scale_reordering_preserves_e4m3_boundaries(self):
         boundaries = [0.0, floating(1)] + LEVELS8

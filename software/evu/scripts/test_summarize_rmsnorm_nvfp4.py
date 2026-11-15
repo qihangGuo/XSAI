@@ -29,6 +29,35 @@ def complete_log(samples=3, compact=False, cases=11, single=False):
 
 
 class RmsnormSummaryTest(unittest.TestCase):
+    def test_banked_quantization_output(self):
+        for cases in (8, 11):
+            previous = complete_log(samples=1, cases=cases, single=True)
+            for banked in (0, 1):
+                metadata = ('format=11 quant_batch=16 quant_vl=16 quant_sew=32 '
+                            f'quant_schedule=overlap lane_sum=1 quant_rename=1 quant_banked={banked}')
+                current = previous.replace('format=6', metadata)
+                self.assertEqual(summarize(current), summarize(previous))
+                for field, invalid in ((f'quant_banked={banked}', ''),
+                                       (f'quant_banked={banked}', 'quant_banked=2'),
+                                       ('quant_rename=1', ''), ('lane_sum=1', 'lane_sum=2')):
+                    with self.assertRaises(ValueError):
+                        summarize(current.replace(field, invalid))
+
+    def test_lane_sum_and_renamed_quantization_output(self):
+        for cases in (8, 11):
+            previous = complete_log(samples=1, cases=cases, single=True)
+            for lane_sum in (0, 1):
+                for rename in (0, 1):
+                    metadata = ('format=10 quant_batch=16 quant_vl=16 quant_sew=32 '
+                                f'quant_schedule=overlap lane_sum={lane_sum} quant_rename={rename}')
+                    current = previous.replace('format=6', metadata)
+                    self.assertEqual(summarize(current), summarize(previous))
+                    for field in (f'lane_sum={lane_sum}', f'quant_rename={rename}'):
+                        with self.assertRaises(ValueError):
+                            summarize(current.replace(field, ''))
+                        with self.assertRaises(ValueError):
+                            summarize(current.replace(field, field.split('=')[0] + '=2'))
+
     def test_overlapped_e32_output(self):
         metadata = 'format=8 quant_batch=16 quant_vl=16 quant_sew=32 quant_schedule=overlap'
         for cases in (8, 11):

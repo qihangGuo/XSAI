@@ -35,7 +35,7 @@ class ExecuteSequencerIO(maxDepth: Int, nFUs: Int, forwarding: Boolean = false)(
   val operandsReady = Output(Bool())
   val earlyOperandReads = Output(UInt(3.W))
   val reductionPrefetch = Output(Bool())
-  val lookahead = Input(Valid(new VectorReadReq))
+  val lookahead = Input(Vec(3, Valid(new VectorReadReq)))
   val atTail = Output(Bool())
   val rawDependencies = Output(UInt(egsTotal.W))
   val forward = Option.when(forwarding)(Vec(3, new VectorForwardOperand))
@@ -93,6 +93,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   val vd_eew    = Reg(UInt(2.W))
   val slide     = Reg(Bool())
   val aligned_slide = RegInit(false.B)
+  val group_slide = RegInit(false.B)
   val slide_up  = Reg(Bool())
   val slide1    = Reg(Bool())
   val slide_offset = Reg(UInt((1+log2Ceil(maxVLMax)).W))
@@ -182,6 +183,9 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     val dis_uscalar      = Mux(dis_inst.funct3(2), dis_inst.rs1_data, dis_inst.imm5)
     val dis_slide_offset = Mux(!dis_slide1, get_max_offset(dis_uscalar, dis_sew), 1.U)
     val dis_aligned_slide = usesPerm.B && VectorFastPaths.alignedSlide(dis_inst, dLen, vParams.alignedSlide)
+    val dis_group_slide = usesPerm.B && !dis_aligned_slide &&
+      VectorFastPaths.singleGroupSlide(dis_inst, dLen, vParams.singleGroupSlide)
+    val dis_direct_slide = dis_aligned_slide || dis_group_slide
     val dis_tail         = dis_next_eidx === dis_vl
     val dis_rgatherei16  = dis_inst.funct3 === OPIVV && dis_inst.opif6 === OPIFunct6.rgatherei16 && usesPerm.B
     val dis_rgather_eew  = Mux(dis_inst.opif6 === OPIFunct6.rgatherei16, 1.U, dis_sew)
@@ -218,11 +222,11 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     assert(dis_inst.vstart === 0.U || dis_exp2)
     valid         := true.B
     inst          := io.dis.bits
-    inst.renv2    := dis_inst.renv2 || dis_aligned_slide
+    inst.renv2    := dis_inst.renv2 || dis_direct_slide
     eidx          := dis_start
     wvd_mask      := Mux(dis_inst.wvd               , FillInterleaved(egsPerVReg, dis_vd_arch_mask), 0.U)
     rvs1_mask     := Mux(dis_inst.renv1             , FillInterleaved(egsPerVReg, dis_vs1_arch_mask), 0.U)
-    rvs2_mask     := Mux(dis_inst.renv2 || dis_aligned_slide, FillInterleaved(egsPerVReg, dis_vs2_arch_mask), 0.U)
+    rvs2_mask     := Mux(dis_inst.renv2 || dis_direct_slide, FillInterleaved(egsPerVReg, dis_vs2_arch_mask), 0.U)
     rvd_mask      := Mux(dis_inst.renvd && usesRvd.B, FillInterleaved(egsPerVReg, dis_vd_arch_mask), 0.U)
     rvm_mask      := Mux(dis_inst.renvm             , ~(0.U(egsPerVReg.W)), 0.U)
     head          := true.B
@@ -235,7 +239,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     acc_merge     := false.B
     acc_merge_id  := 1.U
     sets_wmask    := dis_ctrl.bool(SetsWMask)
-    uses_perm     := dis_ctrl.bool(UsesGatherUnit) && usesPerm.B
+    uses_perm     := dis_ctrl.bool(UsesGatherUnit) && usesPerm.B && !dis_group_slide
     elementwise   := dis_ctrl.bool(Elementwise)
     zext_imm5     := dis_ctrl.bool(ZextImm5)
     pipelined     := dis_ctrl.bool(PipelinedExecution)
@@ -243,6 +247,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     fu_sel        := dis_ctrl.uint(FUSel(nFUs))
     slide         := dis_slide
     aligned_slide := dis_aligned_slide
+    group_slide   := dis_group_slide
     rgatherei16   := dis_rgatherei16
     mvnrr         := dis_mvnrr
     vs1_eew       := dis_vs1_eew
@@ -387,9 +392,9 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     io.prefetch(i).bits.lastOperand := false.B
   }
   io.reductionPrefetch := reductionStream && io.prefetch(1).valid
-  // At the current tail, the ordinary next-EG hint is unused. Reuse that
-  // collector slot for an independently checked queue-head EXP2 source.
-  when(io.atTail && io.lookahead.valid) { io.prefetch(1) := io.lookahead }
+  for (port <- 0 until 3) {
+    when(io.atTail && io.lookahead(port).valid) { io.prefetch(port) := io.lookahead(port) }
+  }
 
   // Legacy VRF ready acknowledges the returning SRAM data. Forward it in
   // that cycle; retain it only while the current micro-op is stalled.
@@ -415,7 +420,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
 
   val destIndex = Mux(lowPrecision && EvuLowPrecision.packed(inst.funct6), eidx >> 1, eidx)
   val wvd_eg = getEgId(inst.rd, Mux(inst.reduction, 0.U, destIndex), vd_eew, inst.writes_mask)
-  val read_slide_buffer = slide && !aligned_slide && Mux(slide_up,
+  val read_slide_buffer = slide && !aligned_slide && !group_slide && Mux(slide_up,
     next_eidx > slide_offset,
     eidx +& slide_offset < inst.vconfig.vtype.vlMax)
   val read_eidx_buffer = rgather_v || rgatherei16
@@ -516,7 +521,10 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     ~(0.U(dLenB.W)))
   val slide_down_bit_mask = FillInterleaved(8, slide_down_byte_mask)
   io.iss.bits.use_slide_rvs2 := slide && !aligned_slide
-  io.iss.bits.slide_data := io.vgu.slide_data & slide_down_bit_mask
+  val shifted_group = if (usesPerm) {
+    VectorFastPaths.shiftGroup(io.rvs2_data, slide_offset, vs2_eew, slide_up, dLen)
+  } else { 0.U(dLen.W) }
+  io.iss.bits.slide_data := Mux(group_slide, shifted_group, io.vgu.slide_data & slide_down_bit_mask)
 
   io.iss.bits.use_scalar_rvs1 := inst.funct3.isOneOf(OPIVI, OPIVX, OPMVX, OPFVF) || rgather_v || rgatherei16
   io.iss.bits.scalar := Mux(rgather_v || rgatherei16,

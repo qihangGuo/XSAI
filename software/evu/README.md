@@ -132,12 +132,20 @@ The default RTL has 16 FP32 divide/sqrt lanes. Quantization batches 16 block
 scales, keeps VL=16/e32 throughout, and overlaps next-batch amax, current-batch
 scale computation and previous-batch FP4 packing. Consumed input registers
 provide a second scale/mask context. Outputs use aligned 64-byte FP4/scale
-stores; format 8 identifies the fixed-VL quantization schedule. The one-lane control
+stores. Format 10 adds one final sum reduction per row and separates steady-state
+amax scratch from packing scratch. Format 11 adds bank-aware register placement
+and finer amax/packing interleaving. `EVU_RMS_QUANT_BANKED=0` restores the
+format-10 quantization schedule; setting `EVU_RMS_LANE_SUM=0`,
+`EVU_RMS_QUANT_RENAME=0` and `EVU_RMS_QUANT_BANKED=0` restores the format-8
+arithmetic schedule for same-RTL comparisons. The one-lane control
 configuration is `DefaultExternalVectorScalarDivMatrixConfig`.
 CPU arithmetic is used only outside timing for setup/checking. There are
 11 cases, each measured once without warmup by default, and no
 CPU-performance or rsqrt7/Newton cases. Native BF16 is not
 measured. `EVU_RMS_ONLY=1` selects the eight-case RMSNorm-only regression image.
+Run `bash software/evu/scripts/compare_rmsnorm_software.sh ../NEMU_evu` on the
+server to build and compare both bank-aware software variants on the same EMU,
+including checked per-interval cycle and counter CSVs in `out/rmsnorm-software`.
 Six new instructions, independent XX8/MXFP issue paths and server acceptance
 are documented in [`EVU_LOW_PRECISION.md`](docs/EVU_LOW_PRECISION.md).
 See [`RMSNORM_NVFP4_BENCHMARK.md`](docs/RMSNORM_NVFP4_BENCHMARK.md) for numerical

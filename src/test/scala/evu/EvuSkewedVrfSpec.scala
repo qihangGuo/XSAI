@@ -104,6 +104,7 @@ class EvuSkewedVrfSpec extends AnyFlatSpec with ChiselScalatestTester with Match
   it should "pipeline successor reads on response consumption and buffer them across execution stalls" in {
     implicit val p: Parameters = parameters(4096)
     test(new RegisterReadCollector).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      dut.io.bypass.poke(false.B)
       dut.io.client.req.bits.oldest.poke(false.B)
       dut.io.client.req.bits.lastOperand.poke(false.B)
       dut.io.client.req.bits.eg.poke(16.U)

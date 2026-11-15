@@ -33,7 +33,8 @@ class SpecialSequencer(exu_insns: Seq[VectorInstruction], context: Int = 0, cont
     val needs_index = inst.vmu && inst.mop(0)
     val ctrl = new VectorDecoder(inst, exu_insns, Seq(UsesGatherUnit, Reduction))
     val gather = !inst.vmu && ctrl.bool(UsesGatherUnit) &&
-      !VectorFastPaths.alignedSlide(inst, dLen, vParams.alignedSlide)
+      !VectorFastPaths.alignedSlide(inst, dLen, vParams.alignedSlide) &&
+      !VectorFastPaths.singleGroupSlide(inst, dLen, vParams.singleGroupSlide)
     val reduction = !inst.vmu && ctrl.bool(Reduction)
     ((needs_mask || needs_index || gather) && (context == 0).B) ||
       (reduction && (dynamicContext.B || (inst.vat % contexts.U) === context.U))

@@ -35,7 +35,10 @@ case class EvuParams(
     decoupledAmuIssue: Boolean = true,
     interleaveReductions: Boolean = true,
     fp32MinMaxTree: Boolean = true,
-    alignedSlide: Boolean = true
+    alignedSlide: Boolean = true,
+    singleGroupSlide: Boolean = true,
+    crossInstructionPrefetch: Boolean = true,
+    extendedResultForwarding: Boolean = true
 ) {
   require(vlenBits > 0 && vlenBits   % 8 == 0)
   require(dlenBits > 0 && dlenBits   % 8 == 0 && vlenBits > dlenBits && vlenBits % dlenBits == 0)

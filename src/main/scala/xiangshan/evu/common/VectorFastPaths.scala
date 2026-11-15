@@ -20,4 +20,23 @@ object VectorFastPaths extends HasVectorConsts {
   }
 
   def minMaxTreeDepth(datapath: Int): Int = math.max(2, log2Ceil(datapath / 32))
+
+  def singleGroupSlide(inst: VectorIssueInst, datapath: Int, enabled: Boolean): Bool = {
+    val offset = Mux(inst.funct3 === OPIVX, inst.rs1_data, inst.imm5)
+    val elements = (datapath / 8).U >> inst.vconfig.vtype.vsew
+    val length = inst.vconfig.vl
+    val up = inst.opif6 === OPIFunct6.slideup
+    enabled.B && !inst.vmu && inst.funct3.isOneOf(OPIVI, OPIVX) &&
+      inst.opif6.isOneOf(OPIFunct6.slideup, OPIFunct6.slidedown) &&
+      inst.vm && inst.vstart === 0.U && length =/= 0.U &&
+      inst.vconfig.vtype.vsew <= 2.U && length <= elements &&
+      length <= inst.vconfig.vtype.vlMax &&
+      Mux(up, offset < length,
+        (length +& offset) <= elements && (length +& offset) <= inst.vconfig.vtype.vlMax)
+  }
+
+  def shiftGroup(data: UInt, offset: UInt, sew: UInt, up: Bool, datapath: Int): UInt = {
+    val shift = ((offset << sew) << 3)(log2Ceil(datapath) - 1, 0)
+    Mux(up, (data << shift)(datapath - 1, 0), data >> shift)
+  }
 }

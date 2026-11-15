@@ -23,6 +23,29 @@ def counter_log(cases=11):
 
 
 class RmsnormCountersTest(unittest.TestCase):
+    def test_banked_run_reports_timed_diagnostics_without_setup_traffic(self):
+        text = counter_log().replace('format=6',
+            'format=11 quant_batch=16 quant_vl=16 quant_sew=32 quant_schedule=overlap '
+            'lane_sum=1 quant_rename=1 quant_banked=1')
+        text = re.sub(r'(\[EVU-EXE\] fence=(\d+) [^\n]*)',
+                      lambda m: m[1] + f' dep={10000 + int(m[2]) * 7} resp={20000 + int(m[2]) * 3}', text)
+        text = re.sub(r'(\[EVU-FU\] fence=(\d+) path=fp_mxfp [^\n]*)',
+                      lambda m: m[1] + f' operand={30000 + int(m[2]) * 2} queue={40000 + int(m[2]) * 5}', text)
+        rows = summarize_counters(text)
+        self.assertTrue(all(row['dependency_wait'] == 7 and row['vrf_read_response_wait'] == 3 and
+                            row['mxfp_operand_wait'] == 2 and row['mxfp_queue_wait'] == 5 for row in rows))
+        self.assertTrue(all(row['fma_queue_wait'] == '' for row in rows))
+        with self.assertRaisesRegex(ValueError, 'missing counter'):
+            summarize_counters(text.replace('dep=10007', '', 1))
+
+    def test_renamed_lane_sum_run_keeps_timed_output_accounting(self):
+        text = counter_log().replace('format=6',
+            'format=10 quant_batch=16 quant_vl=16 quant_sew=32 quant_schedule=overlap lane_sum=1 quant_rename=1')
+        rows = summarize_counters(text)
+        self.assertEqual(len(rows), 11)
+        self.assertTrue(all(row['logical_store_bytes'] == 1152 for row in rows
+                            if row['stage'] in ('quant_evu', 'fused_nvfp4')))
+
     def test_overlapped_run_keeps_the_same_logical_output_size(self):
         text = counter_log().replace('format=6',
                                      'format=8 quant_batch=16 quant_vl=16 quant_sew=32 quant_schedule=overlap')

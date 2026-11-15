@@ -59,6 +59,136 @@ packing buffer. Alignment uses DLEN/8 bytes, not a fixed 64-byte constant.
 
 ## Validation and server use
 
+### Operand and single-group slide follow-up
+
+Checkpoint `142923fc9` preserves the previous RTL/software before this follow-up.
+Three independent `EvuParams` switches default to true:
+
+- `singleGroupSlide`: unmasked VX/VI slideup/slidedown, vstart=0, whose source
+  and destination accesses fit within the first DLEN group. Slide-up requires
+  offset<VL and VL<=group elements; slide-down additionally requires VL+offset
+  to fit both the group and VLMAX. Existing VRF ports supply the data to a
+  parameterized shifter; the original write masks preserve untouched bytes.
+  This bypass avoids the special permutation queue and compactor. All other
+  cases retain the original path, including cross-group, masked, restarted,
+  oversized-offset and slide1 operations. No new instruction or FP4 buffer is
+  introduced.
+- `extendedResultForwarding`: connects integer/permute, FP divide, ordinary
+  conversion, XX8 and MXFP paths to the existing full-EG bypass. Iterative
+  results may forward while held under writeback backpressure, but completion
+  and exception flags still follow the original write-acceptance handshake.
+  Only full masks qualify; packed FP4/FP8 and reduction partial writes do not
+  forward. VAT age and intervening-writer checks are retained.
+- `crossInstructionPrefetch`: checks each ordinary issue-queue head against
+  older writers and hints up to three first-group operands into the existing
+  collectors while the current instruction is at its tail. Normal demand
+  reads retain priority. Reductions and instructions requiring the generic
+  gather/slide machinery do not use this lookahead. Scalar-index broadcasts
+  hint the addressed source group, with out-of-VLMAX indices excluded.
+  This is operand lookahead, not arbitrary out-of-order issue
+  or cache prefetch. Setting it false retains the previous EXP2-only hint.
+
+### Collector invalidation fix (2026-11-15)
+
+The format-11 RMSNorm run exposed an operand-coherence bug at its first
+`amax / 6` division (`pc=0x80001e20`, instruction `0x697faa0b`). E0 arithmetic
+could leave a full-group speculative read in the divide operand collector:
+the E0 mirror served the demand without consuming that read, and subsequent
+VRF writes did not invalidate it. Reassigning the quantization constant to
+v31 then reused its earlier `[512, 0, ..., 0]` group despite the physical VRF
+already containing sixteen sixes. This produces DZ rather than reference NX.
+The production VRF/collector Treadle reproducer observed the stale group;
+the same sequence without prefetch returned the updated broadcast.
+
+`RegisterReadCollector` now cancels a matching read when the E0 mirror serves
+the operand, suppresses same-cycle hints for that bypassed EG, and invalidates
+cached data on matching physical VRF writes.
+Invalidation includes masked pipeline writes and staged load/iterative writes,
+independent of diagnostic counters or VAT ownership; zero-mask writes leave
+data valid. If an invalidated read is still outstanding, its untagged response
+must drain before a replacement request is accepted. Unrelated EG writes and
+normal successor prefetch retain their existing behavior. No ISA, NEMU,
+quantization formula, software schedule or fence changes are needed.
+
+Focused checks use Treadle, without generating Verilog or guest binaries:
+
+```sh
+PATH="$PWD/src/main/resources:$PATH" mill -i evuCheck.test.testOnly evu.EvuRmsnormPrefetchSpec
+PATH="$PWD/src/main/resources:$PATH" mill -i evuCheck.test.testOnly \
+  evu.EvuSynchronousVrfSpec evu.EvuReadPrioritySpec \
+  evu.EvuScalarResultForwardingSpec evu.EvuWriteCompletionSpec
+PATH="$PWD/src/main/resources:$PATH" mill -i evuCheck.test.testOnly \
+  evu.EvuSkewedVrfSpec -- -z 'pipeline successor'
+PATH="$PWD/src/main/resources:$PATH" mill -i evuCheck.test.testOnly \
+  evu.EvuSaturnOperandSpec -- -z 'prefetch real'
+```
+
+Local Treadle checks passed the rewritten v31 reproducer, staged partial LL
+writes, E0 cancellation with a simultaneous hint, unrelated-EG retention,
+zero-mask/ownerless physical-write notifications, and invalidation while the
+old response is buffered, returning, or still pending. Normal real-VRF
+successor prefetch and backpressure checks also passed. The production
+`EvuAreaTopSpec` CHIRRTL structural check passed. A full all-EG bank traversal
+was stopped because of interpreter runtime and is not counted as passed.
+
+The subsequent November 15 server run passes all 11 format-11 cases and EVU
+Difftest with `pending=0`: quantization takes 3659 cycles and the row-major
+complete operator takes 5101. See the
+[checkpoint record](checkpoints/2026-11-15-rmsnorm-5101.md) for the full results,
+artifact-provenance limits and remaining regression/synthesis work. This is
+joint RTL/software workload acceptance, not an isolated hardware speedup.
+
+### Follow-up acceptance
+
+No divider/FMA replication or reduction-context increase is included. The
+new bypass muxes, group shifter and hint logic still require timing/area checks.
+`EvuGroupSlideSpec` covers byte/halfword/word shifts, partial write masks,
+source capture, RAW/WAR/WAW stalls, backpressure and fallback selection at
+DLEN=128/256/512. `EvuIterForwardingSpec` covers held full divide results,
+partial-result rejection and completion timing. `EvuIndependentOperandSpec`
+also covers all three tail hint ports versus normal next-group prefetch.
+The full-backend `EvuSlideSpec` adds short-group, partial-tail, in-place
+slide-down and cross-group fallback transitions for each SEW/LMUL combination.
+
+The follow-up is statically compiled locally; these RTL simulations must run
+on the server, not be inferred from compilation success:
+
+```sh
+mill -i evuCheck.test.testOnly evu.EvuGroupSlideSpec evu.EvuAlignedSlideSpec \
+  evu.EvuIterForwardingSpec evu.EvuVectorResultForwardingSpec \
+  evu.EvuIndependentOperandSpec evu.EvuSlideSpec
+```
+
+For an attributable performance comparison, first save a checked checkpoint
+run. Build the new EMU once and compare baseline versus optimized software on
+that same EMU. The software switches can also be varied independently:
+
+```sh
+make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM NAME=rmsnorm_nvfp4_evu_test \
+  EVU_RMS_LANE_SUM=0 EVU_RMS_QUANT_RENAME=0 EVU_RMS_QUANT_BANKED=0 \
+  BINARY="$PWD/software/evu/build/rmsnorm_baseline-riscv64-xs"
+make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM NAME=rmsnorm_nvfp4_evu_test
+```
+
+The baseline uses the previous arithmetic schedule, and the default image
+prints `format=11 lane_sum=1 quant_rename=1 quant_banked=1` among its configuration fields.
+Use `EVU_RMS_QUANT_BANKED=0` with the other switches at 1 to reproduce the
+format-10 timed arithmetic, or use `compare_rmsnorm_software.sh` to compare
+the new bank-aware assignment and instruction order on one unchanged EMU.
+Run each image with the same NEMU and EMU arguments, then compare the checked
+logs with `compare_rmsnorm_runs.py`. Do not mix a reverted format-9 experiment
+with the format-8 checkpoint baseline. Check `sumsq`, `rms_evu`, `quant_evu`,
+both full fusion schedules and checked Softmax; a lower isolated stage is not
+enough to accept an end-to-end regression.
+
+For timed rather than whole-program counters, build `EVU_RMS_VERBOSE=1`, run
+EMU with `-- +evu_mem_trace=1`, and parse using
+`summarize_rmsnorm_counters.py`. Counters can overlap and must not be added as
+independent lost cycles. New speedups and RTL functional PASS remain unclaimed
+until server acceptance.
+
+### Previous tree/aligned-slide validation
+
 `EvuMinMaxTreeSpec` checks consecutive inputs and bubbles at DLEN=64/128/256/512,
 random bit patterns, NaNs, infinities, signed zeros, subnormals, mixed two/four
 cycle outputs and exception VATs. Production-sequencer tests cover min/max

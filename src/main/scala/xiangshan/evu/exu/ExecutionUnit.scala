@@ -24,6 +24,7 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
     val iter_hazards = Output(Vec(iter_fus.size, Valid(new PipeHazard(maxPipeDepth))))
     val iter_write = Decoupled(new VectorWrite(dLen))
     val iterWriteVat = Output(UInt(vParams.vatSz.W))
+    val iterWriteForwardable = Output(Bool())
     val pipe_write = Output(Valid(new VectorWrite(dLen)))
     val pipeWriteVat = Output(UInt(vParams.vatSz.W))
     val pipeWriteForwardable = Output(Bool())
@@ -68,6 +69,7 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
   io.iter_write.valid := false.B
   io.iter_write.bits := DontCare
   io.iterWriteVat := 0.U
+  io.iterWriteForwardable := false.B
   io.acc_write.valid := false.B
   io.acc_write.bits := DontCare
   io.acc_write_slot := 0.U
@@ -174,6 +176,8 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
     io.iter_write.bits.mask := iter_write_arb.io.out.bits.mask
     io.iter_write.bits.data := iter_write_arb.io.out.bits.data
     io.iterWriteVat := VecInit(iter_fus.map(_._1.io.hazard.bits.vat))(iter_write_arb.io.chosen)
+    io.iterWriteForwardable := !VecInit(iter_fus.map(_._1.io.acc))(iter_write_arb.io.chosen) &&
+      iter_write_arb.io.out.bits.mask.andR
     when (!pipe_write) {
       io.acc_write.valid := iter_write_arb.io.out.valid && acc
       io.acc_write.bits.eg   := Mux1H(iter_write_arb.io.in.map(_.fire), iter_fus.map(_._1.io.write.bits.eg))

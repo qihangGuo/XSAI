@@ -34,6 +34,16 @@ def summarize_counters(text):
                 ("MEM", "logical_store", "logical_store_bytes"),
                 ("FU:fp_xx8", "issue", "xx8_issues"), ("FU:fp_mxfp", "issue", "mxfp_issues"),
                 ("FU:fp_xx8", "wb", "xx8_writeback_wait"), ("FU:fp_mxfp", "wb", "mxfp_writeback_wait"))
+    diagnostics = (("EXE", "dep", "dependency_wait"), ("EXE", "operand", "operand_wait"),
+                   ("EXE", "feedback", "feedback_wait"), ("EXE", "perm", "permutation_wait"),
+                   ("EXE", "grant", "vrf_read_grant_wait"), ("EXE", "resp", "vrf_read_response_wait"),
+                   ("EXE", "vfw", "vector_forwards"), ("EXE", "used", "prefetch_used"),
+                   ("VMU", "ack", "vmu_ack_wait"),
+                   ("FU:fp_fma", "queue", "fma_queue_wait"), ("FU:fp_fma", "idle", "fma_idle_with_work"),
+                   ("FU:fp_cmp", "queue", "cmp_queue_wait"), ("FU:fp_cmp", "idle", "cmp_idle_with_work"),
+                   ("FU:fp_xx8", "idle", "xx8_idle_with_work"),
+                   ("FU:fp_mxfp", "operand", "mxfp_operand_wait"),
+                   ("FU:fp_mxfp", "queue", "mxfp_queue_wait"), ("FU:fp_mxfp", "idle", "mxfp_idle_with_work"))
     for sample in samples:
         key = sample["stage"], sample["schedule"], int(sample["sample"])
         if key not in expected or key in seen or int(sample["errors"]):
@@ -46,6 +56,9 @@ def summarize_counters(text):
                   "cycles": int(sample["cycles"]), "fences": sample["fences"]}
         for kind, field, label in counters:
             result[label] = counter_delta(snapshots[start, kind], snapshots[end, kind], field)
+        for kind, field, label in diagnostics:
+            before, after = snapshots.get((start, kind), {}), snapshots.get((end, kind), {})
+            result[label] = counter_delta(before, after, field) if field in before or field in after else ""
         if key[0] in ("quant_evu", "fused_nvfp4") and result["logical_store_bytes"] != 1152:
             raise ValueError("NVFP4 timed interval must store exactly 1152 logical bytes")
         output.append(result)

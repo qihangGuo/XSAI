@@ -22,6 +22,12 @@
 #ifndef EVU_RMS_ONLY
 #define EVU_RMS_ONLY 0
 #endif
+#ifndef EVU_RMS_LANE_SUM
+#define EVU_RMS_LANE_SUM 1
+#endif
+#if EVU_RMS_LANE_SUM != 0 && EVU_RMS_LANE_SUM != 1
+#error "EVU_RMS_LANE_SUM must be 0 or 1"
+#endif
 #if EVU_RMS_ONLY != 0 && EVU_RMS_ONLY != 1
 #error "EVU_RMS_ONLY must be 0 or 1"
 #endif
@@ -127,10 +133,29 @@ static inline float reference_rsqrt(float value) {
 #define RN_GAMMA_3 19
 #define LOAD_CHUNK(row, reg, chunk) XV_LOAD(reg, &inputs[(row) * COLS + (chunk) * CHUNK], 2)
 #define STORE_CHUNK(row, reg, chunk) XV_STORE(reg, &normalized.data[(row) * COLS + (chunk) * CHUNK], 2)
+#if EVU_RMS_LANE_SUM
+#define RN_SQUARE_CHUNK_0(row, reg) XV_FMUL(RN_JOIN(RN_STATE_, row), reg, reg, 2)
+#define RN_SQUARE_CHUNK_NEXT(row, reg) do { \
+  XV_FMUL(RN_JOIN(RN_TEMP_, row), reg, reg, 2); \
+  XV_FADD(RN_JOIN(RN_STATE_, row), RN_JOIN(RN_TEMP_, row), RN_JOIN(RN_STATE_, row), 2); \
+} while (0)
+#define RN_SQUARE_CHUNK_1(row, reg) RN_SQUARE_CHUNK_NEXT(row, reg)
+#define RN_SQUARE_CHUNK_2(row, reg) RN_SQUARE_CHUNK_NEXT(row, reg)
+#define RN_SQUARE_CHUNK_3(row, reg) RN_SQUARE_CHUNK_NEXT(row, reg)
+#define SQUARE_CHUNK(row, reg, chunk) RN_JOIN(RN_SQUARE_CHUNK_, chunk)(row, reg)
+#define RN_SUMSQ_FINAL() do { \
+  XV_FREDUCE_SUM(24, 28, 24, 2); \
+  XV_FREDUCE_SUM(25, 28, 25, 2); \
+  XV_FREDUCE_SUM(26, 28, 26, 2); \
+  XV_FREDUCE_SUM(27, 28, 27, 2); \
+} while (0)
+#else
 #define SQUARE_CHUNK(row, reg, chunk) do { \
   XV_FMUL(RN_JOIN(RN_TEMP_, row), reg, reg, 2); \
   XV_FREDUCE_SUM(RN_JOIN(RN_STATE_, row), RN_JOIN(RN_STATE_, row), RN_JOIN(RN_TEMP_, row), 2); \
 } while (0)
+#define RN_SUMSQ_FINAL()
+#endif
 #define NORMALIZE_CHUNK(row, reg, chunk) do { \
   XV_FMUL_SCALAR(reg, RN_JOIN(RN_STATE_, row), reg); \
   XV_FMUL(reg, RN_JOIN(RN_GAMMA_, chunk), reg, 2); \
@@ -151,10 +176,12 @@ static void load_operands(unsigned wave) {
 }
 
 static void seed_sums(void) {
+#if !EVU_RMS_LANE_SUM
   XV_FADD_E0(24, 28, 28);
   XV_FADD_E0(25, 28, 28);
   XV_FADD_E0(26, 28, 28);
   XV_FADD_E0(27, 28, 28);
+#endif
 }
 
 static void load_row_scalars(const float *values) {
@@ -173,6 +200,7 @@ static void store_row_scalars(float *values) {
 
 static void sum_of_squares(unsigned wave) {
   SCHEDULE(SQUARE_CHUNK, wave);
+  RN_SUMSQ_FINAL();
 }
 
 #define SCALE_ROW(operation, scalar, reg) do { \
@@ -409,9 +437,11 @@ __attribute__((used, noinline)) static int rmsnorm_nvfp4_test_main(void) {
   const unsigned stage_count = EVU_RMS_ONLY ? QUANT_EVU : STAGES;
   unsigned cases = 0;
   for (enum Stage stage = EMPTY; (unsigned)stage < stage_count; ++stage) cases += schedule_count(stage);
-  printf("[RN] config rows=4 cols=512 samples=%u input=%s alpha_bits=%08x eps_bits=%08x warmup=0 cases=%u format=8 quant_batch=16 quant_vl=16 quant_sew=32 quant_schedule=overlap workload=%s quantization=%s\n",
+  printf("[RN] config rows=4 cols=512 samples=%u input=%s alpha_bits=%08x eps_bits=%08x warmup=0 cases=%u format=11 quant_batch=16 quant_vl=16 quant_sew=32 quant_schedule=overlap lane_sum=%u quant_rename=%u quant_banked=%u workload=%s quantization=%s\n",
     (unsigned)EVU_RMS_SAMPLES, EVU_RMS_BF16_INPUT ? "bf16_rounded_fp32" : "fp32",
     rn_float_bits(alpha), rn_float_bits(epsilon), cases,
+    (unsigned)EVU_RMS_LANE_SUM, (unsigned)EVU_RMS_QUANT_RENAME,
+    (unsigned)EVU_RMS_QUANT_BANKED,
     EVU_RMS_ONLY ? "rmsnorm_evu" : "rmsnorm_nvfp4_evu", EVU_RMS_ONLY ? "not_measured" : "evu");
   for (enum Stage stage = EMPTY; (unsigned)stage < stage_count; ++stage) {
     const unsigned schedules = schedule_count(stage);

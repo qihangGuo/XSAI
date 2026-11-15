@@ -83,6 +83,7 @@ class EvuReadPrioritySpec extends AnyFlatSpec with ChiselScalatestTester {
   it should "collect the current demand before a hint and reuse the successor response" in {
     implicit val p: Parameters = parameters
     test(new RegisterReadCollector).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      dut.io.bypass.poke(false.B)
       dut.io.client.req.valid.poke(true.B)
       dut.io.client.req.bits.eg.poke(3.U)
       dut.io.client.req.bits.oldest.poke(false.B)
@@ -123,6 +124,7 @@ class EvuReadPrioritySpec extends AnyFlatSpec with ChiselScalatestTester {
   it should "count an outstanding wrong hint and replace it when its response arrives" in {
     implicit val p: Parameters = parameters
     test(new RegisterReadCollector).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      dut.io.bypass.poke(false.B)
       dut.io.client.req.valid.poke(false.B)
       dut.io.client.req.bits.eg.poke(3.U)
       dut.io.client.req.bits.oldest.poke(false.B)

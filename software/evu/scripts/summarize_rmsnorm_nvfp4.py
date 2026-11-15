@@ -43,25 +43,30 @@ def summarize(text):
     if header.get("rows") != "4" or header.get("cols") != "512" or header.get("cases") not in CASE_SETS:
         raise ValueError("unexpected benchmark shape or case count")
     expected = CASE_SETS[header["cases"]]
-    if header["cases"] in ("11", "23") and (header.get("format") not in (("5", "6", "7", "8") if header["cases"] == "11" else ("4",)) or
+    if header["cases"] in ("11", "23") and (header.get("format") not in (("5", "6", "7", "8", "10", "11") if header["cases"] == "11" else ("4",)) or
                                     header.get("workload") != "rmsnorm_nvfp4_evu" or
                                     header.get("quantization") != "evu" or "alpha_bits" not in header):
         raise ValueError("expected full EVU RMSNorm/NVFP4 header matching the case format")
-    if header["cases"] in ("8", "17") and (header.get("format") not in (("5", "6", "7", "8") if header["cases"] == "8" else ("3",)) or
+    if header["cases"] in ("8", "17") and (header.get("format") not in (("5", "6", "7", "8", "10", "11") if header["cases"] == "8" else ("3",)) or
                                     header.get("workload") != "rmsnorm_evu" or
                                     header.get("quantization") != "not_measured"):
         raise ValueError("expected EVU-only RMSNorm header with quantization=not_measured")
     samples = int(header["samples"])
     if samples < 1 or header.get("input") not in ("fp32", "bf16_rounded_fp32"):
         raise ValueError("invalid sample count or input mode")
-    if header.get("format") in ("6", "7", "8") and header.get("warmup") != "0":
-        raise ValueError("format 6/7/8 requires warmup=0")
-    if header.get("format") in ("7", "8") and header.get("quant_batch") != "16":
-        raise ValueError("format 7/8 requires quant_batch=16")
-    if header.get("format") == "8" and (header.get("quant_vl") != "16" or
+    if header.get("format") in ("6", "7", "8", "10", "11") and header.get("warmup") != "0":
+        raise ValueError("format 6/7/8/10/11 requires warmup=0")
+    if header.get("format") in ("7", "8", "10", "11") and header.get("quant_batch") != "16":
+        raise ValueError("format 7/8/10/11 requires quant_batch=16")
+    if header.get("format") in ("8", "10", "11") and (header.get("quant_vl") != "16" or
                                         header.get("quant_sew") != "32" or
                                         header.get("quant_schedule") != "overlap"):
-        raise ValueError("format 8 requires quant_vl=16 quant_sew=32 quant_schedule=overlap")
+        raise ValueError("format 8/10/11 requires quant_vl=16 quant_sew=32 quant_schedule=overlap")
+    if header.get("format") in ("10", "11") and any(header.get(field) not in ("0", "1")
+                                           for field in ("lane_sum", "quant_rename")):
+        raise ValueError("format 10/11 requires lane_sum and quant_rename switches")
+    if header.get("format") == "11" and header.get("quant_banked") not in ("0", "1"):
+        raise ValueError("format 11 requires a quant_banked switch")
     if "[RN] PASS" not in text or "HIT GOOD TRAP" not in text:
         raise ValueError("require both [RN] PASS and emulator HIT GOOD TRAP")
     if re.search(r"\[RN\] FAIL|HIT BAD TRAP|ABORT|Assertion.*failed|Assertion fail", text):

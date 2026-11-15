@@ -136,6 +136,7 @@ class EvuSynchronousVrfSpec extends AnyFlatSpec with ChiselScalatestTester {
   it should "acknowledge only live matching requests and discard responses on reset" in {
     implicit val p: Parameters = parameters
     test(new RegisterReadCollector).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      dut.io.bypass.poke(false.B)
       dut.io.client.req.valid.poke(false.B)
       dut.io.prefetch.valid.poke(false.B)
       dut.io.prefetch.bits.eg.poke(0.U)

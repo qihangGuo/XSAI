@@ -71,6 +71,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
   val vxus = xissParams.map(_.seqs.map(s => Module(new ExecutionUnit(s.fus, s.name)).suggestName(s"vxu${s.name}")))
   val flat_vxus = vxus.flatten
+  val forwardingNames = Set("fp_fma", "fp_cmp", "fp_exp") ++
+    (if (vParams.extendedResultForwarding) Set("int", "fp_div", "fp_conv", "fp_xx8", "fp_mxfp") else Set.empty[String])
   val maxPipeDepth = flat_vxus.map(_.maxPipeDepth).max
 
   val vls = Module(new LoadSequencer)
@@ -85,7 +87,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
         Module(new ExecuteSequencer(s.insns, maxPipeDepth, s.fus.size,
           ordinaryOnly = layout.dedicated && layout.reductionOwner(c).isEmpty,
           reductionOnly = layout.reductionOwner(c).nonEmpty,
-          resultForwarding = Set("fp_fma", "fp_cmp", "fp_exp").contains(s.name)))
+          resultForwarding = forwardingNames.contains(s.name)))
           .suggestName(s"vxs${s.name}_$c")
       }
     }
@@ -216,7 +218,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     vxissq.io.enq.bits.reads_vs2_mask := dis_ctrl.bool(ReadsVS2AsMask)
     vxissq.io.enq.bits.renv1 := dis_ctrl.bool(ReadsVS1) && !dis_ctrl.bool(Reduction)
     vxissq.io.enq.bits.renv2 := dis_ctrl.bool(ReadsVS2) ||
-      VectorFastPaths.alignedSlide(vdq.io.deq.bits, dLen, vParams.alignedSlide)
+      VectorFastPaths.alignedSlide(vdq.io.deq.bits, dLen, vParams.alignedSlide) ||
+      VectorFastPaths.singleGroupSlide(vdq.io.deq.bits, dLen, vParams.singleGroupSlide)
     vxissq.io.enq.bits.renvd := dis_ctrl.bool(ReadsVD)
     vxissq.io.enq.bits.renvm := (!vdq.io.deq.bits.vm && dis_ctrl.bool(VMBitReadsVM)) || dis_ctrl.bool(AlwaysReadsVM)
     vxissq.io.enq.bits.wvd := !dis_ctrl.bool(WritesScalar)
@@ -345,7 +348,11 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
   val forwardSeqs = flat_vxs.filter(_.io.forward.nonEmpty)
   val forwardUnits = flat_vxus.zip(xissParams.flatMap(_.seqs)).collect {
-    case (unit, factory) if Set("fp_fma", "fp_cmp", "fp_exp").contains(factory.name) => unit
+    case (unit, factory) if forwardingNames.contains(factory.name) && unit.pipe_fus.nonEmpty => unit
+  }
+  val forwardIterUnits = flat_vxus.zip(xissParams.flatMap(_.seqs)).collect {
+    case (unit, factory) if vParams.extendedResultForwarding && forwardingNames.contains(factory.name) &&
+      unit.iter_fus.nonEmpty => unit
   }
   val forwardWriters = scala.collection.mutable.ArrayBuffer.empty[ValidIO[VectorForwardWriter]]
   def forwardWriter(valid: Bool, vat: UInt, writes: UInt): Unit = {
@@ -365,7 +372,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     forwardWriter(hazard.valid, hazard.bits.vat, hazard.bits.eg_oh)
   }
   for (hazard <- pendingWrites) { forwardWriter(hazard.valid, hazard.bits.vat, hazard.bits.eg_oh) }
-  val forwarding = Module(new VectorResultForwarding(forwardUnits.size, forwardSeqs.size * 3 + 1,
+  val forwarding = Module(new VectorResultForwarding(forwardUnits.size + forwardIterUnits.size, forwardSeqs.size * 3 + 1,
     forwardWriters.size))
   forwarding.io.tail := io.vat_tail
   forwarding.io.writers := VecInit(forwardWriters.toSeq)
@@ -376,6 +383,14 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     result.bits.data := unit.io.pipe_write.bits.data
     result.bits.mask := unit.io.pipe_write.bits.mask
     result.bits.vat := unit.io.pipeWriteVat
+  }
+  for ((unit, index) <- forwardIterUnits.zipWithIndex) {
+    val result = forwarding.io.results(forwardUnits.size + index)
+    result.valid := unit.io.iter_write.valid && unit.io.iterWriteForwardable
+    result.bits.eg := unit.io.iter_write.bits.eg
+    result.bits.data := unit.io.iter_write.bits.data
+    result.bits.mask := unit.io.iter_write.bits.mask
+    result.bits.vat := unit.io.iterWriteVat
   }
   val forwardReads = forwardSeqs.flatMap(seq => Seq(seq.io.rvs1, seq.io.rvs2, seq.io.rvd)
     .zip(seq.io.forward.get).map { case (read, port) => (read, port, seq.io.vat) })
@@ -539,21 +554,36 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   for (((seqs, xu), factory) <- contextsByFu.zip(flat_vxus).zip(xissParams.flatMap(_.seqs))) {
     seqs.foreach(_.io.lookahead := 0.U.asTypeOf(seqs.head.io.lookahead))
     val lookaheadEligible = WireInit(false.B)
-    if (factory.name == "fp_exp") {
+    if (vParams.crossInstructionPrefetch || factory.name == "fp_exp") {
       val queueIndex = xissParams.indexWhere(_.seqs.exists(_.name == factory.name))
       val next = vxissqs(queueIndex).io.deq
-      val eg = getEgId(next.bits.rs2, 0.U, next.bits.vconfig.vtype.vsew, false.B)
-      val olderWriter = forwardWriters.map { writer =>
-        writer.valid && writer.bits.writes(eg) && vatOlder(writer.bits.vat, next.bits.vat)
-      }.foldLeft(false.B)(_ || _)
-      lookaheadEligible := next.valid && next.bits.vm && next.bits.vstart === 0.U &&
-        !next.bits.scalar_to_vd0 && !next.bits.reduction &&
-        next.bits.vconfig.vtype.vsew === 2.U && next.bits.vconfig.vl >= (dLen / 32).U &&
-        !olderWriter && seqs.head.io.atTail
-      seqs.head.io.lookahead.valid := lookaheadEligible
-      seqs.head.io.lookahead.bits.eg := eg
-      seqs.head.io.lookahead.bits.oldest := next.bits.vat === io.vat_head
-      seqs.head.io.lookahead.bits.lastOperand := false.B
+      val ctrl = new VectorDecoder(next.bits, factory.insns, Seq(UsesGatherUnit))
+      val candidate = next.valid && seqs.head.accepts(next.bits) && next.bits.vm &&
+        next.bits.vstart === 0.U && next.bits.vconfig.vl =/= 0.U && !next.bits.reduction &&
+        !ctrl.bool(UsesGatherUnit) && seqs.head.io.atTail &&
+        (vParams.crossInstructionPrefetch.B || (!next.bits.scalar_to_vd0 &&
+          next.bits.vconfig.vtype.vsew === 2.U && next.bits.vconfig.vl >= (dLen / 32).U))
+      val enabled = Seq(next.bits.renv1 && !next.bits.reads_vs1_mask,
+        next.bits.renv2 && !next.bits.reads_vs2_mask, next.bits.renvd)
+      val registers = Seq(next.bits.rs1, next.bits.rs2, next.bits.rd)
+      val scalarGather = next.bits.funct3.isOneOf(OPIVI, OPIVX) && next.bits.opif6 === OPIFunct6.rgather
+      val gatherIndex = Mux(next.bits.funct3 === OPIVX, next.bits.rs1_data, next.bits.imm5)
+      val eligible = (0 until 3).map { port =>
+        val indexed = (port == 1).B && scalarGather
+        val eg = getEgId(registers(port), Mux(indexed, gatherIndex, 0.U), next.bits.vconfig.vtype.vsew, false.B)
+        val olderWriter = forwardWriters.map { writer =>
+          writer.valid && writer.bits.writes(eg) && vatOlder(writer.bits.vat, next.bits.vat)
+        }.foldLeft(false.B)(_ || _)
+        val allowed = candidate && enabled(port) && !olderWriter &&
+          (!indexed || gatherIndex < next.bits.vconfig.vtype.vlMax) &&
+          (vParams.crossInstructionPrefetch.B || (port == 1).B)
+        seqs.head.io.lookahead(port).valid := allowed
+        seqs.head.io.lookahead(port).bits.eg := eg
+        seqs.head.io.lookahead(port).bits.oldest := next.bits.vat === io.vat_head
+        seqs.head.io.lookahead(port).bits.lastOperand := false.B
+        allowed
+      }
+      lookaheadEligible := eligible.reduce(_ || _)
     }
     val criticalPriority = factory.name == "fp_fma" || factory.name == "fp_cmp"
     val arb = Module(new SharedExecutionArbiter(seqs.size, maxPipeDepth, xu.nFUs, criticalPriority))

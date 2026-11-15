@@ -6,20 +6,33 @@ The full timed path uses EVU for every numerical step. CPU arithmetic is
 limited to untimed setup and correctness checks. No rsqrt7 or CPU-performance
 case is included; reciprocal square root is EVU sqrt followed by division.
 
-The overlapped software schedule still requires server guest compilation and
-execution on the existing low-precision RTL. Source-level checks are not
-measured performance or an RTL PASS.
+Format 10 adds lane-wise sum accumulation and quantization scratch renaming.
+Format 11 adds bank-aware quantization register assignment and finer amax/pack
+interleaving, controlled by `EVU_RMS_QUANT_BANKED=1` (the default). This software
+change uses existing instructions and needs only a guest rebuild on the server.
+The new schedule and the single-group slide, result forwarding and operand
+lookahead RTL require server acceptance. Source-level checks are not measured
+performance or an RTL PASS. See `EVU_REDUCTION_SLIDE_FASTPATHS.md` for hardware
+switches and a same-software/same-RTL comparison sequence.
 
-The subsequent default min/max-tree and aligned-slide RTL optimizations require
-a new server EMU build; see `EVU_REDUCTION_SLIDE_FASTPATHS.md`. Compare the same
-format-8 guest image before and after that hardware change.
+## Validated checkpoint (2026-11-15)
+
+The server run with the collector invalidation fix and bank-aware format-11
+software passes all 11 cases and EVU Difftest (`pending=0`). Row-major RMSNorm
+takes 898 cycles, quantization 3659, and the complete operator 5101; the wave4
+complete operator takes 5220. These are one-sample, no-warmup measurements.
+Against the successful format-10 run, quantization improves by 8.1% and the
+row-major complete operator by 6.1%; RTL and software changed together.
+The [checkpoint record](checkpoints/2026-11-15-rmsnorm-5101.md) preserves all
+stage results, counter comparisons, source/reference provenance and the raw
+log SHA-256. Tag: `checkpoint/evu-rmsnorm-nvfp4-20261115`.
 
 ## Cases and timing
 
 | Stage | Schedules | Timed work |
 | --- | --- | --- |
 | `empty` | overhead | Dispatch, timestamp and completion overhead |
-| `sumsq` | row_major, wave4 | Resident inputs, four 128-element squares/reductions per row |
+| `sumsq` | row_major, wave4 | Resident inputs, square four chunks, accumulate lane-wise, reduce once per row |
 | `scale_div_eps` | row_major | Four means using division by 512, plus epsilon |
 | `rsqrt_evu` | row_major, wave4 | Four sqrt/divide pairs with resident inputs and 1.0 |
 | `rms_evu` | row_major, wave4 | Full dependent RMSNorm with resident input/output |
@@ -29,7 +42,7 @@ format-8 guest image before and after that hardware change.
 The benchmark runs exactly 11 cases, with no warmup and one timed
 execution per case by default (11 kernel invocations). Default guest printing
 is 13 lines: config, 11 results, PASS. The header identifies this layout
-as `samples=1 warmup=0 cases=11 format=8 quant_batch=16 quant_vl=16 quant_sew=32 quant_schedule=overlap`. Each result covers
+as `samples=1 warmup=0 cases=11 format=11 quant_batch=16 quant_vl=16 quant_sew=32 quant_schedule=overlap lane_sum=1 quant_rename=1 quant_banked=1`. Each result covers
 all four rows and reports `cycles`, retired CPU `inst` and `errors`, without
 min/median/max statistics. Instructions include dispatch and timestamp probes.
 `empty` is not subtracted; separately prepared stage costs are not additive.
@@ -69,14 +82,29 @@ should not be compared directly with the previous warmed measurements.
 ## Register layout and quantization
 
 RMSNorm uses v0..v15 for four chunks per row, v16..v19 for gamma,
-v20..v23 for square scratch, v24..v27 for row scalars, and v28..v31 for
-constants. VL=128/e32/m1 processes each chunk.
+v20..v23 for square scratch, v24..v27 for row accumulators/scalars, and v28..v31
+for constants. VL=128/e32/m1 processes each chunk. Each row's first square
+initializes its full 128-element accumulator; three independent multiply/add
+pairs accumulate the remaining chunks. Four final reductions replace sixteen
+chunk reductions. Multiplication and addition remain separate FP32 operations,
+not FMA. Summation association changes, so use the existing numerical tolerance
+and the server difftest rather than expecting identical RMSNorm bits.
+
+`EVU_RMS_LANE_SUM=0` restores four seeded chunk reductions per row.
+`EVU_RMS_QUANT_RENAME=0` restores shared amax/packing scratch.
+`EVU_RMS_QUANT_BANKED=0` restores the format-10 quantization schedule, including
+its exact expanded instruction sequence for each `EVU_RMS_QUANT_RENAME` value.
+All three switches default to 1 and have distinct object/binary variants.
+Set all three to zero to reproduce the format-8 timed arithmetic schedule;
+the header remains format 11. All variants still run exactly 11 timed cases.
 
 Quantization starts with all normalized y in v0..v15. Each row is consumed
 as two batches of 16 blocks (256 elements, two source registers per batch).
 After batch 0 is packed, v0/v1 are dead and become a second inverse/mask
-context. Other source registers remain untouched until their data is consumed.
-The RMSNorm row-major/wave4 schedules and input loading are unchanged.
+context. After the following batch consumes v2/v3, those registers become
+dedicated steady-state maximum-reduction scratch, separate from the
+packing workspaces. Other source registers remain untouched until consumed.
+Input loading and the row-major/wave4 traversal order are unchanged.
 `include/rmsnorm_nvfp4_batch.h` contains the actual shared schedule.
 
 VL=16/e32/m1 remains fixed for the whole quantizer. A packed 16-element FP4
@@ -94,23 +122,44 @@ maxima. Steady state interleaves three phases: next-batch maximum reduction,
 current-batch scale divisions/XX8 conversion, and previous-batch multiply,
 MXFP4 conversion, packing and stores. The two scale contexts alternate;
 division waits contain independent maximum/packing instructions. The final
-batch drains the pipeline. Sharing the four block work registers still
-creates dependencies, so the schedule exposes overlap rather than guaranteeing
-that all FUs execute simultaneously. Confirm cycle changes with server EMU.
+batch drains the pipeline. The initial batches still share scratch, but later
+amax and packing no longer reuse the same work registers. With
+`quant_banked=1`, steady-state amax and packing are interleaved within each
+pair: independent data extractions and scale broadcasts sit between amax
+input, absolute value, reduction and insertion steps. This finer interleaving
+requires `quant_rename=1`; otherwise those steps still share scratch and run
+consecutively. No arithmetic is combined or reordered within an element's
+numerical dependency chain.
 
-| Register | Content |
-| --- | --- |
-| v0, v1 | Initially y chunks 0/1; after batch 0, second inverse/mask context |
-| v2..v15 | Remaining y chunks; read-only during quantization |
-| v16, v17 | Two contiguous FP32 blocks, then reduction/z scratch; v16 also holds E4M3 codes |
-| v18, v19 | Absolute values, broadcast inverse/mask and packed FP4 scratch |
-| v20 | 64-byte FP4 output buffer for eight blocks |
-| v21 | First context's 16 nonzero-block masks |
-| v22 | Collected 16 maxima for the next scale calculation |
-| v23 | Broadcast FP32 constant six |
-| v24 | 64-byte scale buffer accumulated across four batches |
-| v25..v30 | Alpha, one, minimum scale, zero, integer one, factor=127 |
-| v31 | First context's candidates, decoded scales, d, then inv_d |
+At VLEN=4096, DLEN=512 and four banks/lane, group `g` of register `r` maps to
+`(g ^ r ^ (r >> 2) ^ (r >> 4)) & 3`. The default quantizer's binary source
+groups are group zero. The new assignment removes 128 static different-source
+same-bank pairs from the previous `quant_rename=1` stream: 64 seed/data pairs
+in max reductions and 64 factor/data pairs in MXFP4 conversions. This is a
+source-level access count, not saved cycles; reduction seed timing, forwarding,
+cross-instruction reads and writes affect actual contention. The static
+command count remains 1,536, with 24 VL=16 divides and 18 aligned stores.
+Confirm cycles and timed bank/write-block deltas with server EMU.
+
+| Register | Content with `quant_banked=1` | First-group bank |
+| --- | --- | --- |
+| v0, v1 | Initially y chunks 0/1; after batch 0, second inverse/mask context | 0, 1 |
+| v2, v3 | Initially y chunks; after batch 1 is consumed, steady-state amax scratch | 2, 3 |
+| v4..v15 | Remaining y chunks; read-only during quantization | varies |
+| v16, v27 | Two FP32 blocks, then reduction/z scratch; v16 also holds E4M3 codes | 1, 0 |
+| v17 | Broadcast zero and reduction seed | 0 |
+| v18, v19 | Absolute values, broadcast inverse/mask and packed FP4 scratch | 3, 2 |
+| v20 | First context's candidates, decoded scales, d, then inv_d | 0 |
+| v21 | First context's 16 nonzero-block masks | 1 |
+| v22 | MXFP factor=127 in E0 | 2 |
+| v23 | Collected 16 maxima for the next scale calculation | 3 |
+| v24 | 64-byte scale buffer accumulated across four batches | 3 |
+| v25 | Broadcast alpha | 2 |
+| v26 | Broadcast integer one | 1 |
+| v28 | Broadcast minimum nonzero E4M3 scale | 2 |
+| v29 | Broadcast FP32 one | 3 |
+| v30 | 64-byte FP4 output buffer for eight blocks | 0 |
+| v31 | Broadcast FP32 six | 1 |
 
 The finite-input quantization policy matches the existing reference helpers:
 candidate=(m/6)/alpha, E4M3 RNE and saturation at 448, nonzero blocks get at
@@ -158,7 +207,7 @@ The independent quantization helper oracle remains a server-side test.
 storing and processing them as FP32. It does not measure native BF16 bandwidth.
 NaN/Inf inputs are covered by instruction tests, not the full RMSNorm workload.
 
-`EVU_RMS_ONLY=1` selects the eight non-quantization cases (`cases=8 format=8`)
+`EVU_RMS_ONLY=1` selects the eight non-quantization cases (`cases=8 format=11`)
 and needs capability
 bit28 only. Build this image once and run the identical image on old/new
 emulators (each with its matching NEMU) to assess conversion-FU integration
@@ -166,6 +215,28 @@ overhead. The old emulator must already implement the RVV-math extension.
 Do not compare different source/timing versions as a hardware-only change.
 
 ## Server acceptance
+
+For the format-11 software change, keep the current EMU and matching NEMU
+unchanged. Run from the repository root with `AM_HOME` set:
+
+```sh
+bash software/evu/scripts/compare_rmsnorm_software.sh ../NEMU_evu
+```
+
+This builds only two guest variants and runs both with timed FENCE snapshots:
+`bank0` has the previous format-10 quantization instructions, and `bank1` has
+the new register assignment/interleaving. Both use `lane_sum=1 quant_rename=1`,
+the same timing boundary and `EVU_RMS_VERBOSE=1`. The default is one sample
+per case; prefix the command with `EVU_RMS_SAMPLES=3` for repeated measurements.
+Outputs go to `out/rmsnorm-software`: `bank0.log`, `bank1.log`,
+`comparison.csv`, per-variant cycle/counter CSVs and artifact SHA256 hashes.
+`EVU_EMU` and `EVU_RMS_SOFTWARE_OUTPUT` override the emulator and output path.
+An argument can name an absolute NEMU checkout path. No EMU/NEMU rebuild is
+performed. Check both PASS/GOOD TRAP and pending=0 before interpreting cycles;
+the script rejects failed/incomplete runs. Inspect `quant_evu` and both
+`fused_nvfp4` cases plus their timed bank/write-block/operand deltas. The
+existing `rmsnorm.log` result (3683 quantization, 5131/5264 fused cycles) is
+historical context; use the paired server runs to attribute software gains.
 
 `DefaultExternalVectorMatrixConfig` enables 16 parallel FP32 divide/sqrt lanes
 at DLEN=512. `DefaultExternalVectorScalarDivMatrixConfig` retains the scalar
@@ -225,5 +296,9 @@ python3 software/evu/scripts/compare_rmsnorm_runs.py before.log after.log > comp
 
 Counters require `EVU_RMS_VERBOSE=1` and `+evu_mem_trace=1`. They report VRF
 bank conflicts, writeback waits, writes blocking reads, XX8/MXFP issues and
-logical output traffic. A complete NVFP4 interval with logical store bytes
+logical output traffic. Existing diagnostic snapshots also supply dependency,
+operand/feedback/permutation waits, read grant/response waits, FMA/CMP queue
+waits and conversion operand/queue/idle counters; absent historical diagnostic
+fields are left blank rather than treated as zero. Counters overlap and must
+not be summed into lost cycles. A complete NVFP4 interval with logical store bytes
 other than 1,152 is rejected. Physical frequency/area needs separate synthesis.

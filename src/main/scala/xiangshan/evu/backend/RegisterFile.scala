@@ -16,11 +16,13 @@ class SramReadIO(implicit p: Parameters) extends CoreBundle()(p) with HasVectorP
 }
 
 // Legacy clients consume data on req.fire; acknowledge only the matching response.
-class RegisterReadCollector(implicit p: Parameters) extends CoreModule()(p) with HasVectorParams {
+class RegisterReadCollector(writePorts: Int = 0)(implicit p: Parameters) extends CoreModule()(p) with HasVectorParams {
   val io = IO(new Bundle {
     val client = Flipped(new VectorReadIO)
     val memory = new SramReadIO
     val prefetch = Input(Valid(new VectorReadReq))
+    val bypass = Input(Bool())
+    val invalidate = Input(Vec(writePorts, Valid(UInt(log2Ceil(egsTotal).W))))
     val prefetched = Output(Bool())
     val grantWait = Output(Bool())
     val responseWait = Output(Bool())
@@ -34,17 +36,21 @@ class RegisterReadCollector(implicit p: Parameters) extends CoreModule()(p) with
   val requestedEg = Reg(UInt(log2Ceil(egsTotal).W))
   val speculative = RegInit(false.B)
   val buffered = RegInit(false.B)
+  val invalidated = RegInit(false.B)
   val data = Reg(UInt(dLen.W))
   val matches = io.client.req.bits.eg === requestedEg
+  val rewritten = io.invalidate.map(w => w.valid && w.bits === requestedEg).foldLeft(false.B)(_ || _)
+  val obsolete = invalidated || rewritten || (io.bypass && matches)
   val available = pending && (buffered || io.memory.resp.valid)
-  io.client.req.ready := available && matches && io.client.req.valid && !reset.asBool
+  io.client.req.ready := available && matches && io.client.req.valid && !obsolete && !reset.asBool
   io.client.resp := Mux(buffered, data, io.memory.resp.bits)
   val discard = available && !io.client.req.fire &&
-    ((!speculative && !io.client.req.valid) || (io.client.req.valid && !matches))
+    (obsolete || (!speculative && !io.client.req.valid) || (io.client.req.valid && !matches))
   io.held := available && !io.client.req.fire && !discard
   val canIssue = !pending || io.client.req.fire || discard
   val demand = io.client.req.valid && !io.client.req.fire
-  val usePrefetch = io.prefetch.valid && !demand
+  val bypassesHint = io.bypass && io.prefetch.bits.eg === io.client.req.bits.eg
+  val usePrefetch = io.prefetch.valid && !demand && !bypassesHint
   io.memory.req.valid := canIssue &&
     (usePrefetch || demand) && !reset.asBool
   io.memory.req.bits := Mux(usePrefetch, io.prefetch.bits, io.client.req.bits)
@@ -59,6 +65,8 @@ class RegisterReadCollector(implicit p: Parameters) extends CoreModule()(p) with
     ((io.memory.req.fire && requestingClientEg) ||
       (matches && pending && !buffered && !io.memory.resp.valid))
 
+  // An untagged SRAM response must drain before the collector can be reused.
+  when (pending && obsolete) { invalidated := true.B }
   when (io.memory.resp.valid && pending && !buffered) {
     data := io.memory.resp.bits
     buffered := speculative && !discard && !io.client.req.fire
@@ -66,12 +74,14 @@ class RegisterReadCollector(implicit p: Parameters) extends CoreModule()(p) with
   when (io.client.req.fire || discard) {
     pending := false.B
     buffered := false.B
+    invalidated := false.B
   }
   when (io.memory.req.fire) {
     pending := true.B
     requestedEg := io.memory.req.bits.eg
     speculative := usePrefetch
     buffered := false.B
+    invalidated := false.B
   }
 }
 
@@ -213,7 +223,7 @@ class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrit
 
   private def collect(client: VectorReadIO, memory: SramReadIO, prefetchIndex: Int = -1,
       scalarIndex: Int = -1): Unit = {
-    val collector = Module(new RegisterReadCollector)
+    val collector = Module(new RegisterReadCollector(vParams.vrfBanking))
     collectors += collector
     val scalarHit = WireInit(false.B)
     val scalarData = WireInit(0.U(32.W))
@@ -227,6 +237,8 @@ class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrit
     }
     collector.io.client.req.valid := client.req.valid && !scalarHit
     collector.io.client.req.bits := client.req.bits
+    collector.io.bypass := client.req.valid && scalarHit
+    collector.io.invalidate := vrf.io.writeInvalidations
     client.req.ready := Mux(scalarHit, true.B, collector.io.client.req.ready)
     client.resp := Mux(scalarHit, scalarData.pad(dLen), collector.io.client.resp)
     collector.io.memory <> memory
@@ -315,6 +327,7 @@ class SramRegisterFileIO(
   val demandPrefetchBlocked = Output(Bool())
   val prefetchDeferred = Output(Bool())
   val diagnosticWrites = Output(Vec(vParams.vrfBanking, Bool()))
+  val writeInvalidations = Output(Vec(vParams.vrfBanking, Valid(UInt(log2Ceil(egsTotal).W))))
   val e0Values = Option.when(scalarForwarding)(Output(Vec(32, Valid(UInt(32.W)))))
 }
 
@@ -519,6 +532,8 @@ class AraRegisterFile(
     val writeValid = hasWrite && !reset.asBool
     // Saturn retains a bit-mask interface; the exposed EVU subset writes whole bytes.
     val byteMask = VecInit(writeBits.mask.asBools.grouped(8).map(_.reduce(_ && _)).toSeq).asUInt
+    io.writeInvalidations(bank).valid := writeValid && byteMask.orR
+    io.writeInvalidations(bank).bits := writeBits.eg
     when (writeValid) {
       assert(writeBits.mask === FillInterleaved(8, byteMask),
         "EVU VRF requires whole-byte write masks; partial-bit writes need an upstream merge")

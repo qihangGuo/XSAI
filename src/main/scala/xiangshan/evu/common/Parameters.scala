@@ -377,6 +377,9 @@ case class VectorParams(
   interleaveReductions: Boolean = false,
   fp32MinMaxTree: Boolean = false,
   alignedSlide: Boolean = false,
+  singleGroupSlide: Boolean = false,
+  crossInstructionPrefetch: Boolean = false,
+  extendedResultForwarding: Boolean = false,
 
   issStructure: VectorIssueStructure = VectorIssueStructure.Unified,
 

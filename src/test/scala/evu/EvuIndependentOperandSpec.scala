@@ -29,6 +29,7 @@ class EvuIndependentOperandHarness(implicit p: Parameters) extends CoreModule wi
     val issue = Output(Bool())
     val index = Output(UInt(log2Ceil(maxVLMax).W))
     val prefetch = Output(Vec(3, Valid(new VectorReadReq)))
+    val lookahead = Input(Vec(3, Valid(new VectorReadReq)))
     val early = Output(UInt(3.W))
     val waitReason = Output(new ExecuteWaitSignals)
   })
@@ -41,7 +42,7 @@ class EvuIndependentOperandHarness(implicit p: Parameters) extends CoreModule wi
   seq.io.vat_head := 0.U
   seq.io.acc_valid := io.feedback
   seq.io.acc_return := false.B
-  seq.io.lookahead := 0.U.asTypeOf(seq.io.lookahead)
+  seq.io.lookahead := io.lookahead
   seq.io.iss.ready := io.issueReady
   seq.io.pipe_write_req.available := io.writebackReady
   seq.io.vgu.slide_req.ready := true.B
@@ -100,6 +101,7 @@ class EvuIndependentOperandSpec extends AnyFlatSpec with ChiselScalatestTester {
     test(LazyModule(new EvuIndependentOperandShell).module)
       .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
         clear(dut.io.command.bits)
+        clear(dut.io.lookahead)
         val command = dut.io.command.bits
         command.bits.poke(((OPFFunct6.fadd.litValue << 26) | (BigInt(1) << 25) |
           (BigInt(2) << 20) | (BigInt(1) << 15) | (BigInt(1) << 12) | (3 << 7) | 0x57).U)
@@ -174,6 +176,7 @@ class EvuIndependentOperandSpec extends AnyFlatSpec with ChiselScalatestTester {
           dut.io.olderReads.poke(0.U)
           dut.io.readReady.foreach(_.poke(true.B))
           dut.io.readData.foreach(_.poke(0.U))
+          clear(dut.io.lookahead)
           dut.io.feedback.poke(true.B)
           dut.io.issueReady.poke(true.B)
           dut.io.writebackReady.poke(true.B)
@@ -221,5 +224,50 @@ class EvuIndependentOperandSpec extends AnyFlatSpec with ChiselScalatestTester {
           dut.io.issue.expect(false.B)
         }
     }
+  }
+
+  it should "reuse all three tail collector ports without overriding long-vector successor reads" in {
+    implicit val parameters: Parameters = this.parameters
+    test(LazyModule(new EvuIndependentOperandShell).module)
+      .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+        clear(dut.io.command.bits)
+        clear(dut.io.lookahead)
+        val command = dut.io.command.bits
+        command.bits.poke(((OPFFunct6.fadd.litValue << 26) | (BigInt(1) << 25) |
+          (2 << 20) | (1 << 15) | (1 << 12) | (3 << 7) | 0x57).U)
+        command.vconfig.vl.poke(16.U)
+        command.vconfig.vtype.vsew.poke(2.U)
+        command.renv1.poke(true.B)
+        command.renv2.poke(true.B)
+        command.wvd.poke(true.B)
+        dut.io.command.valid.poke(true.B)
+        dut.io.olderWrites.poke(0.U)
+        dut.io.olderReads.poke(0.U)
+        dut.io.readReady.foreach(_.poke(true.B))
+        dut.io.readData.foreach(_.poke(0.U))
+        dut.io.feedback.poke(true.B)
+        dut.io.issueReady.poke(true.B)
+        dut.io.writebackReady.poke(true.B)
+        dut.clock.step()
+        dut.io.command.valid.poke(false.B)
+        for (port <- 0 until 3) {
+          dut.io.lookahead(port).valid.poke(true.B)
+          dut.io.lookahead(port).bits.eg.poke((20 + port * 4).U)
+          dut.io.lookahead(port).bits.oldest.poke(false.B)
+          dut.io.lookahead(port).bits.lastOperand.poke(false.B)
+        }
+        dut.io.prefetch(0).valid.expect(true.B)
+        dut.io.prefetch(0).bits.eg.expect(5.U)
+        dut.io.prefetch(1).valid.expect(true.B)
+        dut.io.prefetch(1).bits.eg.expect(9.U)
+        dut.io.prefetch(2).valid.expect(false.B)
+        dut.clock.step()
+        for (port <- 0 until 3) {
+          dut.io.prefetch(port).valid.expect(true.B)
+          dut.io.prefetch(port).bits.eg.expect((20 + port * 4).U)
+        }
+        dut.clock.step()
+        dut.io.prefetch.foreach(_.valid.expect(false.B))
+      }
   }
 }
