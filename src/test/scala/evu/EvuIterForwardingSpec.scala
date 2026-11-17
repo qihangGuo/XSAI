@@ -52,6 +52,7 @@ class EvuIterForwardingHarness(implicit parameters: Parameters) extends Module {
   forwarding.io.reads(0).valid := true.B
   forwarding.io.reads(0).bits.eg := 8.U
   forwarding.io.reads(0).bits.vat := 2.U
+  forwarding.io.reads(0).bits.mask := ~0.U(512.W)
   io.resultValid := unit.io.iter_write.valid
   io.forwardable := unit.io.iterWriteForwardable
   io.bypass := forwarding.io.out(0).valid

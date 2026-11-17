@@ -37,7 +37,7 @@ class SharedExecutionArbiter(contexts: Int, maxDepth: Int, nFUs: Int,
       val op = in.bits
       val e0 = !op.acc && op.head && op.tail && op.eidx === 0.U && op.vd_eew === 2.U &&
         op.eidx_mask === 15.U && !op.use_wmask
-      op.isOpf && ((op.acc && (op.acc_merge || op.acc_fold)) || e0)
+      op.isOpf && ((op.acc && (op.acc_direct || op.acc_merge || op.acc_fold)) || e0)
     }
     // Separate index arbiters preserve fairness within each class without
     // duplicating the wide operand/data multiplexer.

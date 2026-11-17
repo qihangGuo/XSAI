@@ -62,7 +62,7 @@ BINARY := $(CURDIR)/build/$(NAME)-$(OS_VARIANT)-$(ARCH)
 endif
 endif
 
-ifeq ($(NAME),rmsnorm_nvfp4_evu_test)
+ifneq ($(filter $(NAME),rmsnorm_nvfp4_evu_test rmsnorm_nvfp4_fused_evu_test),)
 EVU_RMS_SAMPLES ?= 1
 EVU_RMS_BF16_INPUT ?= 0
 EVU_RMS_VERBOSE ?= 0
@@ -80,6 +80,14 @@ CFLAGS += -DEVU_RMS_QUANT_BANKED=$(EVU_RMS_QUANT_BANKED)
 CFLAGS += -DEVU_RMS_EPS=$(EVU_RMS_EPS) -DEVU_RMS_ALPHA=$(EVU_RMS_ALPHA)
 CFLAGS += -fno-fast-math
 RN_VARIANT := batch16-v11-lane$(EVU_RMS_LANE_SUM)-rename$(EVU_RMS_QUANT_RENAME)-bank$(EVU_RMS_QUANT_BANKED)-only$(EVU_RMS_ONLY)-n$(EVU_RMS_SAMPLES)-bf$(EVU_RMS_BF16_INPUT)-e$(EVU_RMS_EPS)-a$(EVU_RMS_ALPHA)
+ifeq ($(NAME),rmsnorm_nvfp4_fused_evu_test)
+EVU_RMS_QUANT_DIRECT_FIRST ?= 1
+CFLAGS += -DEVU_RMS_QUANT_DIRECT_FIRST=$(EVU_RMS_QUANT_DIRECT_FIRST)
+RN_VARIANT := $(RN_VARIANT)-first$(EVU_RMS_QUANT_DIRECT_FIRST)
+ifneq ($(EVU_RMS_QUANT_DIRECT_FIRST),1)
+BINARY := $(CURDIR)/build/$(NAME)-$(RN_VARIANT)-$(ARCH)
+endif
+endif
 ifneq ($(EVU_RMS_VERBOSE),0)
 RN_VARIANT := $(RN_VARIANT)-verbose$(EVU_RMS_VERBOSE)
 endif
@@ -89,11 +97,11 @@ BINARY := $(CURDIR)/build/$(NAME)-$(RN_VARIANT)-$(ARCH)
 endif
 endif
 
-ifneq ($(filter $(NAME),vector_memory_path_evu_test vector_add_evu_test exp2_evu_test online_softmax_evu_test csr_context_evu_test virtual_memory_evu_test rmsnorm_nvfp4_evu_test rvv_math_evu_test low_precision_evu_test),)
+ifneq ($(filter $(NAME),vector_memory_path_evu_test vector_add_evu_test exp2_evu_test online_softmax_evu_test csr_context_evu_test virtual_memory_evu_test rmsnorm_nvfp4_evu_test rmsnorm_nvfp4_fused_evu_test rvv_math_evu_test low_precision_evu_test),)
 CFLAGS += -fno-tree-vectorize -fno-tree-slp-vectorize
 endif
 
-ifneq ($(filter $(NAME),vector_memory_path_evu_test online_softmax_evu_test rmsnorm_nvfp4_evu_test),)
+ifneq ($(filter $(NAME),vector_memory_path_evu_test online_softmax_evu_test rmsnorm_nvfp4_evu_test rmsnorm_nvfp4_fused_evu_test),)
 CFLAGS += -ffp-contract=off
 endif
 

@@ -88,7 +88,10 @@ class StoreSequencer(resultForwarding: Boolean = false)(implicit p: Parameters) 
     val fullGroup = get_head_mask(~0.U(mLenB.W), eidx, inst.mem_elem_size, mLen).andR &&
       get_tail_mask(~0.U(mLenB.W), next_eidx, inst.mem_elem_size, mLen).andR
     port.eligible := valid && inst.vm && inst.mop === mopUnit && inst.seg_nf === 0.U &&
-      !rvdCaptured && fullGroup && (mLen == dLen).B
+      !rvdCaptured && (fullGroup || vParams.shortResultForwarding.B) && (mLen == dLen).B
+    port.mask := (if (vParams.shortResultForwarding) FillInterleaved(8,
+      get_head_mask(~0.U(mLenB.W), eidx, inst.mem_elem_size, mLen) &
+        get_tail_mask(~0.U(mLenB.W), next_eidx, inst.mem_elem_size, mLen)) else ~0.U(dLen.W))
   }
   val data_hazard = raw_hazard
 

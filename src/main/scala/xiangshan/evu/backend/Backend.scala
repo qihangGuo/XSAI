@@ -373,9 +373,12 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   }
   for (hazard <- pendingWrites) { forwardWriter(hazard.valid, hazard.bits.vat, hazard.bits.eg_oh) }
   val forwarding = Module(new VectorResultForwarding(forwardUnits.size + forwardIterUnits.size, forwardSeqs.size * 3 + 1,
-    forwardWriters.size))
+    forwardWriters.size, partial = vParams.shortResultForwarding,
+    retainCycles = if (vParams.shortResultForwarding) 4 else 0,
+    invalidationPorts = vParams.vrfBanking))
   forwarding.io.tail := io.vat_tail
   forwarding.io.writers := VecInit(forwardWriters.toSeq)
+  forwarding.io.invalidate := vrf.io.writeInvalidations
   for ((unit, i) <- forwardUnits.zipWithIndex) {
     val result = forwarding.io.results(i)
     result.valid := unit.io.pipe_write.valid && unit.io.pipeWriteForwardable
@@ -383,6 +386,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     result.bits.data := unit.io.pipe_write.bits.data
     result.bits.mask := unit.io.pipe_write.bits.mask
     result.bits.vat := unit.io.pipeWriteVat
+    forwarding.io.accepted.foreach(_(i) := unit.io.pipe_write.valid)
   }
   for ((unit, index) <- forwardIterUnits.zipWithIndex) {
     val result = forwarding.io.results(forwardUnits.size + index)
@@ -391,6 +395,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     result.bits.data := unit.io.iter_write.bits.data
     result.bits.mask := unit.io.iter_write.bits.mask
     result.bits.vat := unit.io.iterWriteVat
+    forwarding.io.accepted.foreach(_(forwardUnits.size + index) := unit.io.iter_write.fire)
   }
   val forwardReads = forwardSeqs.flatMap(seq => Seq(seq.io.rvs1, seq.io.rvs2, seq.io.rvd)
     .zip(seq.io.forward.get).map { case (read, port) => (read, port, seq.io.vat) })
@@ -398,12 +403,14 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     forwarding.io.reads(i).valid := port.eligible
     forwarding.io.reads(i).bits.eg := read.req.bits.eg
     forwarding.io.reads(i).bits.vat := vat
+    forwarding.io.reads(i).bits.mask := port.mask
     port.available := forwarding.io.out(i).valid
   }
   val storeForwardIndex = forwardReads.size
   forwarding.io.reads(storeForwardIndex).valid := vss.io.forward.get.eligible
   forwarding.io.reads(storeForwardIndex).bits.eg := vss.io.rvd.bits.eg
   forwarding.io.reads(storeForwardIndex).bits.vat := vss.io.vat
+  forwarding.io.reads(storeForwardIndex).bits.mask := vss.io.forward.get.mask
   vss.io.forward.get.available := forwarding.io.out(storeForwardIndex).valid
   io.executionPerf.vectorForwards := diagnosticCount("vectorForwards", PopCount(VecInit(
     forwardReads.zipWithIndex.map { case ((read, _, _), i) => read.req.fire && forwarding.io.out(i).valid } :+
@@ -417,6 +424,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   vss.io.rvd.ready := vrf.io.vss.rvd.req.ready || forwarding.io.out(storeForwardIndex).valid
   vrf.io.vss.rvm.req <> vss.io.rvm
   vrf.io.vss.e0Read := vss.io.e0Read
+  // A forwarding hit forces ready; do not feed collector ready back into its invalidation.
+  vrf.io.vss.bypass := vss.io.rvd.valid && forwarding.io.out(storeForwardIndex).valid
   vss.io.rvd_resp := Mux(forwarding.io.out(storeForwardIndex).valid,
     forwarding.io.out(storeForwardIndex).bits, vrf.io.vss.rvd.resp)
   vss.io.rvm_resp := vrf.io.vss.rvm.resp
@@ -432,6 +441,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   for (i <- 0 until flat_vxs.size) {
     val vxs = flat_vxs(i)
     val vxu = fuBySequencer(i)
+    vrf.io.vxs(i).bypass := VecInit.fill(3)(false.B)
 
     vrf.io.vxs(i).rvs1.req <> vxs.io.rvs1.req
     vrf.io.vxs(i).rvs2.req <> vxs.io.rvs2.req
@@ -448,6 +458,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
         memory.req.valid := read.req.valid && !result.valid
         read.req.ready := result.valid || memory.req.ready
         read.resp := Mux(result.valid, result.bits, memory.resp)
+        vrf.io.vxs(i).bypass(port) := read.req.valid && result.valid
       }
     }
     vxs.io.rvm.resp := vrf.io.vxs(i).rvm.resp
@@ -500,7 +511,13 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       val acc_data = Mux1H(owners, reductionSeqs.map(_.io.acc_data.bits))
       val acc_other_data = Mux1H(owners, reductionSeqs.map(_.io.acc_other_data))
       val acc_init = Mux1H(owners, reductionSeqs.map(_.io.acc_init))
-      when (vxs_iss.acc_merge) {
+      when (vxs_iss.acc_direct) {
+        // Keep the raw source EG; only the seed comes from the reduction owner.
+        vxu_iss.wmask := eewByteMask(vxs_iss.vd_eew)
+        vxu_iss.rvs1_elem := acc_data(31, 0)
+        vxu_iss.rvs1_data := acc_data(31, 0)
+        vxu_iss.rvs1_eew := vxs_iss.vd_eew
+      } .elsewhen (vxs_iss.acc_merge) {
         vxu_iss.wmask := ~(0.U(dLenB.W))
         vxu_iss.rvs1_elem := acc_data
         vxu_iss.rvs1_data := acc_data
@@ -654,9 +671,9 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
           vdq.io.deq.valid && target && reductionBlocked)
         for ((stage, j) <- EvuReductionStage.names.zipWithIndex) {
           def matches(op: ExecuteMicroOp): Bool = op.acc && (j match {
-            case 0 => !op.acc_merge && !op.acc_fold
+            case 0 => !op.acc_merge && !op.acc_fold && !op.acc_direct
             case 1 => op.acc_merge
-            case 2 => op.acc_fold
+            case 2 => op.acc_fold || op.acc_direct
             case _ => false.B
           })
           val issued = xu.io.iss.fire && matches(xu.io.iss.bits)

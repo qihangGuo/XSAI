@@ -12,14 +12,15 @@ import xiangshan.evu.common.VectorParams
 class EvuRmsnormPrefetchSpec extends AnyFlatSpec with ChiselScalatestTester {
   behavior of "RMSNorm E0-to-vector operand reuse"
 
-  private def checkReuse(withPrefetch: Boolean, consumeScalar: Boolean): Unit = {
+  private def checkReuse(withPrefetch: Boolean, consumeScalar: Boolean, externalBypass: Boolean = false): Unit = {
     implicit val p: Parameters = EvuVectorParameters(Parameters.empty.alterPartial {
       case freechips.rocketchip.tile.XLen => 64
       case freechips.rocketchip.tile.MaxHartIdBits => 1
       case freechips.rocketchip.rocket.PgLevels => 3
     }, 4096, 512, 512, VectorParams.lgvParams.copy(vrfBanking = 4, debugVrf = true))
     test(new RegisterFile(Seq(1), Seq(1), 1, 1, 4, s"vrf_rmsnorm_prefetch_${withPrefetch}_${consumeScalar}",
-      prefetchPorts = Seq((0, 0)), scalarPorts = Seq((0, 0))))
+      prefetchPorts = Seq((0, 0)), scalarPorts = Seq((0, 0)),
+      bypassPorts = if (externalBypass) Seq((0, 0)) else Seq.empty))
       .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
         val read = dut.io.read(0)(0)
         val write = dut.io.pipe_writes(0)
@@ -35,6 +36,7 @@ class EvuRmsnormPrefetchSpec extends AnyFlatSpec with ChiselScalatestTester {
           port.req.bits.lastOperand.poke(false.B)
         }
         dut.io.e0Read(0).poke(false.B)
+        dut.io.bypass.foreach(_.poke(false.B))
         prefetch.valid.poke(false.B)
         prefetch.bits.eg.poke(eg.U)
         prefetch.bits.oldest.poke(false.B)
@@ -70,6 +72,14 @@ class EvuRmsnormPrefetchSpec extends AnyFlatSpec with ChiselScalatestTester {
           read.req.ready.expect(true.B)
           read.resp.expect("h44000000".U)
           dut.clock.step()
+        }
+        if (externalBypass) {
+          dut.io.bypass(0).poke(true.B)
+          prefetch.valid.poke(true.B)
+          dut.clock.step()
+          dut.io.bypass(0).poke(false.B)
+          prefetch.valid.poke(false.B)
+          dut.io.perf.prefetches.expect(1.U)
         }
         read.req.valid.poke(false.B)
         dut.io.e0Read(0).poke(false.B)
@@ -122,6 +132,10 @@ class EvuRmsnormPrefetchSpec extends AnyFlatSpec with ChiselScalatestTester {
     it should s"read the rewritten broadcast (prefetch=$withPrefetch, E0 bypass=$consumeScalar)" in {
       checkReuse(withPrefetch, consumeScalar)
     }
+  }
+
+  it should "cancel a real VRF prefetch on external result bypass and suppress its matching hint" in {
+    checkReuse(withPrefetch = true, consumeScalar = false, externalBypass = true)
   }
 
   for (bypass <- Seq(false, true); responseState <- Seq("buffered", "returning", "pending")) {

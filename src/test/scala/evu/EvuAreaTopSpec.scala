@@ -50,4 +50,13 @@ class EvuAreaTopSpec extends AnyFlatSpec with Matchers {
     ir should not include "vmuRmwMerges"
     ir should not include "module XSTop"
   }
+
+  it should "check production forwarding and collector wiring without emitting Verilog" in {
+    implicit val p: Parameters = EvuAreaMain.parameters
+    val top = DisableMonitors { p => LazyModule(new EvuAreaTop(EvuParams(enable = true))(p)) }
+    // HW dialect lowering runs firtool's combinational-cycle check, unlike emitCHIRRTL.
+    val ir = ChiselStage.emitHWDialect(top.module,
+      firtoolOpts = Array("-O=release", "--disable-annotation-unknown", "--disable-all-randomization"))
+    ir should include ("hw.module @EvuAreaTop")
+  }
 }

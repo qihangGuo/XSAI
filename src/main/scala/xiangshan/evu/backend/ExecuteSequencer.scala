@@ -114,6 +114,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   val increments_as_mask = Reg(Bool())
   val eidx      = Reg(UInt(log2Ceil(maxVLMax).W))
   val acc_fold  = Reg(Bool())
+  val acc_direct = RegInit(false.B)
   val acc_fold_id = Reg(UInt(log2Ceil(dLenB).W))
   val parallel_acc = Reg(Bool())
   val acc_stream_slot = Reg(UInt(2.W))
@@ -129,7 +130,8 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   val acc_tree = vParams.fp32MinMaxTree.B && fp32_minmax && acc_fold
   val acc_empty = fp32_minmax && acc_fold && !minmax_input_seen
   val acc_last = acc_tree || acc_empty || acc_fold_id + 1.U === log2Ceil(dLenB).U - vd_eew || acc_copy
-  val effective_pipe_stages = Mux(acc_tree, (VectorFastPaths.minMaxTreeDepth(dLen) - 1).U, pipe_stages)
+  val effective_pipe_stages = Mux(acc_direct, VectorFastPaths.minMaxTreeDepth(dLen).U,
+    Mux(acc_tree, (VectorFastPaths.minMaxTreeDepth(dLen) - 1).U, pipe_stages))
   val uscalar  = Mux(inst.funct3(2), inst.rs1_data, inst.imm5)
   val sscalar  = Mux(inst.funct3(2), inst.rs1_data, inst.imm5_sext)
   val rgather    = inst.opif6 === OPIFunct6.rgather && usesPerm.B
@@ -154,7 +156,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
 
   val use_wmask = !inst.vm && sets_wmask
   val eidx_tail = next_eidx === eff_vl
-  val tail      = Mux(inst.reduction && usesAcc.B, acc_fold && acc_last, eidx_tail)
+  val tail      = Mux(inst.reduction && usesAcc.B, acc_direct || (acc_fold && acc_last), eidx_tail)
   io.atTail := valid && tail && !inst.reduction
 
   io.dis.ready := (!valid || (tail && io.iss.fire)) && !io.dis_stall
@@ -231,6 +233,8 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     rvm_mask      := Mux(dis_inst.renvm             , ~(0.U(egsPerVReg.W)), 0.U)
     head          := true.B
     acc_fold      := false.B
+    acc_direct    := usesAcc.B && VectorFastPaths.singleGroupMinMax(dis_inst, dLen,
+      vParams.fp32MinMaxTree && vParams.singleGroupMinMax)
     acc_fold_id   := 0.U
     parallel_acc  := dis_inst.opff6.isOneOf(OPFFunct6.fredusum, OPFFunct6.fredmin, OPFFunct6.fredmax)
     acc_stream_slot := 0.U
@@ -308,15 +312,34 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
       val forwarded = if (resultForwarding && i < 3) io.forward.get(i).available else false.B
       enabled && io.older_writes(eg) && !forwarded
     }
+  val rgatherv_e0_eidx = io.vgu.gather_eidx.bits
+  val rgather_eidx = Mux(rgather_ix, uscalar, rgatherv_e0_eidx)
+  val rgather_zero = rgather_eidx >= inst.vconfig.vtype.vlMax
   io.forward.foreach { ports =>
     val fullGroup = get_head_mask(~0.U(dLenB.W), eidx, incr_eew, dLen).andR &&
       get_tail_mask(~0.U(dLenB.W), next_eidx, incr_eew, dLen).andR
-    val eligible = valid && inst.vm && !uses_perm && !inst.writes_mask && fullGroup &&
+    val eligible = valid && inst.vm && !uses_perm && !inst.writes_mask &&
+      (fullGroup || vParams.shortResultForwarding.B) &&
       !elementwise && (!inst.reduction || !acc_fold && !acc_merge)
-    val enabled = Seq(renv1 && !inst.scalarVrfSource && !inst.reads_vs1_mask,
+    val enabled = Seq(renv1 && (!inst.scalarVrfSource || vParams.shortResultForwarding.B) && !inst.reads_vs1_mask,
       renv2 && !inst.reads_vs2_mask, renvd)
     val captured = Seq(rvs1Captured, rvs2Captured, rvdCaptured)
-    for (i <- 0 until 3) { ports(i).eligible := eligible && enabled(i) && !captured(i) }
+    def byteRange(start: UInt, count: UInt): UInt = FillInterleaved(8,
+      VecInit((0 until dLenB).map(b => b.U >= start && b.U < start +& count)).asUInt)
+    def ordinaryMask(eew: UInt): UInt = byteRange((eidx << eew)(dLenOffBits - 1, 0),
+      (next_eidx - eidx) << eew)
+    val source1 = Mux(lowPrecision && inst.funct6 >= 0x3c.U, byteRange(0.U, 1.U),
+      Mux(inst.scalarVrfSource, byteRange(0.U, 4.U), ordinaryMask(vs1_eew)))
+    val groupSlideSource = byteRange(Mux(slide_up, 0.U, slide_offset << vs2_eew),
+      Mux(slide_up, inst.vconfig.vl - slide_offset, inst.vconfig.vl) << vs2_eew)
+    val gatherSource = byteRange((rgather_eidx << vs2_eew)(dLenOffBits - 1, 0), 1.U << vs2_eew)
+    val source2 = Mux(group_slide, groupSlideSource,
+      Mux(rgather_ix, Mux(rgather_zero, 0.U, gatherSource), ordinaryMask(vs2_eew)))
+    val masks = Seq(source1, source2, ordinaryMask(vs3_eew))
+    for (i <- 0 until 3) {
+      ports(i).eligible := eligible && enabled(i) && !captured(i)
+      ports(i).mask := (if (vParams.shortResultForwarding) masks(i) else ~0.U(dLen.W))
+    }
   }
   val raw_hazard = sourceRaw.reduce(_ || _)
   io.rawDependencies := sourceRaw.zip(Seq(io.rvs1.req.bits.eg, io.rvs2.req.bits.eg,
@@ -327,9 +350,6 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   val war_hazard = inst.wvd && io.older_reads(io.iss.bits.wvd_eg)
   val data_hazard = raw_hazard || waw_hazard || war_hazard
 
-  val rgatherv_e0_eidx = io.vgu.gather_eidx.bits
-  val rgather_eidx = Mux(rgather_ix, uscalar, rgatherv_e0_eidx)
-  val rgather_zero = rgather_eidx >= inst.vconfig.vtype.vlMax
   io.rvs1.req.bits.eg := getEgId(inst.rs1, Mux(inst.scalarVrfSource, 0.U, eidx), vs1_eew, inst.reads_vs1_mask)
   io.rvs2.req.bits.eg := Mux(rgather || rgatherei16,
     getEgId(inst.rs2, rgather_eidx, vs2_eew, false.B),
@@ -535,10 +555,11 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
 
   io.iss.bits.acc       := inst.reduction && usesAcc.B
   io.iss.bits.acc_merge := acc_merge
-  io.iss.bits.acc_slot  := Mux(acc_merge || acc_fold || !parallel_acc, 0.U, acc_stream_slot)
+  io.iss.bits.acc_slot  := Mux(acc_direct || acc_merge || acc_fold || !parallel_acc, 0.U, acc_stream_slot)
   io.iss.bits.acc_copy  := acc_copy
   io.iss.bits.acc_fold  := acc_fold
   io.iss.bits.acc_tree  := acc_tree
+  io.iss.bits.acc_direct := acc_direct
   io.iss.bits.acc_empty := acc_empty
   io.iss.bits.acc_fold_id := acc_fold_id
   io.iss.bits.acc_ew      := elementwise

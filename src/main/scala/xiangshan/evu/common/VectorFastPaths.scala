@@ -21,6 +21,13 @@ object VectorFastPaths extends HasVectorConsts {
 
   def minMaxTreeDepth(datapath: Int): Int = math.max(2, log2Ceil(datapath / 32))
 
+  def singleGroupMinMax(inst: BackendIssueInst, datapath: Int, enabled: Boolean): Bool =
+    enabled.B && !inst.vmu && inst.funct3 === OPFVV && inst.reduction &&
+      inst.opff6.isOneOf(OPFFunct6.fredmin, OPFFunct6.fredmax) &&
+      inst.vm && !inst.renvm && inst.vstart === 0.U &&
+      inst.vconfig.vtype.vsew === 2.U && !inst.wide_vd && !inst.wide_vs2 &&
+      inst.vconfig.vl === (datapath / 32).U && inst.vconfig.vl <= inst.vconfig.vtype.vlMax
+
   def singleGroupSlide(inst: VectorIssueInst, datapath: Int, enabled: Boolean): Bool = {
     val offset = Mux(inst.funct3 === OPIVX, inst.rs1_data, inst.imm5)
     val elements = (datapath / 8).U >> inst.vconfig.vtype.vsew

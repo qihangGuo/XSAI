@@ -228,6 +228,10 @@ class IntegerPipe(implicit p: Parameters) extends PipelinedFunctionalUnit(2)(p) 
   )).decode(io.iss.op)
 
   val ctrl = RegEnable(iss_ctrl, io.iss.valid)
+  // ExecutionUnit registers this issue into pipe(0) on the same edge. Keep
+  // widening selection alongside ctrl so EEW comparison precedes that edge.
+  val widen_vs1 = RegEnable(io.iss.op.rvs1_eew < io.iss.op.vd_eew, io.iss.valid)
+  val widen_vs2 = RegEnable(io.iss.op.rvs2_eew < io.iss.op.vd_eew, io.iss.valid)
 
   io.stall := false.B
 
@@ -263,8 +267,8 @@ class IntegerPipe(implicit p: Parameters) extends PipelinedFunctionalUnit(2)(p) 
   })(rvs1_eew)
 
   val adder_arr = Module(new AdderArray(dLenB))
-  adder_arr.io.in1 := Mux(rvs1_eew < vd_eew, narrow_vs1, in1_bytes)
-  adder_arr.io.in2 := Mux(rvs2_eew < vd_eew, narrow_vs2, in2_bytes)
+  adder_arr.io.in1 := Mux(widen_vs1, narrow_vs1, in1_bytes)
+  adder_arr.io.in2 := Mux(widen_vs2, narrow_vs2, in2_bytes)
   adder_arr.io.incr.foreach(_ := false.B)
   adder_arr.io.avg := ctrl.bool(Averaging)
   adder_arr.io.eew := vd_eew

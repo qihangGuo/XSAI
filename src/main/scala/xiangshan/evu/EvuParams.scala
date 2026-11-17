@@ -33,12 +33,15 @@ case class EvuParams(
     fmaOrdinaryContexts: Int = 1,
     scalarInstructions: Boolean = true,
     decoupledAmuIssue: Boolean = true,
+    completionLookahead: Boolean = true,
     interleaveReductions: Boolean = true,
     fp32MinMaxTree: Boolean = true,
+    singleGroupMinMax: Boolean = true,
     alignedSlide: Boolean = true,
     singleGroupSlide: Boolean = true,
     crossInstructionPrefetch: Boolean = true,
-    extendedResultForwarding: Boolean = true
+    extendedResultForwarding: Boolean = true,
+    shortResultForwarding: Boolean = true
 ) {
   require(vlenBits > 0 && vlenBits   % 8 == 0)
   require(dlenBits > 0 && dlenBits   % 8 == 0 && vlenBits > dlenBits && vlenBits % dlenBits == 0)

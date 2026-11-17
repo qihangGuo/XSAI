@@ -89,10 +89,12 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     parallelFp32Div = p.parallelFp32Div,
     interleaveReductions = p.interleaveReductions,
     fp32MinMaxTree = p.fp32MinMaxTree,
+    singleGroupMinMax = p.singleGroupMinMax,
     alignedSlide = p.alignedSlide,
     singleGroupSlide = p.singleGroupSlide,
     crossInstructionPrefetch = p.crossInstructionPrefetch,
-    extendedResultForwarding = p.extendedResultForwarding
+    extendedResultForwarding = p.extendedResultForwarding,
+    shortResultForwarding = p.shortResultForwarding
   )
   private implicit val saturnP: Parameters = EvuVectorParameters(
     xsParameters,

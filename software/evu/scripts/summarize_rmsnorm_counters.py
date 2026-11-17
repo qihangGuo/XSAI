@@ -44,6 +44,13 @@ def summarize_counters(text):
                    ("FU:fp_xx8", "idle", "xx8_idle_with_work"),
                    ("FU:fp_mxfp", "operand", "mxfp_operand_wait"),
                    ("FU:fp_mxfp", "queue", "mxfp_queue_wait"), ("FU:fp_mxfp", "idle", "mxfp_idle_with_work"))
+    diagnostics += tuple((f"FU:{path}", field, f"{label}_{name}")
+                         for path, label in (("fp_fma", "fma"), ("fp_cmp", "cmp"))
+                         for field, name in (("issue", "issues"), ("dep", "dependency_wait"),
+                                             ("operand", "operand_wait"), ("feedback", "feedback_wait"),
+                                             ("wb", "writeback_wait"), ("fu", "fu_wait"),
+                                             ("qi", "queue_idle"), ("slot", "result_slot_wait"),
+                                             ("loadwait", "load_wait"), ("fwait", "forward_wait")))
     for sample in samples:
         key = sample["stage"], sample["schedule"], int(sample["sample"])
         if key not in expected or key in seen or int(sample["errors"]):

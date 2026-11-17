@@ -22,6 +22,7 @@ Use the server's existing `AM_HOME`, RISC-V LLVM toolchain and NEMU checkout.
 | `rvv_math_evu_test` | 15 RVV-mapped operations, m1/m2/mf2, E0, tails, flags and saturation |
 | `low_precision_evu_test` | Six low-precision operations, 88 directed cases, packing, tails, flags and guards |
 | `rmsnorm_nvfp4_evu_test` | EVU RMSNorm and full NVFP4 with final-output-only stores; 11 cases |
+| `rmsnorm_nvfp4_fused_evu_test` | Only fused NVFP4 row-major; timed FENCE snapshots and CPU-only checking ([profiling](docs/RMSNORM_FUSED_ROW_MAJOR_PROFILE.md)) |
 
 `Makefile` defaults to `vector_add_evu_test`. The old fused FlashAttention and
 `quanti8mma_evu_example` programs are retired; their binaries cannot run on the

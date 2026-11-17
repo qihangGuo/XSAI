@@ -39,7 +39,7 @@ def integer(expression):
     return evaluate(ast.parse(expression, mode='eval').body)
 
 
-def instruction_trace(rename=1, banked=1):
+def instruction_trace(rename=1, banked=1, direct_first=False):
     compiler = shutil.which('clang') or shutil.which('cc')
     if not compiler:
         raise unittest.SkipTest('a C preprocessor is required; no binary is built')
@@ -48,6 +48,9 @@ def instruction_trace(rename=1, banked=1):
              'XV_FMAX', 'XV_BINARY', 'XV_CVT_E4M3_F32', 'XV_CVT_F32_E4M3',
              'XV_CVT_MXFP4_F32', 'XV_STORE')
     source = '\n'.join(f'#define {name}(...) TRACE({name}, __VA_ARGS__)' for name in names)
+    if direct_first:
+        fused = Path(__file__).resolve().parents[1] / 'rmsnorm_nvfp4_fused_evu_test.c'
+        source += '\n' + fused.read_text().split('#define EVU_RMS_KERNELS_ONLY', 1)[0]
     source += '\n#include "rmsnorm_nvfp4_batch.h"\nRN_QUANT_INITIALIZE(); RN_QUANT_BATCHES();\n'
     include = Path(__file__).resolve().parents[1] / 'include'
     text = subprocess.run([compiler, '-E', '-P', '-x', 'c', '-I' + str(include),
@@ -242,6 +245,31 @@ class RmsnormBatchScheduleTest(unittest.TestCase):
                 self.assertEqual(sum(length for _, _, length in machine.stores), 1152)
                 self.assertEqual(len(machine.written['packed']), 1024)
                 self.assertEqual(len(machine.written['scales']), 128)
+
+    def test_fused_direct_first_matches_reference_with_poisoned_tails(self):
+        generator = random.Random(1612)
+        patterns = [[-0.0] * 2048,
+                    [fp32(generator.uniform(-9, 9)) for _ in range(2048)],
+                    [fp32((index % 16 - 7.5) * 2 ** ((index // 16) % 48 - 24))
+                     for index in range(2048)]]
+        patterns[1][:16] = [-0.0] * 16
+        patterns[1][16:32] = [floating(1)] * 16
+        for banked, rename in ((1, 1), (1, 0), (0, 1), (0, 0)):
+            trace = instruction_trace(rename, banked, direct_first=True)
+            self.assertEqual(len(trace), 1504)
+            for pattern, values in enumerate(patterns):
+                for alpha in (fp32(1 / 448), 1.0):
+                    with self.subTest(banked=banked, rename=rename, pattern=pattern, alpha=alpha):
+                        machine = BatchMachine(values, alpha)
+                        for register in machine.registers[16:]:
+                            register[:] = bytes(generator.getrandbits(8) for _ in register)
+                        for instruction in trace:
+                            machine.execute(*instruction)
+                        packed, scales = scalar_quantize(values, alpha)
+                        self.assertEqual(machine.output['packed'], packed)
+                        self.assertEqual(machine.output['scales'], scales)
+                        self.assertEqual(machine.divisions, [16] * 24)
+                        self.assertEqual(len(machine.stores), 18)
 
     def test_quantization_uses_one_fixed_configuration(self):
         configurations = [tuple(map(integer, arguments)) for operation, *arguments in self.trace

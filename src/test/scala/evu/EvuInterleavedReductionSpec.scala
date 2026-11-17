@@ -21,7 +21,8 @@ import xiangshan.evu.exu._
 /** Exercise production sequencers/FMA without elaborating unrelated backend FUs.
   * Source responses are a test fixture, not a replacement VRF implementation.
   */
-class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean = false)(implicit p: Parameters)
+class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean = false,
+    controlled: Boolean = false)(implicit p: Parameters)
     extends CoreModule with HasVectorParams {
   val io = IO(new Bundle {
     val command = Vec(2, Flipped(Decoupled(new BackendIssueInst)))
@@ -35,14 +36,25 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
     val source = Input(Vec(2, UInt(dLen.W)))
     val seed = Input(Vec(2, UInt(32.W)))
     val mask = Input(Vec(2, UInt(dLen.W)))
+    val seedReady = Input(Vec(2, Bool()))
+    val olderReads = Input(Vec(2, UInt(egsTotal.W)))
+    val olderWrites = Input(Vec(2, UInt(egsTotal.W)))
+    val issueReady = Input(Bool())
+    val writeReady = Input(Bool())
+    val issues = Output(Vec(2, UInt(32.W)))
+    val directs = Output(Vec(2, UInt(32.W)))
+    val returns = Output(Vec(2, UInt(32.W)))
+    val ownerBusy = Output(Vec(2, Bool()))
   })
   val factory: FunctionalUnitFactory = if (maximum) FPCmpFactory else SIMDFPFMAFactory(4, true)
   val insns = VXSequencerParams("fp_fma", Seq(factory)).insns
-  val execute = Seq.fill(2)(Module(new ExecuteSequencer(insns, 4, 1, reductionOnly = true)))
-  val accumulators = (0 until 2).map(i => Module(new SpecialSequencer(insns, i, 2, true)))
-  val arb = Module(new SharedExecutionArbiter(2, 4, 1, prioritizeCritical = true))
   val fu = Module(new ExecutionUnit(Seq(factory), "shared_reduction_test"))
-  fu.io.iss <> arb.io.out
+  val execute = Seq.fill(2)(Module(new ExecuteSequencer(insns, fu.maxPipeDepth, 1, reductionOnly = true)))
+  val accumulators = (0 until 2).map(i => Module(new SpecialSequencer(insns, i, 2, true)))
+  val arb = Module(new SharedExecutionArbiter(2, fu.maxPipeDepth, 1, prioritizeCritical = true))
+  fu.io.iss.valid := arb.io.out.valid && (if (controlled) io.issueReady else true.B)
+  fu.io.iss.bits := arb.io.out.bits
+  arb.io.out.ready := fu.io.iss.ready && (if (controlled) io.issueReady else true.B)
   fu.io.iter_write.ready := true.B
   fu.io.scalar_write.ready := true.B
   fu.io.shared_fp_req.ready := true.B
@@ -59,7 +71,20 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
   io.merges := merges
   val folds = RegInit(VecInit.fill(2)(0.U(32.W)))
   io.folds := folds
+  val issues = RegInit(VecInit.fill(2)(0.U(32.W)))
+  val directs = RegInit(VecInit.fill(2)(0.U(32.W)))
+  val returns = RegInit(VecInit.fill(2)(0.U(32.W)))
+  io.issues := issues
+  io.directs := directs
+  io.returns := returns
   for (context <- 0 until 2) {
+    when(fu.io.iss.fire && fu.io.iss.bits.vat === (context + 1).U) {
+      issues(context) := issues(context) + 1.U
+      when(fu.io.iss.bits.acc_direct) { directs(context) := directs(context) + 1.U }
+    }
+    when(fu.io.acc_write.valid && fu.io.accWriteVat === (context + 1).U) {
+      returns(context) := returns(context) + 1.U
+    }
     when(fu.io.iss.fire && fu.io.iss.bits.acc_merge && fu.io.iss.bits.vat === (context + 1).U) {
       merges(context) := merges(context) + 1.U
     }
@@ -78,12 +103,33 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
     io.command(i).ready := seq.io.dis.ready && acc.io.dis.ready
     seq.io.dis.valid := io.command(i).valid && acc.io.dis.ready
     acc.io.dis.valid := io.command(i).valid && seq.io.dis.ready
-    seq.io.dis.bits := io.command(i).bits
-    acc.io.dis.bits := io.command(i).bits
+    val dispatched = WireInit(io.command(i).bits)
+    if (maximum) {
+      // This fixture exercises only FP32 min/max. Constant decode fields let
+      // Treadle prune unrelated FP16, mask-comparison and permutation logic.
+      val bits = io.command(i).bits.bits
+      dispatched.bits := Cat(Mux(io.command(i).bits.opff6 === OPFFunct6.fredmin,
+        OPFFunct6.fredmin.asUInt, OPFFunct6.fredmax.asUInt), bits(25, 15), OPFVV, bits(11, 0))
+      dispatched.vconfig.vtype.vsew := 2.U
+      dispatched.reduction := true.B
+      dispatched.scalar_to_vd0 := false.B
+      dispatched.wide_vd := false.B
+      dispatched.wide_vs2 := false.B
+      dispatched.writes_mask := false.B
+      dispatched.reads_vs1_mask := false.B
+      dispatched.reads_vs2_mask := false.B
+      dispatched.renv1 := false.B
+      dispatched.renv2 := true.B
+      dispatched.renvd := false.B
+      dispatched.renvm := !io.command(i).bits.vm
+      dispatched.wvd := true.B
+    }
+    seq.io.dis.bits := dispatched
+    acc.io.dis.bits := dispatched
     seq.io.dis_stall := false.B
     acc.io.dis_stall := false.B
-    seq.io.older_reads := 0.U
-    seq.io.older_writes := 0.U
+    seq.io.older_reads := (if (controlled) io.olderReads(i) else 0.U)
+    seq.io.older_writes := (if (controlled) io.olderWrites(i) else 0.U)
     acc.io.older_reads := 0.U
     acc.io.older_writes := 0.U
     seq.io.vat_head := 0.U
@@ -98,7 +144,7 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
         if (port == 3) io.mask(i) else io.source(i)
       } else Fill(dLen / 32, (if (i == 0) 0x3f800000L else 0x40000000L).U(32.W)))
     }
-    acc.io.rvs2.ready := io.sourceReady(i)
+    acc.io.rvs2.ready := (if (controlled) io.seedReady(i) else io.sourceReady(i))
     acc.io.rvm.ready := io.sourceReady(i)
     acc.io.acc_init_resp := (if (operandInputs) io.seed(i) else 0.U)
     acc.io.rvm_resp := 0.U
@@ -114,7 +160,8 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
     acc.io.acc_fu_resp.valid := fu.io.acc_write.valid && fu.io.accWriteVat === acc.io.vat
     acc.io.acc_fu_resp.bits := fu.io.acc_write.bits
     acc.io.acc_fu_resp_slot := fu.io.acc_write_slot
-    seq.io.pipe_write_req.available := arb.io.available(i)
+    seq.io.pipe_write_req.available := arb.io.available(i) && (if (controlled) io.writeReady else true.B)
+    io.ownerBusy(i) := acc.io.busy
     val candidate = arb.io.in(i)
     candidate.valid := seq.io.iss.valid
     seq.io.iss.ready := candidate.ready
@@ -129,7 +176,11 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
     candidate.bits.wmask := seq.io.iss.bits.eidx_mask & Mux(seq.io.iss.bits.vm, Fill(dLenB, 1.U(1.W)), vm)
     candidate.bits.rmask := Fill(dLenB, 1.U(1.W))
     candidate.bits.rvs1_eew := seq.io.iss.bits.vd_eew
-    when(seq.io.iss.bits.acc_merge) {
+    when(seq.io.iss.bits.acc_direct) {
+      candidate.bits.wmask := 15.U
+      candidate.bits.rvs1_data := acc.io.acc_data.bits(31, 0)
+      candidate.bits.rvs1_elem := acc.io.acc_data.bits(31, 0)
+    }.elsewhen(seq.io.iss.bits.acc_merge) {
       candidate.bits.wmask := Fill(dLenB, 1.U(1.W))
       candidate.bits.rvs2_data := acc.io.acc_other_data
       candidate.bits.rvs2_elem := acc.io.acc_other_data
@@ -153,7 +204,8 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
   }
 }
 
-class EvuSharedReductionShell(val maximum: Boolean = false, val operandInputs: Boolean = false)(implicit p: Parameters)
+class EvuSharedReductionShell(val maximum: Boolean = false, val operandInputs: Boolean = false,
+    val controlled: Boolean = false)(implicit p: Parameters)
     extends LazyModule {
   val client = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1("shared-fma-test")))))
   val sink = TLManagerNode(Seq(TLSlavePortParameters.v1(Seq(TLSlaveParameters.v1(
@@ -164,7 +216,7 @@ class EvuSharedReductionShell(val maximum: Boolean = false, val operandInputs: B
 
 class EvuSharedReductionShellImp(outer: EvuSharedReductionShell)(implicit p: Parameters)
     extends LazyModuleImp(outer) {
-  val harness = Module(new EvuSharedReductionHarness(outer.maximum, outer.operandInputs)(p.alterPartial {
+  val harness = Module(new EvuSharedReductionHarness(outer.maximum, outer.operandInputs, outer.controlled)(p.alterPartial {
     case TileVisibilityNodeKey => outer.client
   }))
   val io = IO(chiselTypeOf(harness.io))

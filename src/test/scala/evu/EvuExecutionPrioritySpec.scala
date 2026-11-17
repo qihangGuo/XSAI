@@ -97,37 +97,40 @@ class EvuExecutionPrioritySpec extends AnyFlatSpec with ChiselScalatestTester {
       }
   }
 
-  it should "keep future result slots protected even for a critical candidate" in {
+  it should "keep five-cycle result slots protected for fold and direct critical candidates" in {
     implicit val p: Parameters = parameters
-    test(new SharedExecutionArbiter(2, 4, 1, prioritizeCritical = true))
-      .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
-        for (i <- 0 until 2) {
-          clear(dut.io.in(i).bits)
-          dut.io.in(i).bits.vat.poke(i.U)
-          dut.io.in(i).bits.funct3.poke(1.U)
-          dut.io.in(i).valid.poke((i == 0).B)
-        }
-        dut.io.out.ready.poke(true.B)
-        dut.io.in(0).bits.pipe_depth.poke(3.U)
-        dut.io.out.bits.vat.expect(0.U)
-        dut.clock.step()
-        dut.io.in(0).bits.pipe_depth.poke(0.U)
-        dut.io.in(1).valid.poke(true.B)
-        dut.io.in(1).bits.acc.poke(true.B)
-        dut.io.in(1).bits.acc_fold.poke(true.B)
-        for (depth <- Seq(2, 1)) {
-          dut.io.in(1).bits.pipe_depth.poke(depth.U)
-          dut.io.available(1).expect(false.B)
-          dut.io.in(1).ready.expect(false.B)
+    for (direct <- Seq(false, true)) {
+      test(new SharedExecutionArbiter(2, 5, 1, prioritizeCritical = true))
+        .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+          for (i <- 0 until 2) {
+            clear(dut.io.in(i).bits)
+            dut.io.in(i).bits.vat.poke(i.U)
+            dut.io.in(i).bits.funct3.poke(1.U)
+            dut.io.in(i).valid.poke((i == 0).B)
+          }
+          dut.io.out.ready.poke(true.B)
+          dut.io.in(0).bits.pipe_depth.poke(4.U)
           dut.io.out.bits.vat.expect(0.U)
           dut.clock.step()
+          dut.io.in(0).bits.pipe_depth.poke(0.U)
+          dut.io.in(1).valid.poke(true.B)
+          dut.io.in(1).bits.acc.poke(true.B)
+          dut.io.in(1).bits.acc_fold.poke((!direct).B)
+          dut.io.in(1).bits.acc_direct.poke(direct.B)
+          for (depth <- Seq(3, 2, 1)) {
+            dut.io.in(1).bits.pipe_depth.poke(depth.U)
+            dut.io.available(1).expect(false.B)
+            dut.io.in(1).ready.expect(false.B)
+            dut.io.out.bits.vat.expect(0.U)
+            dut.clock.step()
+          }
+          dut.io.in(1).bits.pipe_depth.poke(0.U)
+          dut.io.out.valid.expect(false.B)
+          dut.clock.step()
+          dut.io.available(1).expect(true.B)
+          dut.io.out.bits.vat.expect(1.U)
+          dut.io.priorityIssue.expect(true.B)
         }
-        dut.io.in(1).bits.pipe_depth.poke(0.U)
-        dut.io.out.valid.expect(false.B)
-        dut.clock.step()
-        dut.io.available(1).expect(true.B)
-        dut.io.out.bits.vat.expect(1.U)
-        dut.io.priorityIssue.expect(true.B)
-      }
+    }
   }
 }

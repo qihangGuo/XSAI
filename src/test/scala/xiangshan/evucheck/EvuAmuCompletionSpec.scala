@@ -249,156 +249,244 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
     }
   }
 
-  it should "consume arithmetic and fence completions once across dequeue bubbles and redirects" in {
+  for (lookahead <- Seq(false, true)) {
+    it should s"consume arithmetic and fence completions once with lookahead=$lookahead" in {
+      val (base, _, _) = ArgParser.parse(Array("--config", "DefaultExternalVectorMatrixConfig",
+        "--disable-perf", "--disable-alwaysdb"))
+      implicit val p: Parameters = base.alterPartial {
+        case XSCoreParamsKey => base(XSTileKey).head.copy(RobSize = 32)
+        case ExternalVectorKey => base(ExternalVectorKey).copy(completionLookahead = lookahead)
+      }
+      test(new EvuAmuCompletionHarness).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+        val arithmeticPc = BigInt("80001100", 16)
+        val fencePc = BigInt("8000113a", 16)
+        val arithmeticInstr = BigInt("6855a68b", 16)
+        val fenceInstr = BigInt("3400000b", 16)
+        def completion(pc: BigInt, opcode: Int, flags: Int, fault: Boolean = false): Unit = {
+          val c = dut.io.completion.bits
+          c.pc.poke(pc.U)
+          c.tval.poke(0.U)
+          c.tvalValid.poke(false.B)
+          c.opcode.poke(opcode.U)
+          c.vd.poke(0.U)
+          c.exception.poke(fault.B)
+          c.fflags.poke(flags.U)
+          c.vxsat.poke(false.B)
+          c.dirtyVs.poke((opcode == 0x34 && !fault).B)
+          c.cause.poke((if (fault) 6 else 0).U)
+          c.jobId.poke((if (opcode == 0x34) 0 else 1).U)
+          c.epoch.poke(0.U)
+        }
+        def reset(): Unit = {
+          dut.io.index.poke(0.U)
+          dut.io.enqueue.poke(false.B)
+          dut.io.writeback.poke(false.B)
+          dut.io.commit.poke(false.B)
+          dut.io.needAmu.poke(true.B)
+          dut.io.pc.poke(0.U)
+          dut.io.instr.poke(0.U)
+          dut.io.issueReady.poke(false.B)
+          dut.io.redirect.poke(false.B)
+          dut.io.completion.valid.poke(false.B)
+          completion(arithmeticPc, 0x34, 1)
+          dut.reset.poke(true.B)
+          dut.clock.step(2)
+          dut.reset.poke(false.B)
+        }
+        def prepare(index: Int, pc: BigInt, instr: BigInt, needAmu: Boolean = true): Unit = {
+          dut.io.index.poke(index.U)
+          dut.io.pc.poke(pc.U)
+          dut.io.instr.poke(instr.U)
+          dut.io.needAmu.poke(needAmu.B)
+          dut.io.enqueue.poke(true.B)
+          dut.clock.step()
+          dut.io.enqueue.poke(false.B)
+          if (needAmu) {
+            dut.io.writeback.poke(true.B)
+            dut.clock.step()
+            dut.io.writeback.poke(false.B)
+          }
+          dut.io.commit.poke(true.B)
+          dut.clock.step()
+          dut.io.commit.poke(false.B)
+        }
+        def expectStatus(pc: BigInt, opcode: Int, flags: Int, fault: Boolean = false): Unit = {
+          dut.io.status.valid.expect(true.B)
+          dut.io.status.bits.pc.expect(pc.U)
+          dut.io.status.bits.opcode.expect(opcode.U)
+          dut.io.status.bits.fflags.expect(flags.U)
+          dut.io.status.bits.exception.expect(fault.B)
+          dut.io.status.bits.cause.expect((if (fault) 6 else 0).U)
+        }
+        for ((scalarGap, fault) <- Seq((false, false), (true, false), (false, true))) {
+          reset()
+          prepare(0, arithmeticPc, arithmeticInstr)
+          if (scalarGap) prepare(1, 0, 0, needAmu = false)
+          prepare(if (scalarGap) 2 else 1, fencePc, fenceInstr)
+          completion(arithmeticPc, 0x34, 1, fault)
+          // An offered completion cannot bypass command acceptance.
+          dut.io.completion.valid.poke(true.B)
+          dut.io.completion.ready.expect(false.B)
+          dut.clock.step(2)
+          dut.io.status.valid.expect(false.B)
+          dut.io.completion.valid.poke(false.B)
+          dut.io.issueReady.poke(true.B)
+          for ((pc, instr) <- Seq((arithmeticPc, arithmeticInstr), (fencePc, fenceInstr))) {
+            dut.io.issued.valid.expect(true.B)
+            dut.io.issued.bits.pc.expect(pc.U)
+            dut.io.issued.bits.instr.expect(instr.U)
+            dut.clock.step()
+          }
+          dut.io.issued.valid.expect(false.B)
+          dut.io.completion.ready.expect(true.B)
+          dut.io.completion.valid.poke(true.B)
+          dut.clock.step() // Arithmetic completes before its AMU entry is dequeued.
+          expectStatus(arithmeticPc, 0x34, 1, fault)
+          // Keep valid asserted: FENCE is ready immediately behind arithmetic.
+          completion(fencePc, 0x1a, 0)
+          if (!lookahead) {
+            dut.io.completion.ready.expect(false.B)
+            dut.clock.step()
+            dut.io.status.valid.expect(false.B)
+          }
+          dut.io.completion.ready.expect(true.B)
+          dut.clock.step()
+          expectStatus(fencePc, 0x1a, 0)
+          dut.io.completion.valid.poke(false.B)
+          dut.io.completion.ready.expect(false.B)
+          dut.clock.step()
+          for (_ <- 0 until 5) {
+            dut.io.status.valid.expect(false.B)
+            dut.io.completion.ready.expect(false.B)
+            dut.clock.step()
+          }
+          dut.io.busy.expect(false.B)
+        }
+        reset()
+        prepare(0, arithmeticPc, arithmeticInstr)
+        dut.io.busy.expect(true.B)
+        dut.io.preflightBusy.expect(false.B)
+        dut.io.issueReady.poke(true.B)
+        dut.io.issued.valid.expect(true.B)
+        dut.clock.step()
+        dut.io.completion.valid.poke(true.B)
+        dut.io.completion.ready.expect(true.B)
+        dut.io.redirect.poke(true.B)
+        dut.io.completion.ready.expect(false.B)
+        dut.clock.step()
+        dut.io.redirect.poke(false.B)
+        for (_ <- 0 until 5) {
+          dut.io.completion.ready.expect(false.B)
+          dut.io.status.valid.expect(false.B)
+          dut.clock.step()
+        }
+        dut.io.completion.valid.poke(false.B)
+        dut.io.busy.expect(false.B)
+        dut.io.preflightBusy.expect(false.B)
+        // A completed ordinary instruction still blocks preflight while its
+        // status propagates; only control blocks ordinary memory preflight.
+        for (f7 <- Seq(1, 0x10, 0x11, 0x1a, 0x45, 0x46)) {
+          reset()
+          prepare(0, arithmeticPc, (BigInt(f7) << 25) | 0xb)
+          dut.io.busy.expect(true.B)
+          dut.io.preflightBusy.expect((!Seq(1, 0x10, 0x11).contains(f7)).B)
+          dut.io.issueReady.poke(true.B)
+          dut.clock.step()
+          completion(arithmeticPc, 1, 0)
+          dut.io.completion.valid.poke(true.B)
+          dut.io.completion.ready.expect(true.B)
+          dut.clock.step()
+          dut.io.completion.valid.poke(false.B)
+          dut.io.preflightBusy.expect(true.B)
+          dut.clock.step(3)
+          dut.io.preflightBusy.expect(true.B)
+          dut.clock.step(2)
+          dut.io.preflightBusy.expect(false.B)
+          dut.io.busy.expect(false.B)
+        }
+      }
+    }
+  }
+
+  it should "accept consecutive completions across scalar gaps, input bubbles and pointer wrap" in {
     val (base, _, _) = ArgParser.parse(Array("--config", "DefaultExternalVectorMatrixConfig",
       "--disable-perf", "--disable-alwaysdb"))
     implicit val p: Parameters = base.alterPartial {
       case XSCoreParamsKey => base(XSTileKey).head.copy(RobSize = 32)
     }
     test(new EvuAmuCompletionHarness).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
-      val arithmeticPc = BigInt("80001100", 16)
-      val fencePc = BigInt("8000113a", 16)
-      val arithmeticInstr = BigInt("6855a68b", 16)
-      val fenceInstr = BigInt("3400000b", 16)
-      def completion(pc: BigInt, opcode: Int, flags: Int, fault: Boolean = false): Unit = {
-        val c = dut.io.completion.bits
-        c.pc.poke(pc.U)
-        c.tval.poke(0.U)
-        c.tvalValid.poke(false.B)
-        c.opcode.poke(opcode.U)
-        c.vd.poke(0.U)
-        c.exception.poke(fault.B)
-        c.fflags.poke(flags.U)
-        c.vxsat.poke(false.B)
-        c.dirtyVs.poke((opcode == 0x34 && !fault).B)
-        c.cause.poke((if (fault) 6 else 0).U)
-        c.jobId.poke((if (opcode == 0x34) 0 else 1).U)
-        c.epoch.poke(0.U)
-      }
-      def reset(): Unit = {
-        dut.io.index.poke(0.U)
-        dut.io.enqueue.poke(false.B)
-        dut.io.writeback.poke(false.B)
-        dut.io.commit.poke(false.B)
-        dut.io.needAmu.poke(true.B)
-        dut.io.pc.poke(0.U)
-        dut.io.instr.poke(0.U)
-        dut.io.issueReady.poke(false.B)
-        dut.io.redirect.poke(false.B)
-        dut.io.completion.valid.poke(false.B)
-        completion(arithmeticPc, 0x34, 1)
-        dut.reset.poke(true.B)
-        dut.clock.step(2)
-        dut.reset.poke(false.B)
-      }
-      def prepare(index: Int, pc: BigInt, instr: BigInt, needAmu: Boolean = true): Unit = {
-        dut.io.index.poke(index.U)
-        dut.io.pc.poke(pc.U)
-        dut.io.instr.poke(instr.U)
-        dut.io.needAmu.poke(needAmu.B)
-        dut.io.enqueue.poke(true.B)
-        dut.clock.step()
-        dut.io.enqueue.poke(false.B)
-        if (needAmu) {
-          dut.io.writeback.poke(true.B)
-          dut.clock.step()
-          dut.io.writeback.poke(false.B)
-        }
-        dut.io.commit.poke(true.B)
-        dut.clock.step()
-        dut.io.commit.poke(false.B)
-      }
-      def expectStatus(pc: BigInt, opcode: Int, flags: Int, fault: Boolean = false): Unit = {
-        dut.io.status.valid.expect(true.B)
-        dut.io.status.bits.pc.expect(pc.U)
-        dut.io.status.bits.opcode.expect(opcode.U)
-        dut.io.status.bits.fflags.expect(flags.U)
-        dut.io.status.bits.exception.expect(fault.B)
-        dut.io.status.bits.cause.expect((if (fault) 6 else 0).U)
-      }
-      for ((scalarGap, fault) <- Seq((false, false), (true, false), (false, true))) {
-        reset()
-        prepare(0, arithmeticPc, arithmeticInstr)
-        if (scalarGap) prepare(1, 0, 0, needAmu = false)
-        prepare(if (scalarGap) 2 else 1, fencePc, fenceInstr)
-        completion(arithmeticPc, 0x34, 1, fault)
-        // An offered completion cannot bypass command acceptance.
-        dut.io.completion.valid.poke(true.B)
-        dut.io.completion.ready.expect(false.B)
-        dut.clock.step(2)
-        dut.io.status.valid.expect(false.B)
-        dut.io.completion.valid.poke(false.B)
-        dut.io.issueReady.poke(true.B)
-        for ((pc, instr) <- Seq((arithmeticPc, arithmeticInstr), (fencePc, fenceInstr))) {
-          dut.io.issued.valid.expect(true.B)
-          dut.io.issued.bits.pc.expect(pc.U)
-          dut.io.issued.bits.instr.expect(instr.U)
-          dut.clock.step()
-        }
-        dut.io.issued.valid.expect(false.B)
-        dut.io.completion.ready.expect(true.B)
-        dut.io.completion.valid.poke(true.B)
-        dut.clock.step() // Arithmetic completes before its AMU entry is dequeued.
-        expectStatus(arithmeticPc, 0x34, 1, fault)
-        // Keep valid asserted: FENCE is ready immediately behind arithmetic.
-        completion(fencePc, 0x1a, 0)
-        dut.io.completion.ready.expect(false.B)
-        dut.clock.step() // Dequeue the completed arithmetic (and any scalar gap).
-        dut.io.status.valid.expect(false.B)
-        dut.io.completion.ready.expect(true.B)
-        dut.clock.step()
-        expectStatus(fencePc, 0x1a, 0)
-        dut.io.completion.valid.poke(false.B)
-        dut.io.completion.ready.expect(false.B)
-        dut.clock.step()
-        for (_ <- 0 until 5) {
-          dut.io.status.valid.expect(false.B)
-          dut.io.completion.ready.expect(false.B)
-          dut.clock.step()
-        }
-        dut.io.busy.expect(false.B)
-      }
-      reset()
-      prepare(0, arithmeticPc, arithmeticInstr)
-      dut.io.busy.expect(true.B)
-      dut.io.preflightBusy.expect(false.B)
+      dut.io.enqueue.poke(false.B)
+      dut.io.writeback.poke(false.B)
+      dut.io.commit.poke(false.B)
+      dut.io.index.poke(0.U)
+      dut.io.needAmu.poke(true.B)
+      dut.io.pc.poke(0.U)
+      dut.io.instr.poke(0.U)
       dut.io.issueReady.poke(true.B)
-      dut.io.issued.valid.expect(true.B)
-      dut.clock.step()
-      dut.io.completion.valid.poke(true.B)
-      dut.io.completion.ready.expect(true.B)
-      dut.io.redirect.poke(true.B)
-      dut.io.completion.ready.expect(false.B)
-      dut.clock.step()
       dut.io.redirect.poke(false.B)
-      for (_ <- 0 until 5) {
-        dut.io.completion.ready.expect(false.B)
-        dut.io.status.valid.expect(false.B)
-        dut.clock.step()
-      }
       dut.io.completion.valid.poke(false.B)
-      dut.io.busy.expect(false.B)
-      dut.io.preflightBusy.expect(false.B)
-      // A completed ordinary instruction still blocks preflight while its
-      // status propagates; only control blocks ordinary memory preflight.
-      for (f7 <- Seq(1, 0x10, 0x11, 0x1a, 0x45, 0x46)) {
-        reset()
-        prepare(0, arithmeticPc, (BigInt(f7) << 25) | 0xb)
-        dut.io.busy.expect(true.B)
-        dut.io.preflightBusy.expect((!Seq(1, 0x10, 0x11).contains(f7)).B)
-        dut.io.issueReady.poke(true.B)
-        dut.clock.step()
-        completion(arithmeticPc, 1, 0)
-        dut.io.completion.valid.poke(true.B)
-        dut.io.completion.ready.expect(true.B)
-        dut.clock.step()
+      def clear(x: Data): Unit = x match {
+        case b: Bool => b.poke(false.B)
+        case u: UInt => u.poke(0.U)
+        case v: Vec[_] => v.foreach(clear)
+        case b: Bundle => b.elements.values.foreach(clear)
+      }
+      clear(dut.io.completion.bits)
+      for (round <- 0 until 4) {
+        val entries = (round * 20 until (round + 1) * 20)
+        val commands = entries.filter(_ % 5 != 2)
+        for (number <- entries) {
+          val needAmu = commands.contains(number)
+          dut.io.index.poke((number % 32).U)
+          dut.io.pc.poke((0x80006000L + number * 4).U)
+          dut.io.instr.poke(((BigInt(0x32) << 25) | 0xb).U)
+          dut.io.needAmu.poke(needAmu.B)
+          dut.io.enqueue.poke(true.B)
+          dut.clock.step()
+          dut.io.enqueue.poke(false.B)
+          if (needAmu) {
+            dut.io.writeback.poke(true.B)
+            dut.clock.step()
+            dut.io.writeback.poke(false.B)
+          }
+          dut.io.commit.poke(true.B)
+          dut.clock.step()
+          dut.io.commit.poke(false.B)
+        }
+        dut.clock.step(4)
+        dut.io.issued.valid.expect(false.B)
+        for ((number, position) <- commands.zipWithIndex) {
+          if (position == 7) {
+            dut.io.completion.valid.poke(false.B)
+            dut.clock.step(3)
+            dut.io.status.valid.expect(false.B)
+          }
+          val c = dut.io.completion.bits
+          c.pc.poke((0x80006000L + number * 4).U)
+          c.opcode.poke(0x32.U)
+          c.jobId.poke((position % 16).U)
+          c.fflags.poke((position % 32).U)
+          c.vxsat.poke((position % 2 == 1).B)
+          c.exception.poke((position == 9).B)
+          c.cause.poke((if (position == 9) 6 else 0).U)
+          c.dirtyVs.poke((position != 9).B)
+          dut.io.completion.valid.poke(true.B)
+          dut.io.completion.ready.expect(true.B)
+          dut.clock.step()
+          dut.io.status.valid.expect(true.B)
+          dut.io.status.bits.pc.expect((0x80006000L + number * 4).U)
+          dut.io.status.bits.fflags.expect((position % 32).U)
+          dut.io.status.bits.vxsat.expect((position % 2 == 1).B)
+          dut.io.status.bits.exception.expect((position == 9).B)
+          dut.io.status.bits.cause.expect((if (position == 9) 6 else 0).U)
+          dut.io.committedBusy.expect(true.B)
+        }
         dut.io.completion.valid.poke(false.B)
-        dut.io.preflightBusy.expect(true.B)
-        dut.clock.step(3)
-        dut.io.preflightBusy.expect(true.B)
-        dut.clock.step(2)
-        dut.io.preflightBusy.expect(false.B)
+        dut.io.completion.ready.expect(false.B)
+        dut.clock.step(6)
+        dut.io.status.valid.expect(false.B)
         dut.io.busy.expect(false.B)
+        dut.io.preflightBusy.expect(false.B)
       }
     }
   }

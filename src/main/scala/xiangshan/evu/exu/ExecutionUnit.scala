@@ -100,24 +100,35 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
   if (pipe_fus.size > 0) {
     val pipe_valids    = Seq.fill(maxPipeDepth)(RegInit(false.B))
     val pipe_bits      = Seq.fill(maxPipeDepth)(Reg(new ExecuteMicroOpWithData(nFUs)))
+    // Decode controls on the same edge as pipe_bits, without adding a stage.
+    // Clear every bubble so invalid FU inputs keep their original zero values.
+    val pipe_fu_live   = Seq.fill(maxPipeDepth)(RegInit(0.U(nFUs.W)))
+    val pipe_fu_write  = Seq.fill(maxPipeDepth)(RegInit(0.U(nFUs.W)))
 
     val pipe_iss = io.iss.fire && pipe_fus.map(t => io.iss.bits.fu_sel(t._2)).orR
     pipe_valids.head := pipe_iss
+    pipe_fu_live.head := Mux(pipe_iss, io.iss.bits.fu_sel, 0.U)
+    pipe_fu_write.head := Mux(pipe_iss && io.iss.bits.pipe_depth === 0.U,
+      io.iss.bits.fu_sel, 0.U)
     when (pipe_iss) {
       pipe_bits.head      := io.iss.bits
     }
 
     for (i <- 1 until maxPipeDepth) {
       val fire = pipe_valids(i-1)
-      pipe_valids(i) := fire && pipe_bits(i-1).pipe_depth =/= (i-1).U
+      val advance = fire && pipe_bits(i-1).pipe_depth =/= (i-1).U
+      pipe_valids(i) := advance
+      pipe_fu_live(i) := Mux(advance, pipe_bits(i-1).fu_sel, 0.U)
+      pipe_fu_write(i) := Mux(advance && pipe_bits(i-1).pipe_depth === i.U,
+        pipe_bits(i-1).fu_sel, 0.U)
       when (fire) {
         pipe_bits(i)      := pipe_bits(i-1)
       }
     }
     for ((fu, j) <- pipe_fus) {
       for (i <- 0 until fu.depth) {
-        fu.io.pipe(i).valid := pipe_valids(i) && pipe_bits(i).fu_sel(j)
-        fu.io.pipe(i).bits  := Mux(pipe_valids(i) && pipe_bits(i).fu_sel(j),
+        fu.io.pipe(i).valid := pipe_fu_live(i)(j)
+        fu.io.pipe(i).bits  := Mux(pipe_fu_live(i)(j),
           pipe_bits(i), 0.U.asTypeOf(new ExecuteMicroOpWithData(nFUs)))
       }
     }
@@ -127,7 +138,11 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
       v && b.pipe_depth === i.U
     }
     // Selects which of all FUs has the write
-    val write_fu_sel = pipe_fus.map { case (_, j) => Mux1H(write_pipe_sel, pipe_bits.map(_.fu_sel))(j) }
+    val write_fu_sel = pipe_fus.map { case (_, j) => pipe_fu_write.map(_(j)).orR }
+    for (i <- 0 until maxPipeDepth) {
+      assert(pipe_fu_live(i) === Mux(pipe_valids(i), pipe_bits(i).fu_sel, 0.U))
+      assert(pipe_fu_write(i) === Mux(write_pipe_sel(i), pipe_bits(i).fu_sel, 0.U))
+    }
     assert(PopCount(write_pipe_sel) <= 1.U)
     pipe_write := write_pipe_sel.orR
     when (write_pipe_sel.orR) {
@@ -135,13 +150,19 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
       val acc = Mux1H(write_pipe_sel, pipe_bits.map(_.acc))
       val tail = Mux1H(write_pipe_sel, pipe_bits.map(_.tail))
       val vat = Mux1H(write_pipe_sel, pipe_bits.map(_.vat))
+      val selected_write = Mux1H(write_fu_sel, pipe_fus.map(_._1.io.write.bits))
       io.pipeWriteVat := vat
       io.pipeWriteForwardable := !acc && Mux1H(write_pipe_sel, pipe_bits.map(op =>
         op.vm && !op.use_wmask && op.eidx_mask.andR))
+      if (vParams.shortResultForwarding) {
+        io.pipeWriteForwardable := (!acc || tail) && Mux1H(write_pipe_sel,
+          pipe_bits.map(op => op.vm && !op.use_wmask)) &&
+          Mux1H(write_fu_sel, pipe_fus.map(_._1.io.write.bits.mask.orR))
+      }
       io.pipe_write.valid := Mux1H(write_fu_sel, pipe_fus.map(_._1.io.write.valid)) && (!acc || tail)
-      io.pipe_write.bits := Mux1H(write_fu_sel, pipe_fus.map(_._1.io.write.bits))
+      io.pipe_write.bits := selected_write
       io.acc_write.valid := acc && !tail
-      io.acc_write.bits := Mux1H(write_fu_sel, pipe_fus.map(_._1.io.write.bits))
+      io.acc_write.bits := selected_write
       io.acc_write_slot := Mux1H(write_pipe_sel, pipe_bits.map(_.acc_slot))
       io.accWriteVat := vat
       io.completed.valid := tail
@@ -178,6 +199,10 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
     io.iterWriteVat := VecInit(iter_fus.map(_._1.io.hazard.bits.vat))(iter_write_arb.io.chosen)
     io.iterWriteForwardable := !VecInit(iter_fus.map(_._1.io.acc))(iter_write_arb.io.chosen) &&
       iter_write_arb.io.out.bits.mask.andR
+    if (vParams.shortResultForwarding) {
+      io.iterWriteForwardable := (!VecInit(iter_fus.map(_._1.io.acc))(iter_write_arb.io.chosen) ||
+        VecInit(iter_fus.map(_._1.io.tail))(iter_write_arb.io.chosen)) && iter_write_arb.io.out.bits.mask.orR
+    }
     when (!pipe_write) {
       io.acc_write.valid := iter_write_arb.io.out.valid && acc
       io.acc_write.bits.eg   := Mux1H(iter_write_arb.io.in.map(_.fire), iter_fus.map(_._1.io.write.bits.eg))

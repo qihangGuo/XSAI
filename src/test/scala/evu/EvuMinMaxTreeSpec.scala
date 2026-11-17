@@ -99,9 +99,9 @@ class EvuMinMaxTreeSpec extends AnyFlatSpec with ChiselScalatestTester with Matc
     }
   }
 
-  it should "share the result channel with two-cycle comparisons and tag flags with the completing VAT" in {
+  it should "share two/four/five-cycle results and tag flags with the completing VAT" in {
     implicit val parameters: Parameters = EvuVectorParameters(base, 4096, 512, 512,
-      VectorParams.lgvParams.copy(fp32MinMaxTree = true))
+      VectorParams.lgvParams.copy(fp32MinMaxTree = true, singleGroupMinMax = true))
     test(new EvuMinMaxPipeHarness).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
       val pending = scala.collection.mutable.Map.empty[Int, (BigInt, BigInt, Int, Int)]
       val random = new scala.util.Random(32)
@@ -119,7 +119,8 @@ class EvuMinMaxTreeSpec extends AnyFlatSpec with ChiselScalatestTester with Matc
         }
         clear(dut.io.issue.bits)
         val tree = issued % 3 != 1
-        val depth = if (tree) 4 else 2
+        val direct = issued % 3 == 2
+        val depth = if (direct) 5 else if (tree) 4 else 2
         val issue = issued < 60 && !pending.contains(cycle + depth)
         dut.io.issue.valid.poke(issue.B)
         if (issue) {
@@ -141,11 +142,14 @@ class EvuMinMaxTreeSpec extends AnyFlatSpec with ChiselScalatestTester with Matc
             val values = Seq.fill(16)(random.nextInt().toLong & 0xffffffffL)
               .updated(issued % 16, if (issued % 2 == 0) 0x7f800001L else 0x7fc00001L)
             val minimum = issued % 2 == 0
-            val (result, flags) = reference(values, minimum)
+            val seed = Seq(0L, 0x7f800001L, 0x7fc00001L, 0x7f800000L, 0xff800000L)(issued % 5)
+            val (result, flags) = reference((if (direct) Seq(seed) else Seq.empty) ++ values, minimum)
             op.funct6.poke((if (minimum) OPFFunct6.fredmin.litValue else OPFFunct6.fredmax.litValue).U)
             op.acc.poke(true.B)
-            op.acc_fold.poke(true.B)
-            op.acc_tree.poke(true.B)
+            op.acc_fold.poke((!direct).B)
+            op.acc_tree.poke((!direct).B)
+            op.acc_direct.poke(direct.B)
+            op.rvs1_data.poke(BigInt(seed).U)
             op.rvs2_data.poke(pack(values).U)
             pending(cycle + depth) = (BigInt(result), BigInt("ffffffff", 16), flags, vat)
           } else {
@@ -216,10 +220,12 @@ class EvuMinMaxTreeSpec extends AnyFlatSpec with ChiselScalatestTester with Matc
             }
             dut.clock.step()
             dut.io.command.foreach(_.valid.poke(false.B))
-            for (cycle <- 0 until 220) {
+            var cycle = 0
+            while (!dut.io.completed.forall(_.peek().litToBoolean) && cycle < 220) {
               dut.io.sourceReady(0).poke((cycle % 7 != 0).B)
               dut.io.sourceReady(1).poke((cycle % 5 != 0).B)
               dut.clock.step()
+              cycle += 1
             }
             val active = (0 until length).filter(mask.testBit).map(index => values(index % 16))
             val expected = (0 until 2).map(context =>

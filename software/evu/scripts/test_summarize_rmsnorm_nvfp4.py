@@ -5,14 +5,17 @@ from summarize_rmsnorm_nvfp4 import CASE_SETS, summarize
 
 def complete_log(samples=3, compact=False, cases=11, single=False):
     expected = CASE_SETS[str(cases)]
-    metadata = ("format=5 workload=rmsnorm_nvfp4_evu quantization=evu alpha_bits=3b124925" if cases == 11
+    metadata = ("format=11 workload=rmsnorm_nvfp4_evu quantization=evu alpha_bits=3b124925 "
+                "profile=fused_row_major oracle_dlen=512 quant_batch=16 quant_vl=16 quant_sew=32 "
+                "quant_schedule=overlap lane_sum=1 quant_rename=1 quant_banked=1" if cases == 1
+                else "format=5 workload=rmsnorm_nvfp4_evu quantization=evu alpha_bits=3b124925" if cases == 11
                 else "format=5 workload=rmsnorm_evu quantization=not_measured" if cases == 8
                 else "format=3 workload=rmsnorm_evu quantization=not_measured" if cases == 17
                 else "format=4 workload=rmsnorm_nvfp4_evu quantization=evu alpha_bits=3b124925" if cases == 23
                 else "alpha_bits=3b124925")
     if single:
         metadata = metadata.replace("format=5", "format=6")
-    lines = [f"[RN] config rows=4 cols=512 samples={samples} input=fp32 eps_bits=3727c5ac warmup={0 if single else 1} cases={cases} {metadata}"]
+    lines = [f"[RN] config rows=4 cols=512 samples={samples} input=fp32 eps_bits=3727c5ac warmup={0 if single or cases == 1 else 1} cases={cases} {metadata}"]
     for stage, schedule in sorted(expected):
         if single:
             cycles = 200 if schedule == "row_major" else 100
@@ -29,6 +32,21 @@ def complete_log(samples=3, compact=False, cases=11, single=False):
 
 
 class RmsnormSummaryTest(unittest.TestCase):
+    def test_fused_only_profile_reports_exactly_one_case(self):
+        for samples in (1, 3):
+            text = complete_log(samples=samples, cases=1, single=samples == 1, compact=True)
+            rows = summarize(text)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual((rows[0]['stage'], rows[0]['schedule']), ('fused_nvfp4', 'row_major'))
+            self.assertEqual(rows[0]['samples'], samples)
+            for old, new in (('profile=fused_row_major', ''), ('oracle_dlen=512', 'oracle_dlen=256'),
+                             ('format=11', 'format=8'), ('quantization=evu', 'quantization=cpu'),
+                             ('warmup=0', 'warmup=1'), ('schedule=row_major', 'schedule=wave4')):
+                with self.subTest(old=old), self.assertRaises(ValueError):
+                    summarize(text.replace(old, new))
+            with self.assertRaises(ValueError):
+                summarize(text + '\n[RN] stage=quant_evu schedule=row_major cycles=10 inst=5 errors=0')
+
     def test_banked_quantization_output(self):
         for cases in (8, 11):
             previous = complete_log(samples=1, cases=cases, single=True)

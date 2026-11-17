@@ -14,7 +14,7 @@ and multi-context return routing. Long vectors still stream all input groups
 and merge the accumulator slots actually used. The final horizontal fold is
 one pipelined-tree operation instead of repeated issue/feedback rounds.
 At DLEN=512, the tree has 15 pair comparisons over four registered levels;
-one 16-element reduction now issues one streaming operation and one tree fold,
+with `singleGroupMinMax=false`, one 16-element reduction issues one streaming operation and one tree fold,
 instead of one streaming operation and four ordinary folds. This is an issue
 count, not a promise of two cycles per reduction.
 
@@ -34,6 +34,50 @@ masked or tail elements cannot raise exceptions through unused comparisons.
 The same FP32 reduction semantics apply with the tree disabled.
 An all-masked FP32 min/max copies the initial value without canonicalizing a
 NaN or raising NV; it skips unused slot merges and uses one final copy.
+
+### Single-EG direct min/max
+
+`EvuParams.singleGroupMinMax` defaults to true. With the FP32 tree enabled,
+unmasked FP32 `fredmin.vs`/`fredmax.vs`, vstart=0 and VL exactly DLEN/32 use
+one final micro-op instead of streaming into an accumulator and issuing a fold.
+At DLEN=512 the raw 16-element source enters the existing four-level tree;
+a separate registered FP32 min/max comparison includes the architectural seed.
+The result latency is five cycles, not four. The seed read and reduction owner
+allocation remain unchanged. No intermediate accumulator write is generated.
+Longer/shorter vectors, masks, FP16 and widening forms keep their old paths.
+
+The explicit `acc_direct` marker selects raw source data plus owner slot-zero
+seed in the backend and gives the final operation reduction-critical priority.
+The comparison pipeline, shared result-slot scheduler, VRF write reservation
+and VAT-tagged completion/flags all use the actual 2/4/5-cycle latency. Only the
+low four destination bytes are written; short-result forwarding and collector
+invalidation are unchanged. Direct operations count as final folds in the
+existing diagnostic stage counters, not as streaming accumulator operations.
+
+Use `DefaultExternalVectorMatrixConfig` for the on case and
+`DefaultExternalVectorNoSingleGroupMinMaxMatrixConfig` for the off case.
+Keep format-11 software, short forwarding and every other option identical.
+Each eligible amax removes one comparison-FU issue and its accumulator return;
+128 amax operations remove 128 issues per quantization. This does not predict
+the end-to-end cycle reduction; compare quantization/fused cycles and interval
+counter deltas on the server, with difftest enabled.
+
+Local checks do not generate Verilog, build emu or build a guest binary:
+
+```sh
+PATH="$PWD/src/main/resources:$PATH" mill -i evuCheck.test.testOnly \
+  evu.EvuSingleGroupMinMaxSpec evu.EvuMinMaxTreeSpec
+PATH="$PWD/src/main/resources:$PATH" mill -i evuCheck.test.testOnly \
+  evu.EvuAreaTopSpec -- -z 'without emitting Verilog'
+```
+
+Local validation on 2026-11-16 passed EVU Scala compilation, feature-selection
+checks, direct-on/off seed/NaN/signed-zero/tail/mask cases, operand retention
+under RAW/WAR/WAW and seed/write/issue backpressure, owner reuse, mixed 2/4/5-cycle
+writeback/flag tagging and critical result-slot protection. The production EVU
+also passed HW-dialect lowering with combinational-cycle checking. These are
+directed checks, not a complete EVU regression or a server difftest/performance
+result. No Verilog, emu or guest binary was generated locally.
 
 ## Aligned slide
 
@@ -62,7 +106,7 @@ packing buffer. Alignment uses DLEN/8 bytes, not a fixed 64-byte constant.
 ### Operand and single-group slide follow-up
 
 Checkpoint `142923fc9` preserves the previous RTL/software before this follow-up.
-Three independent `EvuParams` switches default to true:
+Four independent `EvuParams` switches default to true:
 
 - `singleGroupSlide`: unmasked VX/VI slideup/slidedown, vstart=0, whose source
   and destination accesses fit within the first DLEN group. Slide-up requires
@@ -79,6 +123,15 @@ Three independent `EvuParams` switches default to true:
   and exception flags still follow the original write-acceptance handshake.
   Only full masks qualify; packed FP4/FP8 and reduction partial writes do not
   forward. VAT age and intervening-writer checks are retained.
+- `shortResultForwarding`: extends that bypass when the producer's valid-byte
+  mask covers every byte the consumer reads. This supports narrow conversion
+  payloads, final reduction elements, selected gather/slide bytes and simple
+  unmasked store tails. A one-entry, four-cycle result slot per source bridges
+  writeback-to-read gaps; physical writes, VAT wrap and reset invalidate it.
+  Unrequested bytes are not merged from the VRF, and VAT age, intervening
+  writers, WAR/WAW and collector invalidation remain enforced. Unsupported
+  masked/generic-permutation cases fall back to the VRF. The default is enabled;
+  `DefaultExternalVectorNoShortForwardMatrixConfig` provides the off baseline.
 - `crossInstructionPrefetch`: checks each ordinary issue-queue head against
   older writers and hints up to three first-group operands into the existing
   collectors while the current instruction is at its tail. Normal demand
@@ -138,6 +191,25 @@ complete operator takes 5101. See the
 artifact-provenance limits and remaining regression/synthesis work. This is
 joint RTL/software workload acceptance, not an isolated hardware speedup.
 
+### Result-bypass wiring fix (2026-11-16)
+
+The short-result follow-up initially notified collectors using `request.fire &&
+forwardingHit`. Because collector invalidation affects VRF `ready`, this created
+a combinational path from `ready` through `fire` and `bypass` back to `ready`.
+The server firtool build rejected it in the FMA destination-read path; store
+reads had the same wiring. Both now use `request.valid && forwardingHit`.
+A forwarding hit already forces requester `ready` high, so this is equivalent
+without adding latency or weakening collector invalidation.
+
+`EvuAreaTopSpec` additionally lowers the complete production EVU to HW dialect
+using firtool, exercising its combinational-cycle check. This goes beyond the
+previous CHIRRTL structural check and does not emit Verilog or build EMU:
+
+```sh
+PATH="$PWD/src/main/resources:$PATH" mill -i evuCheck.test.testOnly \
+  evu.EvuAreaTopSpec -- -z 'production forwarding'
+```
+
 ### Follow-up acceptance
 
 No divider/FMA replication or reduction-context increase is included. The
@@ -145,7 +217,10 @@ new bypass muxes, group shifter and hint logic still require timing/area checks.
 `EvuGroupSlideSpec` covers byte/halfword/word shifts, partial write masks,
 source capture, RAW/WAR/WAW stalls, backpressure and fallback selection at
 DLEN=128/256/512. `EvuIterForwardingSpec` covers held full divide results,
-partial-result rejection and completion timing. `EvuIndependentOperandSpec`
+partial-result rejection and completion timing. `EvuShortForwardingSpec` covers
+mask coverage for FP8/FP4/reduction results, narrow source reads and store
+tails, short-result retention/invalidation, and preserved hazards.
+`EvuIndependentOperandSpec`
 also covers all three tail hint ports versus normal next-group prefetch.
 The full-backend `EvuSlideSpec` adds short-group, partial-tail, in-place
 slide-down and cross-group fallback transitions for each SEW/LMUL combination.

@@ -376,10 +376,12 @@ case class VectorParams(
   parallelFp32Div: Boolean = false,
   interleaveReductions: Boolean = false,
   fp32MinMaxTree: Boolean = false,
+  singleGroupMinMax: Boolean = false,
   alignedSlide: Boolean = false,
   singleGroupSlide: Boolean = false,
   crossInstructionPrefetch: Boolean = false,
   extendedResultForwarding: Boolean = false,
+  shortResultForwarding: Boolean = false,
 
   issStructure: VectorIssueStructure = VectorIssueStructure.Unified,
 

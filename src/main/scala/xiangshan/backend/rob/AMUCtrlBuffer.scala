@@ -268,6 +268,8 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
   // To AMU
   val deqPtr = RegInit(0.U.asTypeOf(new RobPtr))
   val deqEntries = (0 until CommitWidth).map(i => amuCtrlEntries((deqPtr + i.U).value))
+  val deqCount = PriorityEncoder(deqEntries.map(x => !x.canDeq) :+ true.B)
+  val nextDeqPtr = deqPtr + deqCount
   val separateIssue = p(ExternalVectorKey).enable && p(ExternalVectorKey).decoupledAmuIssue
   val issuePtr = RegInit(0.U.asTypeOf(new RobPtr))
   val dispatchPtr = if (separateIssue) issuePtr else deqPtr
@@ -349,24 +351,33 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
 
   }
 
-  // EVU completion is consumed only by the oldest AMU entry; later vector commands must not bypass an older memory operation.
+  // Skip only the completed prefix being cleared this cycle. The target is
+  // still the oldest unfinished entry, never a younger command behind it.
   io.evuCompletion.foreach { completion =>
-    val headEvuAccepted = amuCtrlEntries(deqPtr.value).evuAccepted
-    // canDeq is registered, so the completed head remains visible until the
-    // following cycle's dequeue. Do not consume the next completion for it.
-    completion.ready := headEvuAccepted && !amuCtrlEntries(deqPtr.value).canDeq && !io.redirect.valid
+    val completionPtr = if (p(ExternalVectorKey).completionLookahead) nextDeqPtr else deqPtr
+    val entry = amuCtrlEntries(completionPtr.value)
+    completion.ready := entry.valid && entry.needAMU && entry.writebacked && entry.committed &&
+      entry.amuCtrl.evu && entry.evuAccepted && !entry.canDeq && !io.redirect.valid
     when (completion.fire) {
-      amuCtrlEntries(deqPtr.value).canDeq := true.B
-      amuCtrlEntries(deqPtr.value).evuException := completion.bits.exception
-      amuCtrlEntries(deqPtr.value).evuFflags := completion.bits.fflags
-      amuCtrlEntries(deqPtr.value).evuVxsat := completion.bits.vxsat
-      amuCtrlEntries(deqPtr.value).evuCause := completion.bits.cause
+      entry.canDeq := true.B
+      entry.evuException := completion.bits.exception
+      entry.evuFflags := completion.bits.fflags
+      entry.evuVxsat := completion.bits.vxsat
+      entry.evuCause := completion.bits.cause
       evuStatusReg := completion.bits
       evuStatusPulse := true.B
+      for (i <- 0 until CommitWidth) {
+        assert(!(i.U < deqCount && completionPtr === deqPtr + i.U),
+          "EVU completion targeted an AMU entry being cleared")
+      }
     }
+    val previousFire = RegNext(completion.fire, false.B)
+    XSPerfAccumulate("evu_amu_completion_fire", completion.fire)
+    XSPerfAccumulate("evu_amu_completion_blocked", completion.valid && !completion.ready)
+    XSPerfAccumulate("evu_amu_completion_lookahead", completion.fire && completionPtr =/= deqPtr)
+    XSPerfAccumulate("evu_amu_completion_consecutive", completion.fire && previousFire)
     if (env.EnableDifftest) {
       val event = DifftestModule(new DiffEvuCompletionEvent, delay = 3)
-      val entry = amuCtrlEntries(deqPtr.value)
       val payload = entry.amuCtrl.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey)))
       event.valid := completion.fire
       event.coreid := io.hartId.get
@@ -399,12 +410,9 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
     e.valid && e.needAMU && e.writebacked && e.amuCtrl.evu && !e.canDeq && serial
   }.reduce(_ || _) || statusDrain.orR
 
-  val deqCondSeq = deqEntries.map(x => ~x.canDeq)
-  val deqCount = PriorityEncoder(deqCondSeq :+ true.B)
   if (separateIssue) {
     val issueAdvance = issueEntries.zip(io.toAMU).map { case (entry, port) => issuedOrSkipped(entry) || port.fire }
     val issueCount = PriorityEncoder(issueAdvance.map(!_) :+ true.B)
-    val nextDeqPtr = deqPtr + deqCount
     val nextIssuePtr = issuePtr + Mux(!issueBarrier && !io.redirect.valid, issueCount, 0.U)
     // Scalar entries can retire while a barrier freezes EVU dispatch. Never
     // leave the issue cursor behind entries that retirement has invalidated.
@@ -419,7 +427,7 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
     XSPerfAccumulate("evu_amu_barrier_cycles", issueBarrier)
   }
   // Update deqPtr and invalidate entries
-  deqPtr := deqPtr + deqCount
+  deqPtr := nextDeqPtr
   for (i <- 0 until CommitWidth) {
     val curr_deq_ptr = deqPtr + i.U
     when(amuCtrlEntries(curr_deq_ptr.value).canDeq && i.U < deqCount) {

@@ -419,6 +419,7 @@ static uint64_t sample_median(const uint64_t *values) {
   return lower + (values[EVU_RMS_SAMPLES / 2] - lower) / 2;
 }
 
+#ifndef EVU_RMS_KERNELS_ONLY
 __attribute__((used, noinline)) static int rmsnorm_nvfp4_test_main(void) {
   __asm__ volatile ("csrw frm, x0" ::: "memory");
   if (XV_CSR_READ(XV_EVLENB) != 512 || (XV_CSR_READ(XV_EVCAP) & 255) != 2 ||
@@ -490,3 +491,4 @@ __attribute__((used, noinline)) static int rmsnorm_nvfp4_test_main(void) {
 __attribute__((naked)) int main(void) {
   __asm__ volatile ("li t0, 0x2200\ncsrs mstatus, t0\nli t0, 9\ncsrw 0xbc8, t0\ntail rmsnorm_nvfp4_test_main\n");
 }
+#endif

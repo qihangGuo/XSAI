@@ -7,7 +7,7 @@ from test_summarize_rmsnorm_nvfp4 import complete_log
 
 
 def counter_log(cases=11):
-    lines = [complete_log(samples=1, compact=True, cases=cases, single=cases == 11)]
+    lines = [complete_log(samples=1, compact=True, cases=cases, single=cases in (1, 11))]
     for index, (stage, schedule) in enumerate(sorted(CASE_SETS[str(cases)])):
         start, end = 2 * index, 2 * index + 1
         stored = 1152 if stage in ("quant_evu", "fused_nvfp4") else 0
@@ -23,6 +23,28 @@ def counter_log(cases=11):
 
 
 class RmsnormCountersTest(unittest.TestCase):
+    def test_fused_only_uses_only_its_two_measurement_fences(self):
+        text = counter_log(cases=1)
+        rows = summarize_counters(text)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['fences'], '0:1')
+        self.assertEqual(rows[0]['logical_store_bytes'], 1152)
+        self.assertEqual(rows[0]['vrf_bank_conflicts'], 3)
+        with self.assertRaises((KeyError, ValueError)):
+            summarize_counters(text.replace('fences=0:1', 'fences=0:2'))
+
+    def test_fused_only_reports_comparison_work_and_fma_queue_blocking(self):
+        text = counter_log(cases=1)
+        for fence in (0, 1):
+            text += f'\n[EVU-FU] fence={fence} path=fp_cmp issue={1000 + fence * 272} feedback={100 + fence * 7}'
+            text += f'\n[EVU-FU] fence={fence} path=fp_fma issue={2000 + fence * 300} qi={500 + fence * 20}'
+        row, = summarize_counters(text)
+        self.assertEqual(row['cmp_issues'], 272)
+        self.assertEqual(row['cmp_feedback_wait'], 7)
+        self.assertEqual(row['fma_issues'], 300)
+        self.assertEqual(row['fma_queue_idle'], 20)
+        self.assertEqual(row['fma_feedback_wait'], '')
+
     def test_banked_run_reports_timed_diagnostics_without_setup_traffic(self):
         text = counter_log().replace('format=6',
             'format=11 quant_batch=16 quant_vl=16 quant_sew=32 quant_schedule=overlap '

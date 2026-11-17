@@ -32,6 +32,7 @@ COMPACT_RMS_EXPECTED.update((("empty", "overhead"), ("scale_div_eps", "row_major
 COMPACT_FUSED_EXPECTED = COMPACT_RMS_EXPECTED | {("quant_evu", "row_major"),
                                                ("fused_nvfp4", "row_major"), ("fused_nvfp4", "wave4")}
 CASE_SETS.update({"8": COMPACT_RMS_EXPECTED, "11": COMPACT_FUSED_EXPECTED})
+CASE_SETS["1"] = {("fused_nvfp4", "row_major")}
 FIELDS = re.compile(r"(\w+)=([^\s]+)")
 
 
@@ -43,7 +44,10 @@ def summarize(text):
     if header.get("rows") != "4" or header.get("cols") != "512" or header.get("cases") not in CASE_SETS:
         raise ValueError("unexpected benchmark shape or case count")
     expected = CASE_SETS[header["cases"]]
-    if header["cases"] in ("11", "23") and (header.get("format") not in (("5", "6", "7", "8", "10", "11") if header["cases"] == "11" else ("4",)) or
+    if header["cases"] == "1" and (header.get("profile") != "fused_row_major" or
+                                    header.get("format") != "11" or header.get("oracle_dlen") != "512"):
+        raise ValueError("expected fused_row_major format-11 profile with the DLEN=512 oracle")
+    if header["cases"] in ("1", "11", "23") and (header.get("format") not in (("5", "6", "7", "8", "10", "11") if header["cases"] in ("1", "11") else ("4",)) or
                                     header.get("workload") != "rmsnorm_nvfp4_evu" or
                                     header.get("quantization") != "evu" or "alpha_bits" not in header):
         raise ValueError("expected full EVU RMSNorm/NVFP4 header matching the case format")

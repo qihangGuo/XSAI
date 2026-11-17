@@ -23,7 +23,8 @@ case object FPCmpFactory extends FunctionalUnitFactory {
 
 class FPCompPipe(implicit p: Parameters)
     extends PipelinedFunctionalUnit(if (p(VectorParamsKey).fp32MinMaxTree)
-      VectorFastPaths.minMaxTreeDepth(p(VectorParamsKey).dLen) else 2)(p) with HasFPUParameters {
+      VectorFastPaths.minMaxTreeDepth(p(VectorParamsKey).dLen) +
+        (if (p(VectorParamsKey).singleGroupMinMax) 1 else 0) else 2)(p) with HasFPUParameters {
   val supported_insns = FPCmpFactory.insns
 
   io.stall := false.B
@@ -147,7 +148,7 @@ class FPCompPipe(implicit p: Parameters)
   val s1_sign_injection = RegEnable(ctrl.bool(FPSgnj), io.pipe(0).valid)
 
 
-  io.write.valid := io.pipe(1).valid && !io.pipe(1).bits.acc_tree
+  io.write.valid := io.pipe(1).valid && !io.pipe(1).bits.acc_tree && !io.pipe(1).bits.acc_direct
   io.write.bits.eg := io.pipe(1).bits.wvd_eg
   io.write.bits.mask := Mux(s1_writes_as_mask, mask_write_mask, FillInterleaved(8, io.pipe(1).bits.wmask))
   io.write.bits.data := RegEnable(out, io.pipe(0).valid)
@@ -164,11 +165,12 @@ class FPCompPipe(implicit p: Parameters)
   io.scalar_write.bits := DontCare
 
   if (vParams.fp32MinMaxTree) {
+    val treeDepth = VectorFastPaths.minMaxTreeDepth(dLen)
     val tree = Module(new FPMinMaxTree(dLen))
-    tree.io.valid := io.iss.valid && io.iss.op.acc_tree
+    tree.io.valid := io.iss.valid && (io.iss.op.acc_tree || io.iss.op.acc_direct)
     tree.io.source := io.iss.op.rvs2_data
     tree.io.minimum := io.iss.op.opff6 === OPFFunct6.fredmin
-    val treeOutput = io.pipe(depth - 1)
+    val treeOutput = io.pipe(treeDepth - 1)
     when(treeOutput.valid && treeOutput.bits.acc_tree) {
       io.write.valid := true.B
       io.write.bits.eg := treeOutput.bits.wvd_eg
@@ -176,6 +178,23 @@ class FPCompPipe(implicit p: Parameters)
       io.write.bits.data := Mux(treeOutput.bits.acc_empty, treeOutput.bits.rvs2_data(31, 0), tree.io.result)
       io.set_fflags.valid := true.B
       io.set_fflags.bits := Mux(treeOutput.bits.acc_empty, 0.U, tree.io.flags)
+    }
+    if (vParams.singleGroupMinMax) {
+      // Seventeen operands need one more registered comparison than the 16-input tree.
+      val directValid = treeOutput.valid && treeOutput.bits.acc_direct
+      val (seedResult, seedInvalid) = FP32MinMax(tree.io.result, treeOutput.bits.rvs1_data(31, 0),
+        treeOutput.bits.opff6 === OPFFunct6.fredmin)
+      val directResult = RegEnable(seedResult, directValid)
+      val directFlags = RegEnable(tree.io.flags | Cat(seedInvalid, 0.U(4.W)), directValid)
+      val directOutput = io.pipe(treeDepth)
+      when(directOutput.valid && directOutput.bits.acc_direct) {
+        io.write.valid := true.B
+        io.write.bits.eg := directOutput.bits.wvd_eg
+        io.write.bits.mask := 0xffffffffL.U(dLen.W)
+        io.write.bits.data := directResult
+        io.set_fflags.valid := true.B
+        io.set_fflags.bits := directFlags
+      }
     }
   }
 }

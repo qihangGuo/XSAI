@@ -65,10 +65,18 @@
   XV_BROADCAST(RN_QUANT_INT_ONE, RN_QUANT_INT_ONE, 2); \
 } while (0)
 
+/* The fused-only entry may consume block zero directly from the input. */
+#ifndef RN_BATCH_EXTRACT_FIRST
+#define RN_BATCH_EXTRACT_FIRST(first, block, source) XV_SLIDEDOWN(first, 16 * (block), source, 2)
+#endif
+#ifndef RN_BATCH_FIRST_REG
+#define RN_BATCH_FIRST_REG(first, block, source) first
+#endif
+
 #define RN_BATCH_MAX_PAIR_REGS(source, block, index, first, second, abs_first, abs_second) do { \
-  XV_SLIDEDOWN(first, 16 * (block), source, 2); \
+  RN_BATCH_EXTRACT_FIRST(first, block, source); \
   XV_SLIDEDOWN(second, 16 * ((block) + 1), source, 2); \
-  XV_FABS(abs_first, first, 2); \
+  XV_FABS(abs_first, RN_BATCH_FIRST_REG(first, block, source), 2); \
   XV_FABS(abs_second, second, 2); \
   XV_FREDUCE_MAX(first, RN_QUANT_ZERO, abs_first, 2); \
   XV_FREDUCE_MAX(second, RN_QUANT_ZERO, abs_second, 2); \
@@ -86,11 +94,11 @@
 #endif
 
 #define RN_BATCH_PACK_PAIR(source, block, index, next_index, inverse, mask) do { \
-  XV_SLIDEDOWN(16, 16 * (block), source, 2); \
+  RN_BATCH_EXTRACT_FIRST(16, block, source); \
   XV_SLIDEDOWN(RN_QUANT_SECOND, 16 * ((block) + 1), source, 2); \
   XV_GATHER_IMM(18, index, inverse, 2); \
   XV_GATHER_IMM(19, next_index, inverse, 2); \
-  XV_FMUL(16, 18, 16, 2); \
+  XV_FMUL(16, 18, RN_BATCH_FIRST_REG(16, block, source), 2); \
   XV_FMUL(RN_QUANT_SECOND, 19, RN_QUANT_SECOND, 2); \
   XV_GATHER_IMM(18, index, mask, 2); \
   XV_GATHER_IMM(19, next_index, mask, 2); \
@@ -169,15 +177,15 @@
 /* v2/v3 are dead inputs here. Interleave independent amax and packing
  * operations without letting either path overwrite the other's operands. */
 #define RN_BATCH_STEADY_PAIR(next_source, source, block, index, next_index, inverse, mask) do { \
-  XV_SLIDEDOWN(2, 16 * (block), next_source, 2); \
-  XV_SLIDEDOWN(16, 16 * (block), source, 2); \
+  RN_BATCH_EXTRACT_FIRST(2, block, next_source); \
+  RN_BATCH_EXTRACT_FIRST(16, block, source); \
   XV_SLIDEDOWN(3, 16 * ((block) + 1), next_source, 2); \
   XV_SLIDEDOWN(RN_QUANT_SECOND, 16 * ((block) + 1), source, 2); \
-  XV_FABS(2, 2, 2); \
+  XV_FABS(2, RN_BATCH_FIRST_REG(2, block, next_source), 2); \
   XV_GATHER_IMM(18, index, inverse, 2); \
   XV_FABS(3, 3, 2); \
   XV_GATHER_IMM(19, next_index, inverse, 2); \
-  XV_FMUL(16, 18, 16, 2); \
+  XV_FMUL(16, 18, RN_BATCH_FIRST_REG(16, block, source), 2); \
   XV_FREDUCE_MAX(2, RN_QUANT_ZERO, 2, 2); \
   XV_FMUL(RN_QUANT_SECOND, 19, RN_QUANT_SECOND, 2); \
   XV_FREDUCE_MAX(3, RN_QUANT_ZERO, 3, 2); \

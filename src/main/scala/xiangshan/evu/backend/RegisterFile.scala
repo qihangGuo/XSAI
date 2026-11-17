@@ -169,7 +169,8 @@ class RegisterFileIO(
     maxDepth: Int,
     prefetchPorts: Int = 0,
     trackWrites: Boolean = false,
-    scalarPorts: Int = 0
+    scalarPorts: Int = 0,
+    bypassPorts: Int = 0
 )(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams {
   val read = MixedVec(reads.map(rc => Vec(rc, Flipped(new VectorReadIO))))
   val mask_read = MixedVec(maskReads.map(rc => Vec(rc, Flipped(new VectorReadIO))))
@@ -183,6 +184,8 @@ class RegisterFileIO(
   val debug = Option.when(vParams.debugVrf)(Output(Vec(egsTotal, UInt(dLen.W))))
   val prefetch = Input(Vec(prefetchPorts, Valid(new VectorReadReq)))
   val e0Read = Input(Vec(scalarPorts, Bool()))
+  val bypass = Input(Vec(bypassPorts, Bool()))
+  val writeInvalidations = Output(Vec(vParams.vrfBanking, Valid(UInt(log2Ceil(egsTotal).W))))
   val perf = Output(new VrfPerf)
 }
 
@@ -204,11 +207,11 @@ class VrfPerf extends Bundle {
 class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrites: Int, maxDepth: Int,
                    sramSuffix: String = "evu_vrf", prefetchPorts: Seq[(Int, Int)] = Seq.empty,
                    trackWrites: Boolean = false, scalarPorts: Seq[(Int, Int)] = Seq.empty,
-                   readClasses: Seq[Int] = Seq.empty)
+                   readClasses: Seq[Int] = Seq.empty, bypassPorts: Seq[(Int, Int)] = Seq.empty)
                   (implicit p: Parameters) extends CoreModule()(p) with HasVectorParams {
 
   val io = IO(new RegisterFileIO(reads, maskReads, pipeWrites, llWrites, maxDepth,
-    prefetchPorts.size, trackWrites, scalarPorts.size))
+    prefetchPorts.size, trackWrites, scalarPorts.size, bypassPorts.size))
   val vrf = Module(new AraRegisterFile(reads, maskReads, pipeWrites, llWrites, maxDepth,
     sramSuffix, trackWrites, scalarPorts.nonEmpty))
   io.pipe_write_reqs <> vrf.io.pipe_write_reqs
@@ -217,12 +220,13 @@ class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrit
   io.llOwners.foreach(vrf.io.llOwners.get := _)
   io.pendingWrites.foreach(_ := vrf.io.pendingWrites.get)
   io.writeCommits.foreach(_ := vrf.io.writeCommits.get)
+  io.writeInvalidations := vrf.io.writeInvalidations
   io.debug.foreach(_ := vrf.io.debug.get)
   val collectors = scala.collection.mutable.ArrayBuffer.empty[RegisterReadCollector]
   val scalarHits = scala.collection.mutable.ArrayBuffer.empty[Bool]
 
   private def collect(client: VectorReadIO, memory: SramReadIO, prefetchIndex: Int = -1,
-      scalarIndex: Int = -1): Unit = {
+      scalarIndex: Int = -1, bypassIndex: Int = -1): Unit = {
     val collector = Module(new RegisterReadCollector(vParams.vrfBanking))
     collectors += collector
     val scalarHit = WireInit(false.B)
@@ -237,7 +241,8 @@ class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrit
     }
     collector.io.client.req.valid := client.req.valid && !scalarHit
     collector.io.client.req.bits := client.req.bits
-    collector.io.bypass := client.req.valid && scalarHit
+    collector.io.bypass := (client.req.valid && scalarHit) ||
+      (if (bypassIndex >= 0) io.bypass(bypassIndex) else false.B)
     collector.io.invalidate := vrf.io.writeInvalidations
     client.req.ready := Mux(scalarHit, true.B, collector.io.client.req.ready)
     client.resp := Mux(scalarHit, scalarData.pad(dLen), collector.io.client.resp)
@@ -247,7 +252,8 @@ class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrit
   }
   for (group <- reads.indices; port <- 0 until reads(group)) {
     collect(io.read(group)(port), vrf.io.read(group)(port),
-      prefetchPorts.indexOf((group, port)), scalarPorts.indexOf((group, port)))
+      prefetchPorts.indexOf((group, port)), scalarPorts.indexOf((group, port)),
+      bypassPorts.indexOf((group, port)))
   }
   for ((clients, ports) <- io.mask_read.zip(vrf.io.mask_read); (client, port) <- clients.zip(ports)) {
     collect(client, port)
