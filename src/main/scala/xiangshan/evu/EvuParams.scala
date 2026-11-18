@@ -30,7 +30,7 @@ case class EvuParams(
     splitFpIssue: Boolean = true,
     parallelFp32Div: Boolean = true,
     reductionContexts: Int = 2,
-    fmaOrdinaryContexts: Int = 1,
+    fmaOrdinaryContexts: Int = 2,
     scalarInstructions: Boolean = true,
     decoupledAmuIssue: Boolean = true,
     completionLookahead: Boolean = true,

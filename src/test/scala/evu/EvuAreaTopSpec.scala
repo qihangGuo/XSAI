@@ -18,7 +18,7 @@ class EvuAreaTopSpec extends AnyFlatSpec with Matchers {
     ep.lanes shouldBe 8
     ep.vrfBanks shouldBe 4
     ep.memoryCommandDepth shouldBe 4
-    ep.fmaOrdinaryContexts shouldBe 1
+    ep.fmaOrdinaryContexts shouldBe 2
     ep.parallelFp32Div shouldBe true
     ep.vectorRegs * ep.vlenBits shouldBe 16 * 1024 * 8
     ep.lanes * ep.vrfBanks shouldBe 32
@@ -44,8 +44,8 @@ class EvuAreaTopSpec extends AnyFlatSpec with Matchers {
     val diagnosticRegisters = "\\breg(?:reset)?\\s+(?:fp_(?:fma|cmp|exp)_(?:idleWithWork|readyArbitrationWait|queueIdle|resultSlotWait|priorityIssues|noWork|loadWait|forwardWait)|vectorForwards|vectorForwardNewer|demandPrefetchWait|prefetchDeferred|prefetchUsed|prefetchDiscarded)\\b".r
     diagnosticRegisters.findFirstIn(ir) shouldBe None
     "\\breg(?:reset)?\\s+diag_\\w+".r.findFirstIn(ir) shouldBe None
-    ir should include ("vxsfp_fma_2")
-    ir should not include "vxsfp_fma_3"
+    ir should include ("vxsfp_fma_3")
+    ir should not include "vxsfp_fma_4"
     ir should not include "vmuRmwGets"
     ir should not include "vmuRmwMerges"
     ir should not include "module XSTop"

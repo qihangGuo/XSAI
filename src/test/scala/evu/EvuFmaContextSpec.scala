@@ -7,6 +7,7 @@ import freechips.rocketchip.diplomacy.LazyModule
 import org.chipsalliance.cde.config.Parameters
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
+import xiangshan.evu.EvuParams
 import xiangshan.evu.adapter.EvuVectorParameters
 import xiangshan.evu.backend.ExecuteContextLayout
 import xiangshan.evu.common._
@@ -14,9 +15,24 @@ import xiangshan.evu.common._
 class EvuFmaContextSpec extends AnyFlatSpec with ChiselScalatestTester with Matchers {
   behavior of "Ordinary FMA contexts sharing one arithmetic path"
 
+  it should "default to two ordinary contexts with two separate reduction owners" in {
+    val ep = EvuParams(enable = true)
+    ep.fmaOrdinaryContexts shouldBe 2
+    ep.reductionContexts shouldBe 2
+    val interleave = ep.interleaveReductions && ep.reductionContexts > 1
+    val fma = ExecuteContextLayout("fp_fma", interleave, ep.fmaOrdinaryContexts, ep.reductionContexts)
+    fma.size shouldBe 4
+    (0 until fma.size).map(fma.reductionOwner) shouldBe Seq(None, None, Some(0), Some(1))
+    val baseline = ep.copy(fmaOrdinaryContexts = 1)
+    ExecuteContextLayout("fp_fma", interleave, baseline.fmaOrdinaryContexts,
+      baseline.reductionContexts).size shouldBe 3
+    ExecuteContextLayout("fp_cmp", interleave, ep.fmaOrdinaryContexts, ep.reductionContexts).size shouldBe 3
+  }
+
   it should "keep both reduction owner IDs stable with one or two ordinary contexts" in {
     for (ordinary <- 1 to 2; reductions <- 2 to 4) {
       val fma = ExecuteContextLayout("fp_fma", true, ordinary, reductions)
+      fma.size shouldBe ordinary + reductions
       (0 until ordinary).foreach(i => fma.reductionOwner(i) shouldBe None)
       (0 until reductions).foreach(i => fma.reductionOwner(ordinary + i) shouldBe Some(i))
       val cmp = ExecuteContextLayout("fp_cmp", true, ordinary, reductions)

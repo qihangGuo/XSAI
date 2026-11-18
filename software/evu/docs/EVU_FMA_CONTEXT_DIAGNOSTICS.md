@@ -3,10 +3,14 @@
 Date: 2026-11-09. Status: source implementation; hardware compilation, simulation,
 numerical regression and PPA measurements remain pending on the server.
 
-Subsequent paired-row work restores the default ordinary FMA count to one after
-the two-context measurement did not show an aggregate speedup. This document
-describes the earlier two-context experiment. Current defaults and diagnostics
-are documented in [EVU_PAIRED_DEQUANT.md](EVU_PAIRED_DEQUANT.md).
+Paired-row work temporarily restored the default ordinary FMA count to one after
+the earlier two-context measurement did not show an aggregate speedup. On
+2026-11-17 the fused RMSNorm experiment enables two again, with a separate
+single-context A/B configuration. Its baseline is 4909 cycles with one ordinary
+context. A subsequent 4183-cycle run includes both two contexts and the
+two-entry dispatch adapter; an isolated context A/B remains required. See
+[RMSNORM_FMA_TWO_CONTEXT_AB.md](RMSNORM_FMA_TWO_CONTEXT_AB.md) for this experiment
+and [EVU_PAIRED_DEQUANT.md](EVU_PAIRED_DEQUANT.md) for the paired-row history.
 
 Subsequent ABI 2 work changes configuration instructions and the CSR snapshot.
 For the combined checkout, rebuild emu, NEMU and guest binaries together as
@@ -35,9 +39,9 @@ CPU commands, eliminate true dependencies or increase SRAM ports. The additional
 context adds real operand buffers, collectors, control state and arbitration;
 its area and timing cost must be measured, not assumed negligible.
 
-`EvuParams.fmaOrdinaryContexts` defaults to 2. Setting it to 1 permits a focused
-server-side comparison without changing ISA or software; no additional top-level
-CONFIG or default build-command change is required. Legacy non-interleaved issue
+`EvuParams.fmaOrdinaryContexts` defaults to 2. Use
+`DefaultExternalVectorSingleFmaContextMatrixConfig` for a focused server-side
+comparison without changing ISA or software. Legacy non-interleaved issue
 structures keep their single general sequencer. The default 2-context behavior
 applies to the split FP, interleaved configuration used by the current emulator.
 

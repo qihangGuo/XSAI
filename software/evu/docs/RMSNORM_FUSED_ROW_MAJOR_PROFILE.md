@@ -114,3 +114,44 @@ byte-dependency test compares all 18 output stores, including poisoned temporary
 tails, for all bank/rename settings. It does not execute the guest or generate
 Verilog, emu or a guest binary. Server Difftest/bit-exact execution and timing
 remain required before claiming a performance improvement.
+
+## Two ordinary FMA contexts
+
+The default external-vector configuration now uses two ordinary FMA contexts
+and two reduction contexts sharing the existing single FMA arithmetic path.
+`DefaultExternalVectorSingleFmaContextMatrixConfig` retains one ordinary context
+for an isolated A/B. CMP retains one ordinary context and two reduction contexts.
+Arithmetic width, reduction-owner count, ISA and guest scheduling are unchanged.
+Legacy non-interleaved backend configurations retain their existing layout.
+
+Reuse the exact same fused-only guest image and NEMU library on both emulator
+builds. With `-- +evu_mem_trace=1`, `[EVU-CONFIG]` must report `fma_contexts=2`
+for the default and `fma_contexts=1` for the control. The baseline 4909-cycle
+log measured one ordinary context; it is not a measurement of the new default.
+Require unchanged correctness and work counts, then compare elapsed cycles,
+FMA queue-idle/operand waits and VRF contention. An extra context can overlap
+independent preparation, but does not eliminate true dependencies or add SRAM
+ports. Baseline counter definitions and arithmetic derivations are in
+[RMSNORM_FMA_TWO_CONTEXT_AB.md](RMSNORM_FMA_TWO_CONTEXT_AB.md).
+
+## Dispatch buffering
+
+`EvuDispatchAdapter` now buffers two commands with `pipe=false, flow=false`.
+With a continuous producer and ready consumer, it accepts and forwards one
+command each cycle after the initial buffering cycle. The old one-entry queue
+alternated enqueue and dequeue. Downstream readiness is not combinationally
+propagated through the queue to the producer. A completely full queue still
+waits until the cycle after a dequeue before accepting another command.
+
+Treadle checks cover a 64-command continuous stream with distinct PC,
+configuration and page-map payloads, two-command capacity under backpressure,
+recovery without loss/duplication, and flushing both entries including input
+offered while flush remains asserted. No software or ISA change is needed.
+The default candidate also includes the two ordinary FMA contexts above;
+the single-FMA control configuration changes only the FMA count and still uses
+the new two-entry dispatch queue. The 4909-cycle checkpoint predates both
+changes, so a combined comparison cannot attribute the cycle delta entirely
+to either one. The subsequent combined server run passes Difftest at 4183 cycles;
+its log hash and counter evidence are recorded in
+[EVU_CHECKPOINT_2026-11-18.md](EVU_CHECKPOINT_2026-11-18.md). Isolated A/B and
+hardware FENCE snapshots remain required to attribute individual gains.

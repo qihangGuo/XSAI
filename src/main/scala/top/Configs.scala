@@ -588,6 +588,10 @@ class DefaultExternalVectorMatrixConfig(n: Int = 1) extends Config(
   WithExternalVector() ++ new DefaultMatrixConfig(n)
 )
 
+class DefaultExternalVectorSingleFmaContextMatrixConfig(n: Int = 1) extends Config(
+  WithExternalVector(EvuParams(enable = true, fmaOrdinaryContexts = 1)) ++ new DefaultMatrixConfig(n)
+)
+
 class DefaultExternalVectorScalarDivMatrixConfig(n: Int = 1) extends Config(
   WithExternalVector(EvuParams(enable = true, parallelFp32Div = false)) ++ new DefaultMatrixConfig(n)
 )

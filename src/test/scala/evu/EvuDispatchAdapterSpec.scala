@@ -65,6 +65,142 @@ class EvuDispatchAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with
     dut.io.in.valid.poke(false.B)
   }
 
+  private def streamCommand(dut: EvuDispatchAdapter, tag: Int): Unit = {
+    val store = tag % 2 == 1
+    val instr = (BigInt(if (store) 0x11 else 0x01) << 25) | (BigInt(31) << 20) |
+      (BigInt(17) << 15) | (BigInt(2) << 12) | (BigInt(23) << 7) | 0x0b
+    dut.io.in.bits.instr.poke(instr.U)
+    dut.io.in.bits.pc.poke((BigInt(0x80000000L) + 4 * tag).U)
+    dut.io.in.bits.base.poke((BigInt(0x10000000L) + 64 * tag).U)
+    dut.io.in.bits.vl.poke((16 + tag).U)
+    dut.io.in.bits.length.poke((64 + 4 * tag).U)
+    dut.io.in.bits.aux.poke((tag & 31).U)
+    dut.io.in.bits.stride.poke((tag - 16).S)
+    dut.io.in.bits.chain.poke((tag % 3 == 0).B)
+    dut.io.in.bits.config.valid.poke(true.B)
+    dut.io.in.bits.config.configured.poke((tag % 2 == 0).B)
+    dut.io.in.bits.config.vl.poke((128 - tag).U)
+    dut.io.in.bits.config.vtype.poke((tag & 255).U)
+    dut.io.in.bits.config.vill.poke((tag % 5 == 0).B)
+    dut.io.in.bits.pageMap.enabled.poke((tag % 2 == 1).B)
+    dut.io.in.bits.pageMap.base.poke((BigInt(0x40000000L) + 4096 * tag).U)
+    dut.io.in.bits.pageMap.length.poke((512 + tag).U)
+    for (i <- 0 until ep.translationPages) {
+      dut.io.in.bits.pageMap.ppn(i).poke((0x80000 + 16 * tag + i).U)
+    }
+    dut.io.in.valid.poke(true.B)
+  }
+
+  private def expectStreamCommand(dut: EvuDispatchAdapter, tag: Int): Unit = {
+    val store = tag % 2 == 1
+    dut.io.out.valid.expect(true.B)
+    dut.io.out.bits.opcode.expect(if (store) EvuOpcode.Store else EvuOpcode.Add)
+    dut.io.out.bits.sew.expect(2.U)
+    dut.io.out.bits.vd.expect(23.U)
+    dut.io.out.bits.vs1.expect(17.U)
+    dut.io.out.bits.vs2.expect(31.U)
+    dut.io.out.bits.pc.expect((BigInt(0x80000000L) + 4 * tag).U)
+    dut.io.out.bits.base.expect((BigInt(0x10000000L) + 64 * tag).U)
+    dut.io.out.bits.vl.expect((16 + tag).U)
+    dut.io.out.bits.length.expect((64 + 4 * tag).U)
+    dut.io.out.bits.aux.expect((tag & 31).U)
+    dut.io.out.bits.stride.expect((tag - 16).S)
+    dut.io.out.bits.chain.expect((tag % 3 == 0).B)
+    dut.io.out.bits.write.expect(store.B)
+    dut.io.out.bits.config.valid.expect(true.B)
+    dut.io.out.bits.config.configured.expect((tag % 2 == 0).B)
+    dut.io.out.bits.config.vl.expect((128 - tag).U)
+    dut.io.out.bits.config.vtype.expect((tag & 255).U)
+    dut.io.out.bits.config.vill.expect((tag % 5 == 0).B)
+    dut.io.out.bits.pageMap.enabled.expect((tag % 2 == 1).B)
+    dut.io.out.bits.pageMap.base.expect((BigInt(0x40000000L) + 4096 * tag).U)
+    dut.io.out.bits.pageMap.length.expect((512 + tag).U)
+    for (i <- 0 until ep.translationPages) {
+      dut.io.out.bits.pageMap.ppn(i).expect((0x80000 + 16 * tag + i).U)
+    }
+    dut.io.out.bits.jobId.expect(0.U)
+    dut.io.out.bits.epoch.expect(0.U)
+  }
+
+  it should "transfer one command per cycle after buffering without combinational flow-through" in {
+    test(new EvuDispatchAdapter(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      initialize(dut)
+      dut.io.out.ready.poke(true.B)
+      streamCommand(dut, 0)
+      dut.io.in.ready.expect(true.B)
+      dut.io.out.valid.expect(false.B)
+      dut.clock.step()
+      for (tag <- 1 until 64) {
+        streamCommand(dut, tag)
+        dut.io.in.ready.expect(true.B)
+        expectStreamCommand(dut, tag - 1)
+        dut.clock.step()
+      }
+      dut.io.in.valid.poke(false.B)
+      expectStreamCommand(dut, 63)
+      dut.clock.step()
+      dut.io.out.valid.expect(false.B)
+      dut.io.in.ready.expect(true.B)
+    }
+  }
+
+  it should "hold two commands under backpressure and recover in order without accepting into a full queue" in {
+    test(new EvuDispatchAdapter(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      initialize(dut)
+      for (tag <- 0 until 2) {
+        streamCommand(dut, tag)
+        dut.io.in.ready.expect(true.B)
+        dut.clock.step()
+      }
+      streamCommand(dut, 2)
+      for (_ <- 0 until 4) {
+        dut.io.in.ready.expect(false.B)
+        expectStreamCommand(dut, 0)
+        dut.clock.step()
+      }
+      dut.io.out.ready.poke(true.B)
+      dut.io.in.ready.expect(false.B) // pipe=false: a full queue cannot refill on this edge.
+      expectStreamCommand(dut, 0)
+      dut.clock.step()
+      dut.io.in.ready.expect(true.B)
+      expectStreamCommand(dut, 1)
+      dut.clock.step()
+      dut.io.in.valid.poke(false.B)
+      expectStreamCommand(dut, 2)
+      dut.clock.step()
+      dut.io.out.valid.expect(false.B)
+    }
+  }
+
+  it should "flush both queued commands and discard input offered while flush remains asserted" in {
+    test(new EvuDispatchAdapter(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      initialize(dut)
+      for (tag <- 0 until 2) {
+        streamCommand(dut, tag)
+        dut.io.in.ready.expect(true.B)
+        dut.clock.step()
+      }
+      streamCommand(dut, 2)
+      dut.io.flush.poke(true.B)
+      dut.io.out.ready.poke(true.B)
+      dut.io.out.valid.expect(false.B)
+      dut.io.in.ready.expect(false.B)
+      dut.clock.step()
+      dut.io.in.ready.expect(true.B)
+      dut.io.out.valid.expect(false.B)
+      dut.clock.step()
+      dut.io.flush.poke(false.B)
+      dut.io.in.valid.poke(false.B)
+      dut.io.out.valid.expect(false.B)
+      streamCommand(dut, 3)
+      dut.clock.step()
+      dut.io.in.valid.poke(false.B)
+      expectStreamCommand(dut, 3)
+      dut.clock.step()
+      dut.io.out.valid.expect(false.B)
+    }
+  }
+
   it should "preserve every field under backpressure and decode the custom0 operations" in {
     test(new EvuDispatchAdapter(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
       initialize(dut)

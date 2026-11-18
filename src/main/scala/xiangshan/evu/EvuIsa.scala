@@ -195,7 +195,8 @@ class EvuDispatchAdapter(p: EvuParams) extends Module {
     val flush = Input(Bool())
   })
 
-  val buffered = Queue(io.in, 1, flush = Some(io.flush))
+  // Two entries permit simultaneous enqueue/dequeue without coupling ready paths.
+  val buffered = Queue(io.in, 2, pipe = false, flow = false, flush = Some(io.flush))
   io.out.valid   := buffered.valid && !io.flush
   io.out.bits    := 0.U.asTypeOf(new EvuCommand(p))
   buffered.ready := io.out.ready && !io.flush
