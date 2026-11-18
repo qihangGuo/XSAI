@@ -18,7 +18,7 @@ class EvuRmsnormPrefetchSpec extends AnyFlatSpec with ChiselScalatestTester {
       case freechips.rocketchip.tile.MaxHartIdBits => 1
       case freechips.rocketchip.rocket.PgLevels => 3
     }, 4096, 512, 512, VectorParams.lgvParams.copy(vrfBanking = 4, debugVrf = true))
-    test(new RegisterFile(Seq(1), Seq(1), 1, 1, 4, s"vrf_rmsnorm_prefetch_${withPrefetch}_${consumeScalar}",
+    test(new RegisterFile(Seq(1), Seq(1), 1, 1, 4, s"vrf_rmsnorm_prefetch_${withPrefetch}_${consumeScalar}_${externalBypass}",
       prefetchPorts = Seq((0, 0)), scalarPorts = Seq((0, 0)),
       bypassPorts = if (externalBypass) Seq((0, 0)) else Seq.empty))
       .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>

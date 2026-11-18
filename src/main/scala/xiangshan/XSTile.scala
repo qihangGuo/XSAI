@@ -561,6 +561,12 @@ class XSTile()(implicit p: Parameters) extends LazyModule
         XSPerfReference("evu_vmu_ack_wait", perf.vmuAckWait, XSPerfLevel.NORMAL)
         XSPerfReference("evu_vmu_entry_stalls", perf.vmuEntryStalls, XSPerfLevel.NORMAL)
         XSPerfReference("evu_job_full_cycles", perf.jobFullCycles, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_job_head_blocked_cycles", perf.jobHeadBlockedCycles, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_job_full_release_cycles", perf.jobFullReleaseCycles, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_dispatch_blocked_cycles", perf.execution.dispatchBlocked, XSPerfLevel.NORMAL)
+        for ((name, index) <- xiangshan.evu.common.EvuDispatchPerf.names.zipWithIndex) {
+          XSPerfReference(s"evu_dispatch_${name}_queue_blocked", perf.execution.dispatchQueueWait(index), XSPerfLevel.NORMAL)
+        }
         XSPerfReference("evu_fma_issue_cycles", perf.execution.fmaIssue, XSPerfLevel.NORMAL)
         XSPerfReference("evu_fma_no_work_cycles", perf.execution.fmaNoWork, XSPerfLevel.NORMAL)
         XSPerfReference("evu_fma_operand_wait_cycles", perf.execution.fmaOperandWait, XSPerfLevel.NORMAL)
@@ -584,9 +590,11 @@ class XSTile()(implicit p: Parameters) extends LazyModule
         for ((name, index) <- xiangshan.evu.common.EvuFuPerf.names.zipWithIndex) {
           val fu = perf.execution.byFu(index)
           XSPerfReference(s"evu_${name}_issue", fu.issue, XSPerfLevel.NORMAL)
+          XSPerfReference(s"evu_${name}_busy_cycles", fu.busy, XSPerfLevel.NORMAL)
           XSPerfReference(s"evu_${name}_dependency_wait", fu.dependencyWait, XSPerfLevel.NORMAL)
           XSPerfReference(s"evu_${name}_operand_wait", fu.operandWait, XSPerfLevel.NORMAL)
           XSPerfReference(s"evu_${name}_feedback_wait", fu.feedbackWait, XSPerfLevel.NORMAL)
+          XSPerfReference(s"evu_${name}_permutation_wait", fu.permutationWait, XSPerfLevel.NORMAL)
           XSPerfReference(s"evu_${name}_writeback_wait", fu.writebackWait, XSPerfLevel.NORMAL)
           XSPerfReference(s"evu_${name}_fu_wait", fu.executionWait, XSPerfLevel.NORMAL)
           XSPerfReference(s"evu_${name}_queue_wait", fu.queueWait, XSPerfLevel.NORMAL)
@@ -596,6 +604,7 @@ class XSTile()(implicit p: Parameters) extends LazyModule
           XSPerfReference(s"evu_${name}_queue_idle", fu.queueIdle, XSPerfLevel.NORMAL)
           XSPerfReference(s"evu_${name}_result_slot_wait", fu.resultSlotWait, XSPerfLevel.NORMAL)
           XSPerfReference(s"evu_${name}_priority_issues", fu.priorityIssues, XSPerfLevel.NORMAL)
+          XSPerfReference(s"evu_${name}_slide_prefetch_eligible", fu.slideLookaheadEligible, XSPerfLevel.NORMAL)
         }
       }
       if (env.EnableDifftest) {

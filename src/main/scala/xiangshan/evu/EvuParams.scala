@@ -40,6 +40,7 @@ case class EvuParams(
     alignedSlide: Boolean = true,
     singleGroupSlide: Boolean = true,
     crossInstructionPrefetch: Boolean = true,
+    slidePrefetch: Boolean = true,
     extendedResultForwarding: Boolean = true,
     shortResultForwarding: Boolean = true
 ) {

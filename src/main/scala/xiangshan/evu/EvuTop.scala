@@ -71,6 +71,8 @@ class EvuPerf extends Bundle {
   val vmuAckWait = UInt(64.W)
   val vmuEntryStalls = UInt(64.W)
   val jobFullCycles = UInt(64.W)
+  val jobHeadBlockedCycles = UInt(64.W)
+  val jobFullReleaseCycles = UInt(64.W)
   val execution = new xiangshan.evu.common.EvuExecutionPerf
 }
 
@@ -475,10 +477,18 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   io.perf.memoryComputeOverlap := vectorBackend.io.memoryComputeOverlap
   io.perf.vmuLoadMerges := perfVmuLoadMerges
   io.perf.vmuStoreMerges := perfVmuStoreMerges
-  val jobFullCycles = RegInit(0.U(64.W))
-  when(io.flush) { jobFullCycles := 0.U }
-    .elsewhen(commandArbiter.io.out.valid && !hasJobSlot) { jobFullCycles := jobFullCycles + 1.U }
-  io.perf.jobFullCycles := jobFullCycles
+  val jobPerf = Module(new EvuJobPerf(ep.commandDepth, ep.enableDifftest))
+  jobPerf.io.live := jobValid
+  jobPerf.io.completed := completionByJobValid
+  jobPerf.io.head := retireId
+  jobPerf.io.headValid := acceptedCount =/= 0.U
+  jobPerf.io.commandValid := commandArbiter.io.out.valid
+  jobPerf.io.hasSlot := hasJobSlot
+  jobPerf.io.retiring := io.completion.fire
+  jobPerf.io.flush := io.flush
+  io.perf.jobFullCycles := jobPerf.io.full
+  io.perf.jobHeadBlockedCycles := jobPerf.io.headBlocked
+  io.perf.jobFullReleaseCycles := jobPerf.io.fullRelease
   io.perf.execution := vectorBackend.io.executionPerf
 
   // Occupancy sums are tag-cycles/command-cycles, not transaction counts.
@@ -525,16 +535,21 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
     when(io.completion.fire && io.completion.bits.opcode === EvuOpcode.Fence) {
       fenceIndex := fenceIndex + 1.U
       when(trace.asBool) {
-        printf(p"[EVU-CONFIG] fence=${fenceIndex} dlen=${ep.dlenBits.U} mlen=${ep.mlenBits.U} vlen=${ep.vlenBits.U} fma_contexts=${ep.fmaOrdinaryContexts.U} reduction_contexts=${ep.reductionContexts.U} fp32_div_lanes=${(if (ep.parallelFp32Div) ep.dlenBits / 32 else 1).U}\n")
+        printf(p"[EVU-CONFIG] fence=${fenceIndex} dlen=${ep.dlenBits.U} mlen=${ep.mlenBits.U} vlen=${ep.vlenBits.U} fma_contexts=${ep.fmaOrdinaryContexts.U} reduction_contexts=${ep.reductionContexts.U} fp32_div_lanes=${(if (ep.parallelFp32Div) ep.dlenBits / 32 else 1).U} slide_prefetch=${ep.slidePrefetch.B}\n")
+        printf(p"[EVU-JOB] fence=${fenceIndex} full=${jobPerf.io.full} head=${jobPerf.io.headBlocked} release=${jobPerf.io.fullRelease}\n")
         printf(p"[EVU-VMU] fence=${fenceIndex} t=${perfCycles} cmd=${memoryCounters(0)} tag=${memoryCounters(1)} get=${memoryCounters(2)} put=${memoryCounters(3)} partial=${memoryCounters(4)} full=${memoryCounters(5)} ack=${memoryCounters(6)} entry=${memoryCounters(7)} win=${vectorBackend.io.memoryOrderStalls} merge=${perfVmuStoreMerges} rmwget=${rmwGets} rmwmerge=${rmwMerges}\n")
         val exe = vectorBackend.io.executionPerf
         val vrf = vectorBackend.io.vrfPerf
+        printf(p"[EVU-DISPATCH] fence=${fenceIndex} path=all queue=${exe.dispatchBlocked}\n")
+        for ((name, index) <- xiangshan.evu.common.EvuDispatchPerf.names.zipWithIndex) {
+          printf(p"[EVU-DISPATCH] fence=${fenceIndex} path=${name} queue=${exe.dispatchQueueWait(index)}\n")
+        }
         printf(p"[EVU-EXE] fence=${fenceIndex} dep=${exe.dependencyWait} operand=${exe.operandWait} feedback=${exe.feedbackWait} perm=${exe.permutationWait} wb=${exe.writebackWait} fu=${exe.executionWait} grant=${vrf.readGrantWait} resp=${vrf.readResponseWait} e0=${vrf.scalarForwards} early=${exe.earlyOperandReads} rpf=${exe.reductionPrefetches} dpw=${vrf.demandPrefetchWait} defer=${vrf.prefetchDeferred} used=${vrf.prefetchUsed} drop=${vrf.prefetchDiscarded} bank=${vrf.bankConflicts} wrblk=${vrf.writeBlocksRead} vfw=${exe.vectorForwards} vnew=${exe.vectorForwardNewer}\n")
         for ((name, index) <- xiangshan.evu.common.EvuFuPerf.names.zipWithIndex) {
           val fu = exe.byFu(index)
-          printf(p"[EVU-FU] fence=${fenceIndex} path=${name} issue=${fu.issue} dep=${fu.dependencyWait} operand=${fu.operandWait} feedback=${fu.feedbackWait} wb=${fu.writebackWait} fu=${fu.executionWait} queue=${fu.queueWait} dispatch=${fu.dispatchBlocked} idle=${fu.idleWithWork} arb=${fu.readyArbitrationWait} qi=${fu.queueIdle} slot=${fu.resultSlotWait} pri=${fu.priorityIssues} nowork=${fu.noWork} loadwait=${fu.loadWait} fwait=${fu.forwardWait}\n")
+          printf(p"[EVU-FU] fence=${fenceIndex} path=${name} issue=${fu.issue} busy=${fu.busy} dep=${fu.dependencyWait} operand=${fu.operandWait} feedback=${fu.feedbackWait} perm=${fu.permutationWait} wb=${fu.writebackWait} fu=${fu.executionWait} queue=${fu.queueWait} dispatch=${fu.dispatchBlocked} idle=${fu.idleWithWork} arb=${fu.readyArbitrationWait} qi=${fu.queueIdle} slot=${fu.resultSlotWait} pri=${fu.priorityIssues} nowork=${fu.noWork} loadwait=${fu.loadWait} fwait=${fu.forwardWait}\n")
           printf(p"[EVU-SCHED] fence=${fenceIndex} path=${name} ordinary=${fu.ordinaryFull} ordinary_idle=${fu.ordinaryFullIdle} reduction=${fu.reductionFull} ready_idle=${fu.operandsReadyIdle} eligible_idle=${fu.eligibleIdle} losers=${fu.readyLosers} bank_reserve=${fu.bankReservation} contexts=${fu.contextCycles} dispatch_red=${fu.dispatchReduction}\n")
-          printf(p"[EVU-HANDOFF] fence=${fenceIndex} path=${name} eligible=${fu.lookaheadEligible} idle=${fu.lookaheadIdle}\n")
+          printf(p"[EVU-HANDOFF] fence=${fenceIndex} path=${name} eligible=${fu.lookaheadEligible} idle=${fu.lookaheadIdle} slide=${fu.slideLookaheadEligible}\n")
           for ((stage, j) <- xiangshan.evu.common.EvuReductionStage.names.zipWithIndex) {
             val s = fu.stages(j)
             printf(p"[EVU-RED] fence=${fenceIndex} path=${name} stage=${stage} issue=${s.issues} e16=${s.elements16} e32=${s.elements32} feedback=${s.feedback} operand=${s.operands}\n")

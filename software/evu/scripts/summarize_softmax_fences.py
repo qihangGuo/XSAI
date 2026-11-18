@@ -8,13 +8,15 @@ from pathlib import Path
 
 
 FIELDS = re.compile(r"(\w+)=[ \t]*([^\s\[]+)")
-KINDS = "VMU|EXE|FU|PREFLIGHT|SCHED|OP|RED|READ|MEM|LAT|CONFIG|HANDOFF|TAIL|READHINT"
+KINDS = "VMU|EXE|FU|PREFLIGHT|SCHED|OP|RED|READ|MEM|LAT|CONFIG|HANDOFF|TAIL|READHINT|JOB|DISPATCH"
 RECORD = re.compile(r"\[EVU-(" + KINDS + r")\]\s+|\[OS\]\s+(?=(?:r|first)=)")
 HARDWARE = re.compile(r"\[EVU-(?:" + KINDS + r")\]\s+")
 GUEST = re.compile(r"\[OS\]\s+(?:r=|first=|DONE\b|PASS\b)[^\r\n]*(?:\r?\n)?")
 PATHS = ("fp_fma", "fp_cmp", "fp_exp")
 REQUIRED = {"VMU", "EXE"} | {"FU:" + path for path in PATHS}
 DIAGNOSTICS = {
+    "JOB": ((), ("full", "head", "release")),
+    "DISPATCH": (("path",), ("queue",)),
     "HANDOFF": (("path",), ("eligible", "idle")),
     "TAIL": (("path", "stage"), ("ready_wait", "return_issue")),
     "READHINT": (("path",), ("last_grant", "last_block")),

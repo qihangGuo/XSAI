@@ -93,6 +93,7 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     alignedSlide = p.alignedSlide,
     singleGroupSlide = p.singleGroupSlide,
     crossInstructionPrefetch = p.crossInstructionPrefetch,
+    slidePrefetch = p.slidePrefetch,
     extendedResultForwarding = p.extendedResultForwarding,
     shortResultForwarding = p.shortResultForwarding
   )

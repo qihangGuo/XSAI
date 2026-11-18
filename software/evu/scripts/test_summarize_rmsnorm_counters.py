@@ -23,6 +23,25 @@ def counter_log(cases=11):
 
 
 class RmsnormCountersTest(unittest.TestCase):
+    def test_integer_divider_dispatch_and_job_diagnostics_use_interval_deltas(self):
+        text = counter_log(cases=1)
+        for fence in (0, 1):
+            text += f'\n[EVU-FU] fence={fence} path=int issue={100 + fence * 886} busy={200 + fence * 1200} dep={30 + fence * 17} queue={40 + fence * 13} perm={9 + fence * 3}'
+            text += f'\n[EVU-FU] fence={fence} path=fp_div issue={10 + fence * 32} busy={100 + fence * 900} fu={50 + fence * 80}'
+            text += f'\n[EVU-JOB] fence={fence} full={100 + fence * 14} head={20 + fence * 9} release={3 + fence * 2}'
+            text += f'\n[EVU-DISPATCH] fence={fence} path=int queue={200 + fence * 31}'
+            text += f'\n[EVU-DISPATCH] fence={fence} path=all queue={300 + fence * 45}'
+            text += f'\n[EVU-HANDOFF] fence={fence} path=int eligible=100 idle=20 slide={50 + fence * 7}'
+        row, = summarize_counters(text)
+        for key, expected in {'int_issues': 886, 'int_busy_cycles': 1200, 'int_dependency_wait': 17,
+                              'int_queue_wait': 13, 'int_permutation_wait': 3,
+                              'div_issues': 32, 'div_busy_cycles': 900,
+                              'div_fu_wait': 80, 'job_full': 14, 'job_head_blocked': 9,
+                              'job_full_release': 2, 'dispatch_int_blocked': 31,
+                              'dispatch_all_blocked': 45, 'int_slide_prefetch_eligible': 7}.items():
+            self.assertEqual(row[key], expected, key)
+        self.assertEqual(row['dispatch_store_blocked'], '')
+
     def test_fused_only_uses_only_its_two_measurement_fences(self):
         text = counter_log(cases=1)
         rows = summarize_counters(text)

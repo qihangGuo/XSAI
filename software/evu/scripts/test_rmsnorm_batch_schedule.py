@@ -39,12 +39,12 @@ def integer(expression):
     return evaluate(ast.parse(expression, mode='eval').body)
 
 
-def instruction_trace(rename=1, banked=1, direct_first=False):
+def instruction_trace(rename=1, banked=1, direct_first=False, direct_maxima=0, scalar_first=0):
     compiler = shutil.which('clang') or shutil.which('cc')
     if not compiler:
         raise unittest.SkipTest('a C preprocessor is required; no binary is built')
     names = ('xv_setvli', 'XV_LOAD_E0', 'XV_BROADCAST', 'XV_SLIDEDOWN', 'XV_SLIDEUP',
-             'XV_FABS', 'XV_FREDUCE_MAX', 'XV_GATHER_IMM', 'XV_FMUL', 'XV_FDIV',
+             'XV_FABS', 'XV_FREDUCE_MAX', 'XV_GATHER_IMM', 'XV_FMUL', 'XV_FMUL_SCALAR', 'XV_FDIV',
              'XV_FMAX', 'XV_BINARY', 'XV_CVT_E4M3_F32', 'XV_CVT_F32_E4M3',
              'XV_CVT_MXFP4_F32', 'XV_STORE')
     source = '\n'.join(f'#define {name}(...) TRACE({name}, __VA_ARGS__)' for name in names)
@@ -55,7 +55,9 @@ def instruction_trace(rename=1, banked=1, direct_first=False):
     include = Path(__file__).resolve().parents[1] / 'include'
     text = subprocess.run([compiler, '-E', '-P', '-x', 'c', '-I' + str(include),
                            '-DEVU_RMS_QUANT_RENAME=' + str(rename),
-                           '-DEVU_RMS_QUANT_BANKED=' + str(banked), '-'],
+                           '-DEVU_RMS_QUANT_BANKED=' + str(banked),
+                           '-DEVU_RMS_QUANT_DIRECT_MAXIMA=' + str(direct_maxima),
+                           '-DEVU_RMS_QUANT_SCALAR_FIRST=' + str(scalar_first), '-'],
                           input=source, text=True, capture_output=True, check=True).stdout
     return parse_trace(text)
 
@@ -174,16 +176,18 @@ class BatchMachine:
             seed, source = map(integer, arguments[1:3])
             maximum = max([floating(self.words(seed)[0])] + list(map(floating, self.words(source)[:self.vl])))
             self.put_words(dest, [bits(maximum)])
-        elif operation in ('XV_FDIV', 'XV_FMUL', 'XV_FMAX'):
+        elif operation in ('XV_FDIV', 'XV_FMUL', 'XV_FMUL_SCALAR', 'XV_FMAX'):
             source1, source2 = map(integer, arguments[1:3])
             first, second = self.words(source1), self.words(source2)
+            if operation == 'XV_FMUL_SCALAR':
+                first = (first[0],) * self.vl
             results = []
             for index in range(self.vl):
                 denominator, numerator = floating(first[index]), floating(second[index])
                 if operation == 'XV_FDIV':
                     assert denominator != 0
                     result = numerator / denominator
-                elif operation == 'XV_FMUL':
+                elif operation in ('XV_FMUL', 'XV_FMUL_SCALAR'):
                     result = numerator * denominator
                 else:
                     result = max(numerator, denominator)
@@ -270,6 +274,35 @@ class RmsnormBatchScheduleTest(unittest.TestCase):
                         self.assertEqual(machine.output['scales'], scales)
                         self.assertEqual(machine.divisions, [16] * 24)
                         self.assertEqual(len(machine.stores), 18)
+
+    def test_fused_e0_move_optimizations_match_reference_individually_and_together(self):
+        generator = random.Random(1596)
+        patterns = [[-0.0] * 2048,
+                    [fp32(generator.uniform(-9, 9)) for _ in range(2048)],
+                    [fp32((index % 16 - 7.5) * 2 ** ((index // 16) % 48 - 24))
+                     for index in range(2048)]]
+        patterns[1][:16] = [0.0] * 16
+        patterns[1][16:32] = [-0.0] * 16
+        patterns[1][32:48] = [floating(1)] * 16
+        for banked, rename in ((1, 1), (1, 0), (0, 1), (0, 0)):
+            for maxima, scalar in ((1, 0), (0, 1), (1, 1)):
+                trace = instruction_trace(rename, banked, direct_first=True,
+                                          direct_maxima=maxima, scalar_first=scalar)
+                self.assertEqual(len(trace), 1504 - 8 * maxima - 8 * scalar)
+                for pattern, values in enumerate(patterns):
+                    for alpha in (fp32(1 / 448), 1.0):
+                        with self.subTest(banked=banked, rename=rename, maxima=maxima,
+                                          scalar=scalar, pattern=pattern, alpha=alpha):
+                            machine = BatchMachine(values, alpha)
+                            for register in machine.registers[16:]:
+                                register[:] = bytes(generator.getrandbits(8) for _ in register)
+                            for instruction in trace:
+                                machine.execute(*instruction)
+                            packed, scales = scalar_quantize(values, alpha)
+                            self.assertEqual(machine.output['packed'], packed)
+                            self.assertEqual(machine.output['scales'], scales)
+                            self.assertEqual(machine.divisions, [16] * 24)
+                            self.assertEqual(len(machine.stores), 18)
 
     def test_quantization_uses_one_fixed_configuration(self):
         configurations = [tuple(map(integer, arguments)) for operation, *arguments in self.trace

@@ -5,6 +5,12 @@
 #if EVU_RMS_QUANT_DIRECT_FIRST != 0 && EVU_RMS_QUANT_DIRECT_FIRST != 1
 #error "EVU_RMS_QUANT_DIRECT_FIRST must be 0 or 1"
 #endif
+#ifndef EVU_RMS_QUANT_DIRECT_MAXIMA
+#define EVU_RMS_QUANT_DIRECT_MAXIMA 1
+#endif
+#ifndef EVU_RMS_QUANT_SCALAR_FIRST
+#define EVU_RMS_QUANT_SCALAR_FIRST 1
+#endif
 #if EVU_RMS_QUANT_DIRECT_FIRST
 /* Pair starts are 0/2/4/6. Keep nonzero extraction order unchanged. */
 #define RN_FUSED_FIRST_0(copy, direct) direct
@@ -106,11 +112,12 @@ __attribute__((used, noinline)) static int rmsnorm_nvfp4_fused_test_main(void) {
   }
   initialize();
   fused_reference();
-  printf("[RN] config rows=4 cols=512 samples=%u input=%s alpha_bits=%08x eps_bits=%08x warmup=0 cases=1 format=11 quant_batch=16 quant_vl=16 quant_sew=32 quant_schedule=overlap lane_sum=%u quant_rename=%u quant_banked=%u quant_direct_first=%u workload=rmsnorm_nvfp4_evu quantization=evu profile=fused_row_major oracle_dlen=512\n",
+  printf("[RN] config rows=4 cols=512 samples=%u input=%s alpha_bits=%08x eps_bits=%08x warmup=0 cases=1 format=11 quant_batch=16 quant_vl=16 quant_sew=32 quant_schedule=overlap lane_sum=%u quant_rename=%u quant_banked=%u quant_direct_first=%u quant_direct_maxima=%u quant_scalar_first=%u workload=rmsnorm_nvfp4_evu quantization=evu profile=fused_row_major oracle_dlen=512\n",
     (unsigned)EVU_RMS_SAMPLES, EVU_RMS_BF16_INPUT ? "bf16_rounded_fp32" : "fp32",
     rn_float_bits(alpha), rn_float_bits(epsilon), (unsigned)EVU_RMS_LANE_SUM,
     (unsigned)EVU_RMS_QUANT_RENAME, (unsigned)EVU_RMS_QUANT_BANKED,
-    (unsigned)EVU_RMS_QUANT_DIRECT_FIRST);
+    (unsigned)EVU_RMS_QUANT_DIRECT_FIRST, (unsigned)EVU_RMS_QUANT_DIRECT_MAXIMA,
+    (unsigned)EVU_RMS_QUANT_SCALAR_FIRST);
   uint64_t cycles[EVU_RMS_SAMPLES], retired[EVU_RMS_SAMPLES];
   for (unsigned sample = 0; sample < EVU_RMS_SAMPLES; ++sample) {
     prepare(FUSED_NVFP4, 0);

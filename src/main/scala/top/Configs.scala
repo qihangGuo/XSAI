@@ -592,6 +592,10 @@ class DefaultExternalVectorSingleFmaContextMatrixConfig(n: Int = 1) extends Conf
   WithExternalVector(EvuParams(enable = true, fmaOrdinaryContexts = 1)) ++ new DefaultMatrixConfig(n)
 )
 
+class DefaultExternalVectorNoSlidePrefetchMatrixConfig(n: Int = 1) extends Config(
+  WithExternalVector(EvuParams(enable = true, slidePrefetch = false)) ++ new DefaultMatrixConfig(n)
+)
+
 class DefaultExternalVectorScalarDivMatrixConfig(n: Int = 1) extends Config(
   WithExternalVector(EvuParams(enable = true, parallelFp32Div = false)) ++ new DefaultMatrixConfig(n)
 )

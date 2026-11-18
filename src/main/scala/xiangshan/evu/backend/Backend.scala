@@ -233,6 +233,13 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
   val issq_stall = Wire(Vec(issGroups.size, Bool()))
   vdq.io.deq.ready := !issq_stall.orR && !reductionBlocked
+  io.executionPerf.dispatchBlocked := diagnosticCount("diag_dispatchBlocked",
+    vdq.io.deq.valid && !vdq.io.deq.ready)
+  val dispatchNames = Seq("load", "store", "special") ++ xissParams.map(_.name)
+  for ((name, index) <- dispatchNames.zipWithIndex if EvuDispatchPerf.names.contains(name)) {
+    io.executionPerf.dispatchQueueWait(EvuDispatchPerf.names.indexOf(name)) :=
+      diagnosticCount(s"diag_dispatch_${name}_queueWait", vdq.io.deq.valid && issq_stall(index))
+  }
 
   var flat_vxu_id: Int = 0
 
@@ -571,50 +578,40 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   for (((seqs, xu), factory) <- contextsByFu.zip(flat_vxus).zip(xissParams.flatMap(_.seqs))) {
     seqs.foreach(_.io.lookahead := 0.U.asTypeOf(seqs.head.io.lookahead))
     val lookaheadEligible = WireInit(false.B)
+    val slideLookaheadEligible = WireInit(false.B)
     if (vParams.crossInstructionPrefetch || factory.name == "fp_exp") {
       val queueIndex = xissParams.indexWhere(_.seqs.exists(_.name == factory.name))
       val next = vxissqs(queueIndex).io.deq
-      val ctrl = new VectorDecoder(next.bits, factory.insns, Seq(UsesGatherUnit))
-      val candidate = next.valid && seqs.head.accepts(next.bits) && next.bits.vm &&
-        next.bits.vstart === 0.U && next.bits.vconfig.vl =/= 0.U && !next.bits.reduction &&
-        !ctrl.bool(UsesGatherUnit) && seqs.head.io.atTail &&
-        (vParams.crossInstructionPrefetch.B || (!next.bits.scalar_to_vd0 &&
-          next.bits.vconfig.vtype.vsew === 2.U && next.bits.vconfig.vl >= (dLen / 32).U))
-      val enabled = Seq(next.bits.renv1 && !next.bits.reads_vs1_mask,
-        next.bits.renv2 && !next.bits.reads_vs2_mask, next.bits.renvd)
-      val registers = Seq(next.bits.rs1, next.bits.rs2, next.bits.rd)
-      val scalarGather = next.bits.funct3.isOneOf(OPIVI, OPIVX) && next.bits.opif6 === OPIFunct6.rgather
-      val gatherIndex = Mux(next.bits.funct3 === OPIVX, next.bits.rs1_data, next.bits.imm5)
-      val eligible = (0 until 3).map { port =>
-        val indexed = (port == 1).B && scalarGather
-        val eg = getEgId(registers(port), Mux(indexed, gatherIndex, 0.U), next.bits.vconfig.vtype.vsew, false.B)
-        val olderWriter = forwardWriters.map { writer =>
-          writer.valid && writer.bits.writes(eg) && vatOlder(writer.bits.vat, next.bits.vat)
-        }.foldLeft(false.B)(_ || _)
-        val allowed = candidate && enabled(port) && !olderWriter &&
-          (!indexed || gatherIndex < next.bits.vconfig.vtype.vlMax) &&
-          (vParams.crossInstructionPrefetch.B || (port == 1).B)
-        seqs.head.io.lookahead(port).valid := allowed
-        seqs.head.io.lookahead(port).bits.eg := eg
-        seqs.head.io.lookahead(port).bits.oldest := next.bits.vat === io.vat_head
-        seqs.head.io.lookahead(port).bits.lastOperand := false.B
-        allowed
-      }
-      lookaheadEligible := eligible.reduce(_ || _)
+      val prefetch = Module(new InstructionPrefetch(factory.insns, forwardWriters.size,
+        fallback = factory.name == "fp_exp"))
+      prefetch.io.next.valid := next.valid
+      prefetch.io.next.bits := next.bits.viewAsSupertype(new BackendIssueInst)
+      prefetch.io.accepts := seqs.head.accepts(next.bits)
+      prefetch.io.atTail := seqs.head.io.atTail
+      prefetch.io.vatHead := io.vat_head
+      prefetch.io.vatTail := io.vat_tail
+      prefetch.io.writers := VecInit(forwardWriters.toSeq)
+      seqs.head.io.lookahead := prefetch.io.hints
+      lookaheadEligible := prefetch.io.hints.map(_.valid).reduce(_ || _)
+      slideLookaheadEligible := prefetch.io.slide
     }
     val criticalPriority = factory.name == "fp_fma" || factory.name == "fp_cmp"
     val arb = Module(new SharedExecutionArbiter(seqs.size, maxPipeDepth, xu.nFUs, criticalPriority))
     for ((seq, c) <- seqs.zipWithIndex) { arb.io.in(c) <> executeCandidates(flat_vxs.indexOf(seq)) }
     xu.io.iss <> arb.io.out
     val perfIndex = EvuFuPerf.names.indexOf(factory.name)
-    if (perfIndex >= 0) {
+    if (perfIndex >= 0 && (vParams.diagnosticCounters || !Set("int", "fp_div").contains(factory.name))) {
       val counters = io.executionPerf.byFu(perfIndex)
       val queueIndex = xissParams.indexWhere(_.seqs.exists(_.name == factory.name))
       val queue = vxissqs(queueIndex)
       counters.issue := perfCount(xu.io.iss.fire)
+      counters.busy := diagnosticCount(s"diag_${factory.name}_busy",
+        seqs.map(_.io.busy).reduce(_ || _) || xu.io.busy)
       counters.dependencyWait := perfCount(seqs.map(_.io.waitReason.dependency).reduce(_ || _))
       counters.operandWait := perfCount(seqs.map(_.io.waitReason.operands).reduce(_ || _))
       counters.feedbackWait := perfCount(seqs.map(_.io.waitReason.feedback).reduce(_ || _))
+      counters.permutationWait := diagnosticCount(s"diag_${factory.name}_permutationWait",
+        seqs.map(_.io.waitReason.permutation).reduce(_ || _))
       counters.writebackWait := perfCount(seqs.map(_.io.waitReason.writeback).reduce(_ || _))
       counters.executionWait := perfCount(seqs.map(_.io.waitReason.execution).reduce(_ || _))
       counters.queueWait := perfCount(queue.io.deq.valid && !queue.io.deq.ready)
@@ -647,6 +644,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       if (vParams.diagnosticCounters) {
         counters.lookaheadEligible := diagnosticCount(s"diag_${factory.name}_lookaheadEligible", lookaheadEligible)
         counters.lookaheadIdle := diagnosticCount(s"diag_${factory.name}_lookaheadIdle", lookaheadEligible && !xu.io.iss.fire)
+        counters.slideLookaheadEligible := diagnosticCount(s"diag_${factory.name}_slideLookaheadEligible",
+          slideLookaheadEligible)
         val ordinaryBlocked = queue.io.deq.valid && !queue.io.deq.bits.reduction && !queue.io.deq.ready
         counters.ordinaryFull := diagnosticCount(s"diag_${factory.name}_ordinaryFull", ordinaryBlocked)
         counters.ordinaryFullIdle := diagnosticCount(s"diag_${factory.name}_ordinaryFullIdle",
@@ -933,12 +932,14 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   clearVat(vss.io.iss.fire && vss.io.iss.bits.tail, vss.io.iss.bits.vat)
   flat_vxus.foreach(_ => clearVat(false.B, 0.U))
 
-  if (vParams.diagnosticCounters && xissParams.flatMap(_.seqs).exists(s => EvuFuPerf.names.contains(s.name))) {
+  // Op classes decode FP funct6 values; integer/divider FU counters are separate.
+  val opClassPaths = Set("fp_fma", "fp_cmp", "fp_exp", "fp_xx8", "fp_mxfp")
+  if (vParams.diagnosticCounters && xissParams.flatMap(_.seqs).exists(s => opClassPaths.contains(s.name))) {
     val fpSeqs = contextsByFu.zip(xissParams.flatMap(_.seqs)).collect {
-      case (seqs, factory) if EvuFuPerf.names.contains(factory.name) => seqs
+      case (seqs, factory) if opClassPaths.contains(factory.name) => seqs
     }.flatten
     val fpUnits = flat_vxus.zip(xissParams.flatMap(_.seqs)).collect {
-      case (unit, factory) if EvuFuPerf.names.contains(factory.name) => unit
+      case (unit, factory) if opClassPaths.contains(factory.name) => unit
     }
     val classes = fpUnits.map(u => EvuOpClass(u.io.iss.bits))
     val seqClasses = fpSeqs.map(s => EvuOpClass(s.io.iss.bits))

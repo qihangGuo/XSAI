@@ -20,7 +20,7 @@ def summarize_counters(text):
     hardware = re.sub(r"\[RN(?:-SAMPLE)?\][^\r\n]*(?:\r?\n)?", "", text)
     snapshots = {}
     for record in records(hardware.splitlines(keepends=True)):
-        match = re.match(r"\[EVU-(EXE|FU|MEM|VMU)\]", record)
+        match = re.match(r"\[EVU-(EXE|FU|MEM|VMU|JOB|DISPATCH|HANDOFF)\]", record)
         if not match:
             continue
         sample = fields(record)
@@ -45,12 +45,25 @@ def summarize_counters(text):
                    ("FU:fp_mxfp", "operand", "mxfp_operand_wait"),
                    ("FU:fp_mxfp", "queue", "mxfp_queue_wait"), ("FU:fp_mxfp", "idle", "mxfp_idle_with_work"))
     diagnostics += tuple((f"FU:{path}", field, f"{label}_{name}")
-                         for path, label in (("fp_fma", "fma"), ("fp_cmp", "cmp"))
+                         for path, label in (("fp_fma", "fma"), ("fp_cmp", "cmp"),
+                                             ("int", "int"), ("fp_div", "div"))
                          for field, name in (("issue", "issues"), ("dep", "dependency_wait"),
                                              ("operand", "operand_wait"), ("feedback", "feedback_wait"),
+                                             ("perm", "permutation_wait"),
                                              ("wb", "writeback_wait"), ("fu", "fu_wait"),
                                              ("qi", "queue_idle"), ("slot", "result_slot_wait"),
-                                             ("loadwait", "load_wait"), ("fwait", "forward_wait")))
+                                             ("loadwait", "load_wait"), ("fwait", "forward_wait"),
+                                             ("busy", "busy_cycles")))
+    diagnostics += tuple((f"FU:{path}", field, f"{label}_{name}")
+                         for path, label in (("int", "int"), ("fp_div", "div"))
+                         for field, name in (("queue", "queue_wait"), ("dispatch", "dispatch_blocked"),
+                                             ("idle", "idle_with_work")))
+    diagnostics += (("JOB", "full", "job_full"), ("JOB", "head", "job_head_blocked"),
+                    ("JOB", "release", "job_full_release"),
+                    ("HANDOFF:int", "slide", "int_slide_prefetch_eligible"))
+    diagnostics += tuple((f"DISPATCH:{path}", "queue", f"dispatch_{path}_blocked")
+                         for path in ("all", "load", "store", "special", "int", "fp_fma", "fp_cmp",
+                                      "fp_exp", "fp_div", "fp_conv", "fp_xx8", "fp_mxfp"))
     for sample in samples:
         key = sample["stage"], sample["schedule"], int(sample["sample"])
         if key not in expected or key in seen or int(sample["errors"]):

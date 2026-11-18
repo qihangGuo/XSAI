@@ -314,14 +314,21 @@ class PipeHazard(pipe_depth: Int)(implicit p: Parameters) extends CoreBundle()(p
 }
 
 object EvuFuPerf {
-  val names = Seq("fp_fma", "fp_cmp", "fp_exp", "fp_xx8", "fp_mxfp")
+  val names = Seq("fp_fma", "fp_cmp", "fp_exp", "fp_xx8", "fp_mxfp", "int", "fp_div")
+}
+
+object EvuDispatchPerf {
+  val names = Seq("load", "store", "special", "int", "fp_fma", "fp_cmp", "fp_exp",
+    "fp_div", "fp_conv", "fp_xx8", "fp_mxfp")
 }
 
 class EvuFuPerf extends Bundle {
   val issue = UInt(64.W)
+  val busy = UInt(64.W) // An active sequencer or execution pipeline; excludes queue-only work.
   val dependencyWait = UInt(64.W)
   val operandWait = UInt(64.W)
   val feedbackWait = UInt(64.W)
+  val permutationWait = UInt(64.W)
   val writebackWait = UInt(64.W)
   val executionWait = UInt(64.W)
   val queueWait = UInt(64.W)
@@ -345,10 +352,13 @@ class EvuFuPerf extends Bundle {
   val dispatchReduction = UInt(64.W)
   val lookaheadEligible = UInt(64.W)
   val lookaheadIdle = UInt(64.W)
+  val slideLookaheadEligible = UInt(64.W)
   val stages = Vec(EvuReductionStage.names.size, new EvuReductionPerf)
 }
 
 class EvuExecutionPerf extends Bundle {
+  val dispatchBlocked = UInt(64.W)
+  val dispatchQueueWait = Vec(EvuDispatchPerf.names.size, UInt(64.W))
   val vectorForwards = UInt(64.W)
   val vectorForwardNewer = UInt(64.W)
   val fmaIssue = UInt(64.W)

@@ -10,6 +10,10 @@ packing order and storage boundaries stay shared. Only this entry enables
 instead of a temporary copy, removing 32 zero-offset slidedown instructions.
 Temporary tails stay undisturbed and are not newly consumed. The original
 11-case test is unchanged when built normally.
+The fused entry also defaults `EVU_RMS_QUANT_DIRECT_MAXIMA=1` and
+`EVU_RMS_QUANT_SCALAR_FIRST=1`: eight first amax results write maxima E0
+directly, and eight first packing multiplies read inverse E0 without a gather.
+Each option removes eight commands and can be disabled independently.
 
 ## Timing and validation
 
@@ -35,8 +39,10 @@ Each eligible call should contain 128 amax instructions and comparison-FU issue
 count 272 with direct min/max, versus 400 with it disabled. Do not expect this
 internal issue reduction to translate proportionally into kernel cycles.
 
-With the default lane-sum setting, whole-guest EVU completion count is 1,612
-with direct-first extraction and 1,644 with it disabled. Two of those commands
+With the default lane-sum setting, whole-guest EVU completion count is 1,596.
+Disabling direct-maxima or scalar-first adds eight commands each; disabling
+direct-first extraction adds 32. The 4183-cycle software baseline has both new
+options disabled and completes 1,612 commands. Two of those commands
 (initial SETVLI and preparation FENCE) are outside the timed interval. FMA/CMP
 issues remain 684/272, FP8/FP4 issues remain 16/128, DIV issues remain 32, and
 memory gets/puts remain 171/18. These expectations assume one sample and the
@@ -91,7 +97,8 @@ The default configuration remains `DefaultExternalVectorMatrixConfig`.
 
 Four new end-of-guest performance counters are:
 
-- `evu_amu_completion_fire`: accepted completions, expected 1,612 or 1,644.
+- `evu_amu_completion_fire`: accepted completions, expected 1,596 by default;
+  add eight per disabled new option and 32 when direct-first is disabled.
 - `evu_amu_completion_blocked`: completion valid while AMU is not ready, including
   redirects and genuinely unaccepted targets, not just the old dequeue bubble.
 - `evu_amu_completion_lookahead`: accepted completion targeting beyond the old
@@ -100,7 +107,8 @@ Four new end-of-guest performance counters are:
   the feature disabled, potentially nonzero with it enabled.
 
 Build the software baseline on the server with
-`NAME=rmsnorm_nvfp4_fused_evu_test EVU_RMS_QUANT_DIRECT_FIRST=0`. The Makefile uses
+`NAME=rmsnorm_nvfp4_fused_evu_test EVU_RMS_QUANT_DIRECT_FIRST=0
+EVU_RMS_QUANT_DIRECT_MAXIMA=0 EVU_RMS_QUANT_SCALAR_FIRST=0`. The Makefile uses
 separate variant object directories and a suffixed baseline image path; the
 header prints `quant_direct_first=0` or `1`. Compare the same software image on
 both hardware configurations, then both software images on the same hardware.
@@ -155,3 +163,8 @@ to either one. The subsequent combined server run passes Difftest at 4183 cycles
 its log hash and counter evidence are recorded in
 [EVU_CHECKPOINT_2026-11-18.md](EVU_CHECKPOINT_2026-11-18.md). Isolated A/B and
 hardware FENCE snapshots remain required to attribute individual gains.
+
+The next candidate enables direct-slide prefetch and additional integer,
+divider, dispatch and job diagnostics. Its software and hardware A/B commands,
+counter definitions and expected counts are in
+[RMSNORM_SLIDE_PREFETCH_AB.md](RMSNORM_SLIDE_PREFETCH_AB.md).

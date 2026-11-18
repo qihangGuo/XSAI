@@ -73,14 +73,56 @@
 #define RN_BATCH_FIRST_REG(first, block, source) first
 #endif
 
+#ifndef EVU_RMS_QUANT_DIRECT_MAXIMA
+#define EVU_RMS_QUANT_DIRECT_MAXIMA 0
+#endif
+#ifndef EVU_RMS_QUANT_SCALAR_FIRST
+#define EVU_RMS_QUANT_SCALAR_FIRST 0
+#endif
+#if (EVU_RMS_QUANT_DIRECT_MAXIMA != 0 && EVU_RMS_QUANT_DIRECT_MAXIMA != 1) || \
+    (EVU_RMS_QUANT_SCALAR_FIRST != 0 && EVU_RMS_QUANT_SCALAR_FIRST != 1)
+#error "EVU_RMS_QUANT_DIRECT_MAXIMA and EVU_RMS_QUANT_SCALAR_FIRST must be 0 or 1"
+#endif
+
+/* Pair indices are literals: select E0 without adding scalar control flow. */
+#define RN_BATCH_ZERO_0(zero, other) zero
+#define RN_BATCH_ZERO_2(zero, other) other
+#define RN_BATCH_ZERO_4(zero, other) other
+#define RN_BATCH_ZERO_6(zero, other) other
+#define RN_BATCH_ZERO_8(zero, other) other
+#define RN_BATCH_ZERO_10(zero, other) other
+#define RN_BATCH_ZERO_12(zero, other) other
+#define RN_BATCH_ZERO_14(zero, other) other
+#define RN_BATCH_ZERO_IMPL(index, zero, other) RN_BATCH_ZERO_##index(zero, other)
+#define RN_BATCH_ZERO(index, zero, other) RN_BATCH_ZERO_IMPL(index, zero, other)
+
+#if EVU_RMS_QUANT_DIRECT_MAXIMA
+#define RN_BATCH_MAX_DEST(index, first) RN_BATCH_ZERO(index, RN_QUANT_MAXIMA, first)
+#define RN_BATCH_MAX_INSERT(index, first) \
+  RN_BATCH_ZERO(index, (void)0, XV_SLIDEUP(RN_QUANT_MAXIMA, index, first, 2))
+#else
+#define RN_BATCH_MAX_DEST(index, first) first
+#define RN_BATCH_MAX_INSERT(index, first) XV_SLIDEUP(RN_QUANT_MAXIMA, index, first, 2)
+#endif
+
+#if EVU_RMS_QUANT_SCALAR_FIRST
+#define RN_BATCH_PACK_GATHER(index, inverse) \
+  RN_BATCH_ZERO(index, (void)0, XV_GATHER_IMM(18, index, inverse, 2))
+#define RN_BATCH_PACK_MUL(index, source, inverse) \
+  RN_BATCH_ZERO(index, XV_FMUL_SCALAR(16, inverse, source), XV_FMUL(16, 18, source, 2))
+#else
+#define RN_BATCH_PACK_GATHER(index, inverse) XV_GATHER_IMM(18, index, inverse, 2)
+#define RN_BATCH_PACK_MUL(index, source, inverse) XV_FMUL(16, 18, source, 2)
+#endif
+
 #define RN_BATCH_MAX_PAIR_REGS(source, block, index, first, second, abs_first, abs_second) do { \
   RN_BATCH_EXTRACT_FIRST(first, block, source); \
   XV_SLIDEDOWN(second, 16 * ((block) + 1), source, 2); \
   XV_FABS(abs_first, RN_BATCH_FIRST_REG(first, block, source), 2); \
   XV_FABS(abs_second, second, 2); \
-  XV_FREDUCE_MAX(first, RN_QUANT_ZERO, abs_first, 2); \
+  XV_FREDUCE_MAX(RN_BATCH_MAX_DEST(index, first), RN_QUANT_ZERO, abs_first, 2); \
   XV_FREDUCE_MAX(second, RN_QUANT_ZERO, abs_second, 2); \
-  XV_SLIDEUP(RN_QUANT_MAXIMA, index, first, 2); \
+  RN_BATCH_MAX_INSERT(index, first); \
   XV_SLIDEUP(RN_QUANT_MAXIMA, (index) + 1, second, 2); \
 } while (0)
 
@@ -96,9 +138,9 @@
 #define RN_BATCH_PACK_PAIR(source, block, index, next_index, inverse, mask) do { \
   RN_BATCH_EXTRACT_FIRST(16, block, source); \
   XV_SLIDEDOWN(RN_QUANT_SECOND, 16 * ((block) + 1), source, 2); \
-  XV_GATHER_IMM(18, index, inverse, 2); \
+  RN_BATCH_PACK_GATHER(index, inverse); \
   XV_GATHER_IMM(19, next_index, inverse, 2); \
-  XV_FMUL(16, 18, RN_BATCH_FIRST_REG(16, block, source), 2); \
+  RN_BATCH_PACK_MUL(index, RN_BATCH_FIRST_REG(16, block, source), inverse); \
   XV_FMUL(RN_QUANT_SECOND, 19, RN_QUANT_SECOND, 2); \
   XV_GATHER_IMM(18, index, mask, 2); \
   XV_GATHER_IMM(19, next_index, mask, 2); \
@@ -182,15 +224,15 @@
   XV_SLIDEDOWN(3, 16 * ((block) + 1), next_source, 2); \
   XV_SLIDEDOWN(RN_QUANT_SECOND, 16 * ((block) + 1), source, 2); \
   XV_FABS(2, RN_BATCH_FIRST_REG(2, block, next_source), 2); \
-  XV_GATHER_IMM(18, index, inverse, 2); \
+  RN_BATCH_PACK_GATHER(index, inverse); \
   XV_FABS(3, 3, 2); \
   XV_GATHER_IMM(19, next_index, inverse, 2); \
-  XV_FMUL(16, 18, RN_BATCH_FIRST_REG(16, block, source), 2); \
-  XV_FREDUCE_MAX(2, RN_QUANT_ZERO, 2, 2); \
+  RN_BATCH_PACK_MUL(index, RN_BATCH_FIRST_REG(16, block, source), inverse); \
+  XV_FREDUCE_MAX(RN_BATCH_MAX_DEST(index, 2), RN_QUANT_ZERO, 2, 2); \
   XV_FMUL(RN_QUANT_SECOND, 19, RN_QUANT_SECOND, 2); \
   XV_FREDUCE_MAX(3, RN_QUANT_ZERO, 3, 2); \
   XV_GATHER_IMM(18, index, mask, 2); \
-  XV_SLIDEUP(RN_QUANT_MAXIMA, index, 2, 2); \
+  RN_BATCH_MAX_INSERT(index, 2); \
   XV_GATHER_IMM(19, next_index, mask, 2); \
   XV_SLIDEUP(RN_QUANT_MAXIMA, (index) + 1, 3, 2); \
   XV_BINARY(0x03, 16, 18, 16, 2); \

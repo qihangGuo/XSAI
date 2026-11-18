@@ -380,6 +380,7 @@ case class VectorParams(
   alignedSlide: Boolean = false,
   singleGroupSlide: Boolean = false,
   crossInstructionPrefetch: Boolean = false,
+  slidePrefetch: Boolean = false,
   extendedResultForwarding: Boolean = false,
   shortResultForwarding: Boolean = false,
 

@@ -40,12 +40,14 @@ class FusedProfileTest(unittest.TestCase):
     def test_riscv_syntax_and_option_validation_without_code_generation(self):
         source = SOFTWARE / 'rmsnorm_nvfp4_fused_evu_test.c'
         for flags in ([], ['-DEVU_RMS_QUANT_DIRECT_FIRST=0'],
+                      ['-DEVU_RMS_QUANT_DIRECT_MAXIMA=0'], ['-DEVU_RMS_QUANT_SCALAR_FIRST=0'],
                       ['-DEVU_RMS_SAMPLES=3'], ['-DEVU_RMS_LANE_SUM=0'],
                       ['-DEVU_RMS_BF16_INPUT=1', '-DEVU_RMS_QUANT_BANKED=0', '-DEVU_RMS_QUANT_RENAME=0']):
             result = subprocess.run(self.compiler() + ['-fsyntax-only', *flags, str(source)],
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-        for flag in ('-DEVU_RMS_ONLY=1', '-DEVU_RMS_SAMPLES=0', '-DEVU_RMS_QUANT_DIRECT_FIRST=2'):
+        for flag in ('-DEVU_RMS_ONLY=1', '-DEVU_RMS_SAMPLES=0', '-DEVU_RMS_QUANT_DIRECT_FIRST=2',
+                     '-DEVU_RMS_QUANT_DIRECT_MAXIMA=2', '-DEVU_RMS_QUANT_SCALAR_FIRST=2'):
             result = subprocess.run(self.compiler() + ['-fsyntax-only', flag, str(source)],
                                     capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
@@ -56,6 +58,7 @@ class FusedProfileTest(unittest.TestCase):
             for name in ('rmsnorm_nvfp4_evu_test.c', 'rmsnorm_nvfp4_fused_evu_test.c'):
                 result = subprocess.run(self.compiler() + ['-E', '-P', f'-DEVU_RMS_LANE_SUM={lane_sum}',
                                         '-DEVU_RMS_QUANT_DIRECT_FIRST=0',
+                                        '-DEVU_RMS_QUANT_DIRECT_MAXIMA=0', '-DEVU_RMS_QUANT_SCALAR_FIRST=0',
                                         str(SOFTWARE / name)], capture_output=True, text=True, check=True)
                 sources.append(result.stdout)
             for name in ('load_operands', 'sum_of_squares', 'scale_epsilon', 'evu_rsqrt',
@@ -85,9 +88,11 @@ class FusedProfileTest(unittest.TestCase):
         self.assertIn('memcmp(scales.data, reference_scales', checker)
         self.assertIn('memcmp(packed.data, reference_packed', checker)
 
-    def quantization_program(self, direct, banked=1, rename=1):
+    def quantization_program(self, direct, banked=1, rename=1, maxima=0, scalar=0):
         result = subprocess.run(self.compiler() + ['-E', '-P',
                                 f'-DEVU_RMS_QUANT_DIRECT_FIRST={direct}',
+                                f'-DEVU_RMS_QUANT_DIRECT_MAXIMA={maxima}',
+                                f'-DEVU_RMS_QUANT_SCALAR_FIRST={scalar}',
                                 f'-DEVU_RMS_QUANT_BANKED={banked}', f'-DEVU_RMS_QUANT_RENAME={rename}',
                                 str(SOFTWARE / 'rmsnorm_nvfp4_fused_evu_test.c')],
                                 capture_output=True, text=True, check=True)
@@ -134,6 +139,18 @@ class FusedProfileTest(unittest.TestCase):
                 self.assertEqual(len(new_stores), 18)
                 self.assertEqual(sum(len(data) for _, data in new_stores), 1152)
 
+    def test_direct_maxima_and_scalar_first_remove_eight_moves_each_without_changing_bytes(self):
+        for banked, rename in ((1, 1), (1, 0), (0, 1), (0, 0)):
+            baseline = self.quantization_program(1, banked, rename)
+            symbols = {}
+            expected = symbolic_quantization(baseline, symbols)
+            for maxima, scalar in ((1, 0), (0, 1), (1, 1)):
+                with self.subTest(banked=banked, rename=rename, maxima=maxima, scalar=scalar):
+                    candidate = self.quantization_program(1, banked, rename, maxima, scalar)
+                    self.assertEqual(len(candidate), 1504 - 8 * maxima - 8 * scalar)
+                    self.assertEqual(sum(op[0] == 0x5c for op in candidate), 8 * scalar)
+                    self.assertEqual(symbolic_quantization(candidate, symbols), expected)
+
 
 def integer_expression(text):
     def value(node):
@@ -176,6 +193,9 @@ def symbolic_quantization(program, symbols):
         opcode, dest, first, second, address = instruction
         right = registers[second][:64]
         left = registers[first][:64] if opcode in (0x02, 0x03, 0x25, 0x32, 0x34, 0x36, 0x44, 0x66, 0x75) else []
+        if opcode == 0x5c:
+            left = registers[first][:4] * 16
+            opcode = 0x32
         if opcode == 0x52:
             registers[dest][:4] = [symbol(('load', address, byte)) for byte in range(4)]
         elif opcode == 0x11:
