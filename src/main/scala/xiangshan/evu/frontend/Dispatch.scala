@@ -22,35 +22,15 @@ class VectorDispatcher(implicit p: Parameters) extends CoreModule()(p) with HasV
     val vat_release = Input(Vec(nRelease, Valid(UInt(vParams.vatSz.W))))
     val vat_head = Output(UInt(vParams.vatSz.W))
     val vat_tail = Output(UInt(vParams.vatSz.W))
+    val commandHead = Option.when(vParams.externalCommandTags)(Input(UInt(vParams.vatSz.W)))
+    val commandTail = Option.when(vParams.externalCommandTags)(Input(UInt(vParams.vatSz.W)))
   })
 
   val debug_id_ctr = RegInit(0.U(debugIdSz.W))
-  val vat_valids = RegInit(VecInit.fill(1 << vParams.vatSz)(false.B))
-  val vat_tail = RegInit(0.U(vParams.vatSz.W))
-  val vat_head = RegInit(0.U(vParams.vatSz.W))
-  def vatOlder(i0: UInt, i1: UInt) = cqOlder(i0, i1, vat_tail)
-  val vat_available = !vat_valids(vat_tail)
-  val vat_available_count = PopCount(~vat_valids.asUInt)
-  val vat_head_incr = WireInit(false.B)
-
-  when (vat_head_incr) {
-    vat_head := vat_head + 1.U
-  }
-
-  when (io.dis.fire) {
-    assert(!vat_valids(vat_tail))
-    vat_valids(vat_tail) := true.B
-    vat_tail := vat_tail + 1.U
-    debug_id_ctr := debug_id_ctr + 1.U
-  }
-
-  when (vat_tail =/= vat_head && !vat_valids(vat_head)) {
-    vat_head_incr := true.B
-  }
-
   val issue_inst = WireInit(io.issue.bits)
-  issue_inst.vat := vat_tail
   issue_inst.debug_id := debug_id_ctr
+  when(io.dis.fire) { debug_id_ctr := debug_id_ctr + 1.U }
+  val vat_available = WireDefault(true.B)
 
   val hwacha_limiter = vParams.hwachaLimiter.map(n => Module(new HwachaLimiter(n)))
   hwacha_limiter.foreach { h =>
@@ -60,13 +40,38 @@ class VectorDispatcher(implicit p: Parameters) extends CoreModule()(p) with HasV
   }
   val hwacha_block = hwacha_limiter.map(_.io.block).getOrElse(false.B)
 
+  if (vParams.externalCommandTags) {
+    issue_inst.vat := io.issue.bits.vat
+    io.vat_head := io.commandHead.get
+    io.vat_tail := io.commandTail.get
+  } else {
+    val vat_valids = RegInit(VecInit.fill(1 << vParams.vatSz)(false.B))
+    val vat_tail = RegInit(0.U(vParams.vatSz.W))
+    val vat_head = RegInit(0.U(vParams.vatSz.W))
+    val vat_head_incr = WireDefault(false.B)
+    vat_available := !vat_valids(vat_tail)
+    issue_inst.vat := vat_tail
+    io.vat_head := vat_head
+    io.vat_tail := vat_tail
+    when(vat_head_incr) { vat_head := vat_head + 1.U }
+    when(io.dis.fire) {
+      assert(!vat_valids(vat_tail))
+      vat_valids(vat_tail) := true.B
+      vat_tail := vat_tail + 1.U
+    }
+    when(vat_tail =/= vat_head && !vat_valids(vat_head)) { vat_head_incr := true.B }
+    for (r <- io.vat_release) {
+      when(r.valid) {
+        assert(vat_valids(r.bits))
+        when(r.bits === vat_head) { vat_head_incr := true.B }
+        vat_valids(r.bits) := false.B
+      }
+    }
+  }
 
   io.issue.ready := vat_available && io.dis.ready   && (!issue_inst.vmu || io.mem.ready) && !hwacha_block
   io.dis.valid   := vat_available && io.issue.valid && (!issue_inst.vmu || io.mem.ready) && !hwacha_block
   io.mem.valid   := vat_available && io.issue.valid && io.dis.ready && issue_inst.vmu    && !hwacha_block
-
-  io.vat_tail := vat_tail
-  io.vat_head := vat_head
 
   val move_to_scalar = (
     (io.issue.bits.funct3 === OPMVV && io.issue.bits.opmf6 === OPMFunct6.wrxunary0 && io.issue.bits.rs1 === 0.U) ||
@@ -130,9 +135,6 @@ class VectorDispatcher(implicit p: Parameters) extends CoreModule()(p) with HasV
 
   for (r <- io.vat_release) {
     when (r.valid) {
-      assert(vat_valids(r.bits))
-      when (r.bits === vat_head) { vat_head_incr := true.B }
-      vat_valids(r.bits) := false.B
       hwacha_limiter.foreach(_.io.vat_release(r.bits) := true.B)
     }
   }

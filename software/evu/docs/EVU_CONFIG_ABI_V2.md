@@ -1,7 +1,9 @@
 # EVU configuration ABI 2
 
-Date: 2026-11-09. Source complete; Scala/RTL integration, numerical and performance
-regressions require server execution. This ABI intentionally breaks compatibility
+ABI introduction date: 2026-11-09. This document specifies the retained ABI;
+the rollout notes below are historical. Current acceptance results are in
+[EVU_CHECKPOINT_2026-11-19.md](EVU_CHECKPOINT_2026-11-19.md).
+This ABI intentionally breaks compatibility
 with old configuration instructions, context buffers and the old reference library.
 
 ## Changes
@@ -86,7 +88,7 @@ make -C software/evu ARCH=riscv64-xs CROSS_COMPILE= \
 ```
 
 Also rebuild/run `NAME=csr_context_evu_test` before the performance tests and
-rebuild the FlashAttention variant being measured. The ordinary build rules track
+rebuild the ordinary vector workload being measured. The ordinary build rules track
 header changes; ensure the selected bin actually comes from this synchronized tree.
 
 ```sh
@@ -116,12 +118,12 @@ mill -i evuMmuCheck.test.testOnly xiangshan.evucheck.EvuRobOrderingSpec
 Coverage includes all 256 VTYPE bytes, zero/large AVL, high-bit rejection,
 scalar input aliases, rd=x0, no duplicate scalar completion write, removed
 CSR faults, M-only EVCFG writes, normalized context restore and config/result
-agreement under backpressure. Existing ordering/redirect, softmax, EXP2,
-memory/FENCE and FlashAttention regressions still apply. Run EVU-disabled
+agreement under backpressure. Existing ordering/redirect, softmax, EXP2 and
+memory/FENCE regressions still apply. Run EVU-disabled
 configuration elaboration too. Passing source checks does not establish RTL
 correctness or timing.
 
-Local checks completed without bins: GCC syntax-only for NEMU model, compute,
+Historical ABI-rollout checks completed without bins: GCC syntax-only for NEMU model, compute,
 CSR permission code and native reference tests; Clang RISC-V syntax-only for
 CSR/context, softmax and FlashAttention guests; native FlashAttention syntax;
 LLVM textual assembly encoding of both new forms; Python log-parser tests;

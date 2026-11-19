@@ -295,6 +295,7 @@ cases = [(32, 256, 256, 1.0), (4, 1, 8, .5), (8, 17, 32, 2.0),
          (8, 255, 264, .75), (4, 257, 280, 1.0), (4, 512, 512, 2.0)]
 checked = 0
 memory_costs = {}
+default_costs = {}
 for rows, cols, stride, scale, state, reduce, pipeline, load_batch in [
         (r, c, s, x, 0, 128, 0, 0) for r, c, s, x in cases] + [
         (r, c, s, x, state, red, 0, 0)
@@ -378,9 +379,30 @@ for rows, cols, stride, scale, state, reduce, pipeline, load_batch in [
                     sum(dut.counts[name] for name in
                         ['XV_LOAD', 'XV_LOAD_E0', 'XV_STORE', 'XV_STORE_E0']),
                     dut.counts['configs'], dut.counts['XV_GATHER_IMM'])
+                if not load_batch:
+                    default_costs[first] = {
+                        name: value for name, value in dut.counts.items()
+                        if value and (name.startswith('XV_') or name == 'configs')
+                    }
         checked += 1
 for (batch, first), (commands, configs, gathers) in sorted(memory_costs.items()):
     print(f'COST: loads4={batch} first={first} memory_commands={commands} '
           f'configs={configs} gathers={gathers}')
+for first, counts in sorted(default_costs.items()):
+    expected = ({'configs': 1, 'XV_LOAD_E0': 69, 'XV_LOAD': 64,
+                 'XV_STORE_E0': 96, 'XV_STORE': 64, 'XV_FMAX': 32,
+                 'XV_FREDUCE_MAX': 32, 'XV_FMAX_E0': 32, 'XV_FMUL_SCALAR': 64,
+                 'XV_FSUB_E0': 32, 'XV_FMUL_E0': 96, 'XV_EXP2_E0': 32,
+                 'XV_FSUB_SCALAR': 64, 'XV_EXP2': 64, 'XV_FADD': 32,
+                 'XV_FREDUCE_SUM': 32, 'XV_FADD_E0': 32} if not first else
+                {'configs': 1, 'XV_LOAD_E0': 5, 'XV_LOAD': 64,
+                 'XV_STORE_E0': 96, 'XV_STORE': 64, 'XV_FMAX': 32,
+                 'XV_FREDUCE_MAX': 32, 'XV_FMUL_SCALAR': 64,
+                 'XV_FMUL_E0': 32, 'XV_FSUB_SCALAR': 64, 'XV_EXP2': 64,
+                 'XV_FADD': 32, 'XV_FREDUCE_SUM': 32})
+    assert counts == expected, (first, counts)
+    print(f'WORK: first={first} commands={sum(counts.values())} '
+          '(online_update only; excludes caller FENCE/CSR accesses)')
+    print('OPS: ' + ' '.join(f'{name}={value}' for name, value in sorted(counts.items())))
 print(f'PASS: {checked} source-driven schedules; wavefront matches per-row baseline; '
       'syntax checked; ideal exp2 only, no RTL run.')

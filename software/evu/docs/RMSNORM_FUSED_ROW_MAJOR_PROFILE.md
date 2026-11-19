@@ -1,5 +1,10 @@
 # Fused row-major profiling
 
+The current RTL candidate uses a unified 32-command VAT/job window and no
+completion FIFO. Its checkpoint, structure and server A/B procedure are in
+[EVU_UNIFIED_COMMAND_WINDOW.md](EVU_UNIFIED_COMMAND_WINDOW.md). Historical
+measurements below retain their original hardware configuration.
+
 `rmsnorm_nvfp4_fused_evu_test.c` runs only
 `stage=fused_nvfp4 schedule=row_major`: four FP32 rows of 512 elements, RMSNorm
 and NVFP4, including input loads and the final 1,152 output bytes. No empty,

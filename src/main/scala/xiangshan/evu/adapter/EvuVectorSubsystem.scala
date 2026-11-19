@@ -26,6 +26,9 @@ class EvuVectorSubsystem(implicit p: Parameters)
     val completed = Output(Vec(nRelease, Valid(UInt(vParams.vatSz.W))))
     val completionVxsat = Output(Vec(nRelease, Bool()))
     val completionFflags = Output(Vec(nRelease, UInt(5.W)))
+    val commandHead = Option.when(vParams.externalCommandTags)(Input(UInt(vParams.vatSz.W)))
+    val commandTail = Option.when(vParams.externalCommandTags)(Input(UInt(vParams.vatSz.W)))
+    val scheduleRelease = Option.when(vParams.externalCommandTags)(Output(UInt((1 << vParams.vatSz).W)))
     val setVxsat = Output(Bool())
     val setFflags = Output(Valid(UInt(5.W)))
     val busy = Output(Bool())
@@ -50,6 +53,11 @@ class EvuVectorSubsystem(implicit p: Parameters)
   backend.io.vat_head := dispatcher.io.vat_head
   backend.io.vat_tail := dispatcher.io.vat_tail
   dispatcher.io.vat_release := backend.io.vat_release
+  dispatcher.io.commandHead.foreach(_ := io.commandHead.get)
+  dispatcher.io.commandTail.foreach(_ := io.commandTail.get)
+  io.scheduleRelease.foreach(_ := backend.io.vat_release.map { release =>
+    Mux(release.valid, UIntToOH(release.bits, 1 << vParams.vatSz), 0.U)
+  }.reduce(_ | _))
   io.completed := backend.io.vat_release
   io.completionVxsat := backend.io.completion_vxsat
   io.completionVxsat(1) := false.B

@@ -38,5 +38,4 @@ No rebuilt reference or simulator has been executed locally for this migration.
 The exact server commands and acceptance criteria are in
 [EVU_PURE_VECTOR_PLAN.md](EVU_PURE_VECTOR_PLAN.md); actual checks are recorded in
 [EVU_PURE_VECTOR_PROGRESS.md](EVU_PURE_VECTOR_PROGRESS.md).
-The previous reference report is archived under
-[matrix-vector/](archive/matrix-vector/NEMU_REFERENCE_STATUS_PRE_PURE_VECTOR.md).
+The previous matrix-coupled reference report is available only in Git history.

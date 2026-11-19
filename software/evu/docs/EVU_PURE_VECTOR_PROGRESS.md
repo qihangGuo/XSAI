@@ -79,8 +79,8 @@ does not require further NEMU or guest changes beyond the migration rebuild.
   Store/Completion/Drain/VRF/CSR events, post-scalar CSR checking and
   outstanding-work checks. Unsupported FAST/FORK/replay states are rejected.
 - Retired fused FlashAttention/quantization guest and host test sources.
-  Historical documents are under `archive/matrix-vector/`; default software
-  is vector add. Six ordinary EVU applications and softmax helpers remain.
+  Their obsolete documents were subsequently removed from the working tree;
+  historical versions remain in Git. Default software is vector add.
 - Added a checked-in minimal difftest patch and idempotent application script
   so the parent can reference an official difftest commit reproducibly.
 

@@ -347,6 +347,7 @@ case class VectorParams(
   dLen: Int = 64,
   mLen: Int = 64,
   vatSz: Int = 3,
+  externalCommandTags: Boolean = false,
 
   useSegmentedIMul: Boolean = false,
   useScalarFPFMA: Boolean = true,       // Use shared scalar FPU all non-FMA FP instructions

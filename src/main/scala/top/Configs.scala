@@ -588,6 +588,10 @@ class DefaultExternalVectorMatrixConfig(n: Int = 1) extends Config(
   WithExternalVector() ++ new DefaultMatrixConfig(n)
 )
 
+class DefaultExternalVector16CommandMatrixConfig(n: Int = 1) extends Config(
+  WithExternalVector(EvuParams(enable = true, commandDepth = 16)) ++ new DefaultMatrixConfig(n)
+)
+
 class DefaultExternalVectorSingleFmaContextMatrixConfig(n: Int = 1) extends Config(
   WithExternalVector(EvuParams(enable = true, fmaOrdinaryContexts = 1)) ++ new DefaultMatrixConfig(n)
 )

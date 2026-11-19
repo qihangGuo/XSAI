@@ -47,7 +47,7 @@ object EvuAreaMain {
       |  "vrf_banks": ${ep.lanes * ep.vrfBanks}, "vrf_bank_depth": ${ep.vectorRegs * ep.vlenBits / ep.dlenBits / ep.vrfBanks},
       |  "vrf_bank_width": ${ep.laneBits}, "vrf_mask_granularity": 8,
       |  "vrf_bits": ${ep.vectorRegs * ep.vlenBits}, "vrf_ports": "1RW",
-      |  "command_depth": ${ep.commandDepth}, "completion_depth": ${ep.completionDepth},
+      |  "command_depth": ${ep.commandDepth}, "unified_commands": true, "completion_fifo_depth": 0,
       |  "reduction_contexts": ${ep.reductionContexts},
       |  "fma_ordinary_contexts": ${ep.fmaOrdinaryContexts},
       |  "fp32_div_lanes": ${if (ep.parallelFp32Div) ep.dlenBits / 32 else 1},

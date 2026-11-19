@@ -30,7 +30,7 @@ object EvuSaturnGather {
   )
 }
 
-class EvuVectorBackendIO(p: EvuParams) extends Bundle {
+class EvuVectorBackendIO(p: EvuParams, unifiedCommands: Boolean) extends Bundle {
   val command = Flipped(Decoupled(new EvuCommand(p)))
   val completion = Decoupled(new EvuCompletion(p))
   val memory = new EvuMemoryIO(p)
@@ -51,6 +51,12 @@ class EvuVectorBackendIO(p: EvuParams) extends Bundle {
   val memoryOutstanding = Output(UInt(log2Ceil(p.memoryCommandDepth + 1).W))
   val memoryStorePending = Output(Bool())
   val memoryDiagnostic = Output(new xiangshan.evu.common.EvuMemoryDiagnostic)
+  val commandHead = Option.when(unifiedCommands)(Input(UInt(log2Ceil(p.commandDepth).W)))
+  val commandTail = Option.when(unifiedCommands)(Input(UInt(log2Ceil(p.commandDepth).W)))
+  val commandEpoch = Option.when(unifiedCommands)(Input(UInt(2.W)))
+  val scheduleRelease = Option.when(unifiedCommands)(Output(UInt(p.commandDepth.W)))
+  val traceId = Option.when(unifiedCommands && p.enableDifftest)(Output(UInt(log2Ceil(p.commandDepth).W)))
+  val tracePc = Option.when(unifiedCommands && p.enableDifftest)(Input(UInt(64.W)))
 }
 
 /**
@@ -59,11 +65,14 @@ class EvuVectorBackendIO(p: EvuParams) extends Bundle {
   * Saturn is the EVU execution engine: its issue queues, element-group
   * chaining and RegisterFile are the only architectural vector state. This
   * adapter translates command metadata without any external VRF consumers.
-  * It maps VAT releases back to EVU job IDs and remaps the independent load/store tags into one
-  * HBL2 source-ID namespace.
+  * EvuTop supplies unified command age tags and owns ordered completion metadata.
+  * Standalone backend harnesses may retain Saturn-local tags. Load/store tags
+  * are remapped into one HBL2 source-ID namespace in both modes.
   */
-class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends Module {
+class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit xsParameters: Parameters) extends Module {
   private val saturnParams = VectorParams.lgvParams.copy(
+    vatSz = if (unifiedCommands) log2Ceil(p.commandDepth) else VectorParams.lgvParams.vatSz,
+    externalCommandTags = unifiedCommands,
     vdqEntries = p.dispatchDepth,
     // LoadOrderBuffer requires the in-flight queue to cover the response
     // ROB. The EVU HBL2 tag budget is only the outstanding-request limit, so
@@ -106,17 +115,21 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   )
   private val vatEntries = 1 << saturnParams.vatSz
 
-  val io = IO(new EvuVectorBackendIO(p))
+  val io = IO(new EvuVectorBackendIO(p, unifiedCommands))
   private val saturn = withReset(reset.asBool || io.flush) {
     Module(new EvuVectorSubsystem()(saturnP))
   }
+  saturn.io.commandHead.foreach(_ := io.commandHead.get)
+  saturn.io.commandTail.foreach(_ := io.commandTail.get)
+  io.scheduleRelease.foreach(_ := saturn.io.scheduleRelease.get)
   io.debugVrf.foreach(_ := saturn.io.debugVrf.get)
   io.vrfPerf := saturn.io.vrfPerf
   io.executionPerf := saturn.io.executionPerf
   val cmd = io.command.bits
   val localVl = Mux(cmd.aux(6), Mux(cmd.vl === 0.U || io.vstart =/= 0.U, 0.U, 1.U), cmd.vl)
   private val zeroCompletionPending = RegInit(false.B)
-  private val zeroCompletionReg = RegInit(0.U.asTypeOf(new EvuCompletion(p)))
+  private val zeroCompletionReg = RegInit(0.U.asTypeOf(new EvuCommandResult(p)))
+  private val zeroIdentity = Option.when(!unifiedCommands)(Reg(new EvuCommandIdentity))
 
   private def isSaturnOpcode(opcode: UInt): Bool = Seq(
     EvuOpcode.Add, EvuOpcode.Sub, EvuOpcode.And, EvuOpcode.Or, EvuOpcode.Xor,
@@ -132,11 +145,11 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   ).map(opcode === _).reduce(_ || _) || EvuRvvMath.contains(opcode) || EvuLowPrecision.contains(opcode)
 
   val isMemory = cmd.opcode === EvuOpcode.Load || cmd.opcode === EvuOpcode.Store
-  val nextVat = RegInit(0.U(saturnParams.vatSz.W))
-  // Store operand release is earlier than physical completion. Keep metadata
-  // reserved independently so a wrapped VAT cannot overwrite an Ack owner.
-  val contextLive = RegInit(VecInit.fill(vatEntries)(false.B))
-  val contextAvailable = !contextLive(nextVat)
+  val nextVat = if (unifiedCommands) cmd.jobId else RegInit(0.U(saturnParams.vatSz.W))
+  // Standalone mode protects metadata until physical completion. In unified
+  // mode the command table owns allocation through CPU reporting instead.
+  val contextLive = Option.when(!unifiedCommands)(RegInit(VecInit.fill(vatEntries)(false.B)))
+  val contextAvailable = contextLive.map(live => !live(nextVat)).getOrElse(true.B)
   io.memoryStorePending := saturn.io.memoryStorePending
   val isExp2 = cmd.opcode === EvuOpcode.Exp2
   val isGatherImm = cmd.opcode === EvuOpcode.GatherImm
@@ -292,6 +305,7 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
       cmd.vl =/= 0.U && !io.flush)
   io.command.ready := backendReady && commandHazardFree && !io.flush
   saturn.io.issue.bits := 0.U.asTypeOf(saturn.io.issue.bits)
+  if (unifiedCommands) { saturn.io.issue.bits.vat := cmd.jobId }
   saturn.io.issue.bits.bits := Mux(isMemory, memoryBits, arithmeticBits)
   saturn.io.issue.bits.vconfig.vl := localVl
   saturn.io.issue.bits.scalarVrfSource := cmd.aux(5) || EvuLowPrecision.scaled(cmd.opcode)
@@ -317,14 +331,16 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   saturn.io.issue.bits.fast_sg := false.B
   saturn.io.issue.bits.mop := Mux(cmd.stride === 0.S, VectorConsts.mopUnit, VectorConsts.mopStrided)
 
-  // The dispatcher allocates VATs in-order. Mirroring its tail at command
-  // acceptance lets an out-of-order VAT release recover the original job ID.
-  val jobIdByVat = Reg(Vec(vatEntries, UInt(log2Ceil(p.commandDepth).W)))
-  val pcByVat = Reg(Vec(vatEntries, UInt(64.W)))
+  // Only standalone mode translates local VATs back to external identities.
+  // Production EvuTop stores that identity once in its unified command table.
+  val jobIdByVat = Option.when(!unifiedCommands)(Reg(Vec(vatEntries, UInt(log2Ceil(p.commandDepth).W))))
+  val pcByVat = Option.when(!unifiedCommands)(Reg(Vec(vatEntries, UInt(64.W))))
   val memoryByVat = Reg(Vec(vatEntries, Bool()))
-  val opcodeByVat = Reg(Vec(vatEntries, UInt(8.W)))
-  val vdByVat = Reg(Vec(vatEntries, UInt(p.regIndexWidth.W)))
-  val epochByVat = Reg(Vec(vatEntries, UInt(2.W)))
+  val opcodeByVat = Option.when(!unifiedCommands)(Reg(Vec(vatEntries, UInt(8.W))))
+  val vdByVat = Option.when(!unifiedCommands)(Reg(Vec(vatEntries, UInt(p.regIndexWidth.W))))
+  val epochByVat = Option.when(!unifiedCommands)(Reg(Vec(vatEntries, UInt(2.W))))
+  def jobForVat(vat: UInt): UInt = jobIdByVat.map(_(vat)).getOrElse(vat)
+  def epochForVat(vat: UInt): UInt = epochByVat.map(_(vat)).getOrElse(io.commandEpoch.get)
   val pageMapByVat = Reg(Vec(vatEntries, new EvuPageMap(p)))
   val virtualBaseByVat = Reg(Vec(vatEntries, UInt(64.W)))
   val memoryErrorAddress = RegInit(VecInit.fill(vatEntries)(0.U(64.W)))
@@ -339,40 +355,45 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   }))
   when(io.command.fire) {
     when (immediateCompletion) {
-      zeroCompletionReg.pc := cmd.pc
-      zeroCompletionReg.tval := 0.U
-      zeroCompletionReg.tvalValid := false.B
-      zeroCompletionReg.opcode := cmd.opcode
-      zeroCompletionReg.vd := cmd.vd
-      zeroCompletionReg.exception := illegalCommand
-      zeroCompletionReg.fflags := 0.U
-      zeroCompletionReg.vxsat := false.B
+      zeroIdentity.foreach { identity =>
+        identity.pc := cmd.pc
+        identity.opcode := cmd.opcode
+        identity.vd := cmd.vd
+        identity.epoch := cmd.epoch
+      }
+      zeroCompletionReg.outcome.tval := 0.U
+      zeroCompletionReg.outcome.tvalValid := false.B
+      zeroCompletionReg.outcome.exception := illegalCommand
+      zeroCompletionReg.outcome.fflags := 0.U
+      zeroCompletionReg.outcome.vxsat := false.B
       // Like the reference, conservatively dirty arithmetic contexts even for
       // an empty ALU operation. Zero-length memory operations leave VS alone.
-      zeroCompletionReg.dirtyVs := !illegalCommand &&
+      zeroCompletionReg.outcome.dirtyVs := !illegalCommand &&
         cmd.opcode =/= EvuOpcode.Load && cmd.opcode =/= EvuOpcode.Store
-      zeroCompletionReg.cause := Mux(illegalCommand, EvuFault.Illegal, EvuFault.None)
+      zeroCompletionReg.outcome.cause := Mux(illegalCommand, EvuFault.Illegal, EvuFault.None)
       zeroCompletionReg.jobId := cmd.jobId
       zeroCompletionReg.epoch := cmd.epoch
       zeroCompletionPending := true.B
     }
   }
   when(saturn.io.issue.fire) {
-    assert(!contextLive(nextVat), "EVU reused metadata before physical completion")
-    contextLive(nextVat) := true.B
-    pcByVat(nextVat) := cmd.pc
+    contextLive.foreach { live =>
+      assert(!live(nextVat), "EVU reused metadata before physical completion")
+      live(nextVat) := true.B
+    }
+    pcByVat.foreach(_(nextVat) := cmd.pc)
     memoryByVat(nextVat) := isMemory
-    jobIdByVat(nextVat) := cmd.jobId
-    opcodeByVat(nextVat) := cmd.opcode
-    vdByVat(nextVat) := cmd.vd
-    epochByVat(nextVat) := cmd.epoch
+    jobIdByVat.foreach(_(nextVat) := cmd.jobId)
+    opcodeByVat.foreach(_(nextVat) := cmd.opcode)
+    vdByVat.foreach(_(nextVat) := cmd.vd)
+    epochByVat.foreach(_(nextVat) := cmd.epoch)
     pageMapByVat(nextVat) := cmd.pageMap
     virtualBaseByVat(nextVat) := Mux(cmd.pageMap.enabled, cmd.base & ~4095.U(64.W), 0.U)
     memoryErrorSticky(nextVat) := false.B
     memoryFaultSticky(nextVat) := EvuFault.None
-    nextVat := nextVat + 1.U
+    if (!unifiedCommands) { nextVat := nextVat + 1.U }
   }
-  when(io.flush) { nextVat := 0.U }
+  if (!unifiedCommands) { when(io.flush) { nextVat := 0.U } }
 
   val releasedThisCycle = saturn.io.completed.map { release =>
     Mux(release.valid, UIntToOH(release.bits, vatEntries), 0.U(vatEntries.W))
@@ -392,9 +413,9 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   val completionMemoryError = memoryErrorSticky(completionVat) || completionFaultNow
   val saturnCompletion = Wire(Decoupled(new EvuCompletion(p)))
   saturnCompletion.valid := visibleReleases.orR && !io.flush
-  saturnCompletion.bits.opcode := opcodeByVat(completionVat)
-  saturnCompletion.bits.vd := vdByVat(completionVat)
-  saturnCompletion.bits.pc := pcByVat(completionVat)
+  saturnCompletion.bits.opcode := opcodeByVat.map(_(completionVat)).getOrElse(0.U)
+  saturnCompletion.bits.vd := vdByVat.map(_(completionVat)).getOrElse(0.U)
+  saturnCompletion.bits.pc := pcByVat.map(_(completionVat)).getOrElse(0.U)
   saturnCompletion.bits.tval := Mux(memoryErrorSticky(completionVat),
     memoryErrorAddress(completionVat), Mux(completionFaultNow, returningMemoryFault.bits.address, 0.U))
   saturnCompletion.bits.tvalValid := memoryByVat(completionVat) && completionMemoryError
@@ -407,25 +428,38 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
     Mux1H(releasingCompletion, saturn.io.completionFflags), completedFflags(completionVat))
   saturnCompletion.bits.vxsat := Mux(releasingCompletion.reduce(_ || _),
     Mux1H(releasingCompletion, saturn.io.completionVxsat), completedVxsat(completionVat))
-  saturnCompletion.bits.dirtyVs := opcodeByVat(completionVat) =/= EvuOpcode.Store
-  saturnCompletion.bits.jobId := jobIdByVat(completionVat)
-  saturnCompletion.bits.epoch := epochByVat(completionVat)
+  saturnCompletion.bits.dirtyVs := opcodeByVat.map(_(completionVat) =/= EvuOpcode.Store).getOrElse(true.B)
+  saturnCompletion.bits.jobId := jobForVat(completionVat)
+  saturnCompletion.bits.epoch := epochForVat(completionVat)
+  io.traceId.foreach(_ := completionVat)
   val zeroCompletion = Wire(Decoupled(new EvuCompletion(p)))
   zeroCompletion.valid := zeroCompletionPending && !io.flush
-  zeroCompletion.bits := zeroCompletionReg
+  zeroCompletion.bits := 0.U.asTypeOf(zeroCompletion.bits)
+  zeroCompletion.bits.pc := zeroIdentity.map(_.pc).getOrElse(0.U)
+  zeroCompletion.bits.opcode := zeroIdentity.map(_.opcode).getOrElse(0.U)
+  zeroCompletion.bits.vd := zeroIdentity.map(_.vd).getOrElse(0.U)
+  zeroCompletion.bits.jobId := zeroCompletionReg.jobId
+  zeroCompletion.bits.epoch := zeroCompletionReg.epoch
+  zeroCompletion.bits.tval := zeroCompletionReg.outcome.tval
+  zeroCompletion.bits.tvalValid := zeroCompletionReg.outcome.tvalValid
+  zeroCompletion.bits.exception := zeroCompletionReg.outcome.exception
+  zeroCompletion.bits.fflags := zeroCompletionReg.outcome.fflags
+  zeroCompletion.bits.vxsat := zeroCompletionReg.outcome.vxsat
+  zeroCompletion.bits.dirtyVs := zeroCompletionReg.outcome.dirtyVs
+  zeroCompletion.bits.cause := zeroCompletionReg.outcome.cause
   val completionArbiter = Module(new Arbiter(new EvuCompletion(p), 2))
   completionArbiter.io.in(0) <> saturnCompletion
   completionArbiter.io.in(1) <> zeroCompletion
   io.completion <> completionArbiter.io.out
   when (zeroCompletion.fire) { zeroCompletionPending := false.B }
   when(io.flush) {
-    contextLive.foreach(_ := false.B)
+    contextLive.foreach(_.foreach(_ := false.B))
     pendingReleases := 0.U
     memoryErrorSticky.foreach(_ := false.B)
     zeroCompletionPending := false.B
     memoryFaultSticky.foreach(_ := EvuFault.None)
   }.otherwise {
-    when(saturnCompletion.fire) { contextLive(completionVat) := false.B }
+    when(saturnCompletion.fire) { contextLive.foreach(_(completionVat) := false.B) }
     pendingReleases := visibleReleases & ~Mux(saturnCompletion.fire, UIntToOH(completionVat, vatEntries), 0.U(vatEntries.W))
     when(saturnCompletion.fire && memoryByVat(completionVat)) {
       memoryErrorSticky(completionVat) := false.B
@@ -475,8 +509,8 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
   io.memory.req.valid := hasFreeTag &&
     (saturn.io.dmem.load_req.valid || saturn.io.dmem.store_req.valid) && !io.flush
   io.memory.req.bits.addr := translate.io.paddr | requestVirtualAddress(5, 0)
-  io.memory.req.bits.jobId := jobIdByVat(requestVat)
-  io.memory.req.bits.epoch := epochByVat(requestVat)
+  io.memory.req.bits.jobId := jobForVat(requestVat)
+  io.memory.req.bits.epoch := epochForVat(requestVat)
   when(io.memory.req.valid) { assert(translate.io.legal, "VMU request escaped its preflight page map") }
   io.memory.req.bits.data := Mux(chooseStore, saturn.io.dmem.store_req.bits.data, 0.U)
   io.memory.req.bits.mask := Mux(chooseStore, saturn.io.dmem.store_req.bits.mask,
@@ -585,7 +619,8 @@ class EvuVectorBackend(p: EvuParams)(implicit xsParameters: Parameters) extends 
       }
     }
     when(saturnCompletion.fire && trace.asBool) {
-      printf(p"[EVU-CMD] event=complete ticket=${tickets(completionVat)} vat=${completionVat} job=${jobIdByVat(completionVat)} epoch=${epochByVat(completionVat)} pc=0x${Hexadecimal(pcByVat(completionVat))} total=${ticks - acceptedAt(completionVat)} t=${ticks}\n")
+      val completedPc = if (unifiedCommands) io.tracePc.get else pcByVat.get(completionVat)
+      printf(p"[EVU-CMD] event=complete ticket=${tickets(completionVat)} vat=${completionVat} job=${jobForVat(completionVat)} epoch=${epochForVat(completionVat)} pc=0x${Hexadecimal(completedPc)} total=${ticks - acceptedAt(completionVat)} t=${ticks}\n")
     }
     when(io.flush && trace.asBool) { printf(p"[EVU-CMD] event=flush t=${ticks}\n") }
   }

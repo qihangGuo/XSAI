@@ -1,7 +1,9 @@
 # FMA contexts and bottleneck diagnostics
 
-Date: 2026-11-09. Status: source implementation; hardware compilation, simulation,
-numerical regression and PPA measurements remain pending on the server.
+Diagnostics introduced on 2026-11-09. Counter definitions below remain current;
+the rollout chronology and old baselines are historical. Current architecture,
+server acceptance and local checks are recorded in
+[EVU_CHECKPOINT_2026-11-19.md](EVU_CHECKPOINT_2026-11-19.md).
 
 Paired-row work temporarily restored the default ordinary FMA count to one after
 the earlier two-context measurement did not show an aggregate speedup. On
@@ -9,8 +11,8 @@ the earlier two-context measurement did not show an aggregate speedup. On
 single-context A/B configuration. Its baseline is 4909 cycles with one ordinary
 context. A subsequent 4183-cycle run includes both two contexts and the
 two-entry dispatch adapter; an isolated context A/B remains required. See
-[RMSNORM_FMA_TWO_CONTEXT_AB.md](RMSNORM_FMA_TWO_CONTEXT_AB.md) for this experiment
-and [EVU_PAIRED_DEQUANT.md](EVU_PAIRED_DEQUANT.md) for the paired-row history.
+[RMSNORM_FMA_TWO_CONTEXT_AB.md](RMSNORM_FMA_TWO_CONTEXT_AB.md) for this experiment.
+The retired paired-row/matrix-coupled history remains available in Git only.
 
 Subsequent ABI 2 work changes configuration instructions and the CSR snapshot.
 For the combined checkout, rebuild emu, NEMU and guest binaries together as
@@ -218,7 +220,7 @@ The FMA regression holds back a load, verifies a younger independent add can
 finish, then checks RAW/WAW/WAR chains, two sums and their scalar consumer.
 The diagnostic regression checks single-element classification, masks, FP16/32
 lane counts and reduction folding. Retain the existing softmax RTL/NEMU, memory
-reordering/error/flush/FENCE, EXP2 and FlashAttention regressions, including
+reordering/error/flush/FENCE and EXP2 regressions, including
 independent numerical accuracy checks in addition to CHECK=0 performance runs.
 
 Accept the context only if both softmax cases and broader EVU tests show an

@@ -23,8 +23,8 @@ case class EvuParams(
     loadResponseDepth:  Int = 32,
     maxMemOutstanding:  Int = 8,
     memoryCommandDepth: Int = 4,
-    commandDepth:       Int = 16,
-    completionDepth:    Int = 16,
+    commandDepth:       Int = 32,
+    completionDepth:    Int = 16, // Legacy constructor compatibility; Top has no completion FIFO.
     egChaining: Boolean = true,
     vmuLineCoalescing: Boolean = true,
     splitFpIssue: Boolean = true,

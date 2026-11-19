@@ -1,5 +1,9 @@
 # Pure Long-Vector Migration
 
+Historical migration plan. The constraints below describe that task, not current
+build/commit policy. Current architecture and acceptance results are recorded in
+[EVU_CHECKPOINT_2026-11-19.md](EVU_CHECKPOINT_2026-11-19.md).
+
 ## Scope and Constraints
 
 Remove EVU FP quantization, matrix dequantization, Launch, direct CUTE ports,
@@ -35,11 +39,13 @@ mill -i evuCheck.test.testOnly evu.EvuRetiredOpcodeSpec
 mill -i evuCheck.test.testOnly evu.EvuRmwStoreCoalescingSpec \
   evu.EvuHbl2LineAdapterSpec evu.EvuVmuLineCoalescerSpec
 mill -i evuCheck.test.testOnly evu.EvuAreaTopSpec
-mill -i evuCheck.test.testOnly evu.EvuCompletionLoopSpec
 mill -i evuMmuCheck.test.testOnly xiangshan.evucheck.EvuRobOrderingSpec \
   xiangshan.evucheck.EvuAmuCompletionSpec xiangshan.evucheck.EvuCompletionStatusSpec \
   xiangshan.evucheck.EvuConfigCSRSpec xiangshan.evucheck.EvuExeUnitElaborationSpec
 ```
+
+`EvuAreaTopSpec` includes the production HW-dialect combinational-cycle check;
+the former Verilog-emitting duplicate completion-loop test has been removed.
 
 PASS: legal commands complete, rejected commands have no data side effects,
 flush drains accepted requests and all tag credits recover. FAIL: assertion,

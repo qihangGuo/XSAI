@@ -21,13 +21,19 @@ Use the server's existing `AM_HOME`, RISC-V LLVM toolchain and NEMU checkout.
 | `online_softmax_evu_test` | Ordinary FP32 softmax, four-row scheduling and interval diagnostics |
 | `rvv_math_evu_test` | 15 RVV-mapped operations, m1/m2/mf2, E0, tails, flags and saturation |
 | `low_precision_evu_test` | Six low-precision operations, 88 directed cases, packing, tails, flags and guards |
+| `slide_evu_test` | 216 slide-up/down cases covering widths, LMUL, aliases, offsets and tails |
 | `rmsnorm_nvfp4_evu_test` | EVU RMSNorm and full NVFP4 with final-output-only stores; 11 cases |
 | `rmsnorm_nvfp4_fused_evu_test` | Only fused NVFP4 row-major; timed FENCE snapshots and CPU-only checking ([profiling](docs/RMSNORM_FUSED_ROW_MAJOR_PROFILE.md)) |
 
 `Makefile` defaults to `vector_add_evu_test`. The old fused FlashAttention and
 `quanti8mma_evu_example` programs are retired; their binaries cannot run on the
-pure-vector ISA. Historical documents and measurements are under
-[`docs/archive/matrix-vector/`](docs/archive/matrix-vector/README.md).
+pure-vector ISA. Their sources and obsolete documentation remain available in
+Git history, not in the current test suite.
+
+The production command window is a unified 32-row VAT/job table without a
+completion FIFO. Two ordinary FMA contexts share one arithmetic datapath.
+The current 3747-cycle RMSNorm checkpoint and counter limitations are recorded in
+[`EVU_CHECKPOINT_2026-11-19.md`](docs/EVU_CHECKPOINT_2026-11-19.md).
 
 ## Server Build and Run
 
@@ -101,6 +107,8 @@ make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM NAME=online_softmax_evu_test
 The kernel contains no CUTE operation, dedicated quantization or final
 probability normalization. Compare identical software options, warmup and
 completion boundaries. Historical cycle counts are not new migration results.
+See [`ONLINE_SOFTMAX_CURRENT.md`](docs/ONLINE_SOFTMAX_CURRENT.md) for the current
+register schedule, exact source-level work counts and optimization candidates.
 
 ## Focused Validation
 

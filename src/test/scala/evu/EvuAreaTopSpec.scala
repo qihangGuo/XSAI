@@ -18,6 +18,7 @@ class EvuAreaTopSpec extends AnyFlatSpec with Matchers {
     ep.lanes shouldBe 8
     ep.vrfBanks shouldBe 4
     ep.memoryCommandDepth shouldBe 4
+    ep.commandDepth shouldBe 32
     ep.fmaOrdinaryContexts shouldBe 2
     ep.parallelFp32Div shouldBe true
     ep.vectorRegs * ep.vlenBits shouldBe 16 * 1024 * 8
@@ -27,6 +28,15 @@ class EvuAreaTopSpec extends AnyFlatSpec with Matchers {
     val top = DisableMonitors { p => LazyModule(new EvuAreaTop(ep)(p)) }
     val ir = ChiselStage.emitCHIRRTL(top.module)
     ir should include ("module EvuAreaTop")
+    ir should include ("module EvuCommandTable")
+    ir should not include "completionQueue"
+    ir should not include "jobIdByVat"
+    ir should not include "pcByVat"
+    ir should not include "opcodeByVat"
+    ir should not include "vdByVat"
+    ir should not include "epochByVat"
+    ir should not include "acceptedOrder"
+    ir should not include "vat_valids"
     ir should not include "matrixInput"
     ir should not include "tileInput"
     ir should not include "cuteWrite"

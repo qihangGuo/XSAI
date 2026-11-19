@@ -111,14 +111,20 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   private val vectorParameters = p.alterMap(Map(
     TileVisibilityNodeKey -> outer.visibilityNode
   ))
-  private val vectorBackend   = Module(new EvuVectorBackend(ep)(vectorParameters))
+  private val vectorBackend   = Module(new EvuVectorBackend(ep, unifiedCommands = true)(vectorParameters))
   private val dispatchAdapter = Module(new EvuDispatchAdapter(ep))
   private val commandArbiter  = Module(new Arbiter(new EvuCommand(ep), 2))
-  private val jobValid         = RegInit(VecInit.fill(ep.commandDepth)(false.B))
-  private val jobState         = RegInit(VecInit.fill(ep.commandDepth)(0.U(3.W)))
-  private val jobEpochs        = RegInit(VecInit.fill(ep.commandDepth)(0.U(2.W)))
-  private val nextJobId        = RegInit(0.U(log2Ceil(ep.commandDepth).W))
+  private val commandTable = Module(new EvuCommandTable(ep))
+  private val jobValid = commandTable.io.live
+  private val nextJobId = commandTable.io.nextId
   private val currentEpoch     = RegInit(0.U(2.W))
+  commandTable.io.flush := io.flush
+  vectorBackend.io.commandHead.get := commandTable.io.scheduleHead
+  vectorBackend.io.commandTail.get := nextJobId
+  vectorBackend.io.commandEpoch.get := currentEpoch
+  commandTable.io.scheduleRelease := vectorBackend.io.scheduleRelease.get
+  commandTable.io.traceId.foreach(_ := vectorBackend.io.traceId.get)
+  vectorBackend.io.tracePc.foreach(_ := commandTable.io.tracePc.get)
   // EVU-local RVV state.  It is architectural state of the single Saturn
   // vector unit, not a second vector register file.
   private val rvvConfigured = RegInit(false.B)
@@ -145,8 +151,7 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   dispatchAdapter.io.flush := io.flush
   commandArbiter.io.in(0) <> io.command
   commandArbiter.io.in(1) <> dispatchAdapter.io.out
-  val liveJobs = PopCount(jobValid)
-  val hasJobSlot = !jobValid(nextJobId) && liveJobs < ep.commandDepth.U
+  val hasJobSlot = commandTable.io.allocate.ready
   val vectorMemoryCommand = commandArbiter.io.out.bits.opcode === EvuOpcode.Load ||
     commandArbiter.io.out.bits.opcode === EvuOpcode.Store
   // The backend owns the bounded command window and per-command translations.
@@ -157,6 +162,11 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   issuedCommand.bits := commandArbiter.io.out.bits
   issuedCommand.bits.jobId := nextJobId
   issuedCommand.bits.epoch := currentEpoch
+  commandTable.io.allocate.valid := issuedCommand.fire
+  commandTable.io.allocate.bits.pc := issuedCommand.bits.pc
+  commandTable.io.allocate.bits.opcode := issuedCommand.bits.opcode
+  commandTable.io.allocate.bits.vd := issuedCommand.bits.vd
+  commandTable.io.allocate.bits.epoch := currentEpoch
   val stateControl = commandArbiter.io.out.bits.opcode === EvuOpcode.SetVli ||
     commandArbiter.io.out.bits.opcode === EvuOpcode.SetVl
   val stateVectorOp = !stateControl &&
@@ -194,51 +204,25 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   vectorBackend.io.flush := io.flush
   issuedCommand.ready := Mux(saturnRoute, vectorBackend.io.command.ready,
     Mux(controlRoute, control.io.command.ready, false.B))
-  // Do not wrap a job ID while all command-table entries are still live.
-  // Backend readiness alone is insufficient because a long Saturn
-  // operation can hold a completion for many cycles.
+  // The command table admits reuse of the retiring row in this same cycle.
   commandArbiter.io.out.ready := issuedCommand.ready && !io.flush &&
     hasJobSlot && !control.io.blockYounger
-  val completionArbiter = Module(new Arbiter(new EvuCompletion(ep), 2))
-  completionArbiter.io.in(0) <> control.io.completion
-  completionArbiter.io.in(1) <> vectorBackend.io.completion
-  val completionQueue = Queue(completionArbiter.io.out, ep.completionDepth, flush = Some(io.flush))
-
-  // Backend completion may be out of order (Saturn VAT release, VMU,
-  // and control paths have different latencies). Keep a small
-  // job-indexed completion table and retire strictly in accepted order.
-  private val jobIdWidth = log2Ceil(ep.commandDepth)
-  val acceptedOrder = Reg(Vec(ep.commandDepth, UInt(jobIdWidth.W)))
-  val acceptedHead = RegInit(0.U(jobIdWidth.W))
-  val acceptedTail = RegInit(0.U(jobIdWidth.W))
-  val acceptedCount = RegInit(0.U(log2Ceil(ep.commandDepth + 1).W))
-  val completionByJob = RegInit(VecInit.fill(ep.commandDepth)(0.U.asTypeOf(new EvuCompletion(ep))))
-  val completionByJobValid = RegInit(VecInit.fill(ep.commandDepth)(false.B))
-  val completionId = completionQueue.bits.jobId
-  val expectedCompletion = jobValid(completionId) && jobEpochs(completionId) === completionQueue.bits.epoch
-  completionQueue.ready := !io.flush && !completionByJobValid(completionId)
-  when(completionQueue.fire && expectedCompletion) {
-    completionByJob(completionId) := completionQueue.bits
-    completionByJobValid(completionId) := true.B
+  val completionArbiter = Module(new Arbiter(new EvuCommandResult(ep), 2))
+  for ((source, index) <- Seq(control.io.completion, vectorBackend.io.completion).zipWithIndex) {
+    val result = completionArbiter.io.in(index)
+    result.valid := source.valid
+    source.ready := result.ready
+    result.bits.jobId := source.bits.jobId
+    result.bits.epoch := source.bits.epoch
+    result.bits.outcome := EvuCommandOutcome.from(source.bits)
   }
-  val retireId = Mux(acceptedCount === 0.U, 0.U, acceptedOrder(acceptedHead))
-  io.completion.valid := acceptedCount =/= 0.U && completionByJobValid(retireId) && !io.flush
-  io.completion.bits := completionByJob(retireId)
+  commandTable.io.result <> completionArbiter.io.out
+  io.completion <> commandTable.io.completion
   when(io.completion.fire) {
-    completionByJobValid(retireId) := false.B
-    acceptedHead := acceptedHead + 1.U
     // A successful vector instruction retires all elements.  On an
     // exception, retain vstart so software can restart from the faulting
     // element.
     when(!io.completion.bits.exception) { rvvVstart := 0.U }
-  }
-  when(issuedCommand.fire) {
-    acceptedOrder(acceptedTail) := nextJobId
-    acceptedTail := acceptedTail + 1.U
-  }
-  when(!io.flush) {
-    when(issuedCommand.fire && !io.completion.fire) { acceptedCount := acceptedCount + 1.U }
-    when(io.completion.fire && !issuedCommand.fire) { acceptedCount := acceptedCount - 1.U }
   }
   control.io.flush := io.flush
   control.io.backendBusy := vectorBackend.io.busy || memoryBusy
@@ -261,34 +245,10 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
       rvvVlmulMag := newVlmulMag
       rvvVstart := 0.U
     }
-    jobValid(nextJobId) := true.B
-    jobState(nextJobId) := EvuJobState.Accepted
-    jobEpochs(nextJobId) := currentEpoch
-    nextJobId := nextJobId + 1.U
   }
-  for (i <- 0 until ep.commandDepth) {
-    when(jobValid(i) && jobState(i) === EvuJobState.Accepted && !io.flush) {
-      jobState(i) := EvuJobState.Running
-    }
-  }
-  io.jobStatus := jobState
+  io.jobStatus := commandTable.io.state
   io.jobEpoch := currentEpoch
-  when(io.completion.fire && !io.flush && jobValid(io.completion.bits.jobId) &&
-    jobEpochs(io.completion.bits.jobId) === io.completion.bits.epoch) {
-    jobState(io.completion.bits.jobId) := Mux(io.completion.bits.exception,
-      EvuJobState.Exception, EvuJobState.Completed)
-    jobValid(io.completion.bits.jobId) := false.B
-  }
   when(io.flush) {
-    for (i <- 0 until ep.commandDepth) {
-      jobValid(i) := false.B
-      jobState(i) := EvuJobState.Flushed
-      completionByJobValid(i) := false.B
-    }
-    acceptedHead := 0.U
-    acceptedTail := 0.U
-    acceptedCount := 0.U
-    nextJobId := 0.U
     currentEpoch := currentEpoch + 1.U
     rvvConfigured := false.B
     rvvVill := false.B
@@ -393,7 +353,7 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
 
   io.busy := control.io.busy || vectorBackend.io.busy ||
     dispatchAdapter.io.out.valid || io.dispatch.valid || memoryBusy || jobValid.asUInt.orR ||
-    completionQueue.valid
+    commandTable.io.busy
   val drainPending = RegInit(false.B)
   io.drain.request.ready := !drainPending && !io.flush
   when(io.drain.request.fire) { drainPending := true.B }
@@ -479,9 +439,9 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   io.perf.vmuStoreMerges := perfVmuStoreMerges
   val jobPerf = Module(new EvuJobPerf(ep.commandDepth, ep.enableDifftest))
   jobPerf.io.live := jobValid
-  jobPerf.io.completed := completionByJobValid
-  jobPerf.io.head := retireId
-  jobPerf.io.headValid := acceptedCount =/= 0.U
+  jobPerf.io.completed := commandTable.io.completed
+  jobPerf.io.head := commandTable.io.head
+  jobPerf.io.headValid := commandTable.io.busy
   jobPerf.io.commandValid := commandArbiter.io.out.valid
   jobPerf.io.hasSlot := hasJobSlot
   jobPerf.io.retiring := io.completion.fire
@@ -535,7 +495,7 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
     when(io.completion.fire && io.completion.bits.opcode === EvuOpcode.Fence) {
       fenceIndex := fenceIndex + 1.U
       when(trace.asBool) {
-        printf(p"[EVU-CONFIG] fence=${fenceIndex} dlen=${ep.dlenBits.U} mlen=${ep.mlenBits.U} vlen=${ep.vlenBits.U} fma_contexts=${ep.fmaOrdinaryContexts.U} reduction_contexts=${ep.reductionContexts.U} fp32_div_lanes=${(if (ep.parallelFp32Div) ep.dlenBits / 32 else 1).U} slide_prefetch=${ep.slidePrefetch.B}\n")
+        printf(p"[EVU-CONFIG] fence=${fenceIndex} dlen=${ep.dlenBits.U} mlen=${ep.mlenBits.U} vlen=${ep.vlenBits.U} fma_contexts=${ep.fmaOrdinaryContexts.U} reduction_contexts=${ep.reductionContexts.U} fp32_div_lanes=${(if (ep.parallelFp32Div) ep.dlenBits / 32 else 1).U} slide_prefetch=${ep.slidePrefetch.B} command_depth=${ep.commandDepth.U} unified_commands=1 completion_fifo=0\n")
         printf(p"[EVU-JOB] fence=${fenceIndex} full=${jobPerf.io.full} head=${jobPerf.io.headBlocked} release=${jobPerf.io.fullRelease}\n")
         printf(p"[EVU-VMU] fence=${fenceIndex} t=${perfCycles} cmd=${memoryCounters(0)} tag=${memoryCounters(1)} get=${memoryCounters(2)} put=${memoryCounters(3)} partial=${memoryCounters(4)} full=${memoryCounters(5)} ack=${memoryCounters(6)} entry=${memoryCounters(7)} win=${vectorBackend.io.memoryOrderStalls} merge=${perfVmuStoreMerges} rmwget=${rmwGets} rmwmerge=${rmwMerges}\n")
         val exe = vectorBackend.io.executionPerf
