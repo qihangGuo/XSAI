@@ -13,7 +13,8 @@ case class ExecuteContextLayout(ordinary: Int, reductions: Int) {
 
 object ExecuteContextLayout {
   def apply(name: String, interleave: Boolean, ordinary: Int, reductions: Int): ExecuteContextLayout = {
-    if (interleave && Set("fp_fma", "fp_cmp").contains(name)) {
+    if (name == "int") ExecuteContextLayout(2, 0)
+    else if (interleave && Set("fp_fma", "fp_cmp").contains(name)) {
       ExecuteContextLayout(if (name == "fp_fma") ordinary else 1, reductions)
     } else ExecuteContextLayout(1, 0)
   }

@@ -23,6 +23,24 @@ def counter_log(cases=11):
 
 
 class RmsnormCountersTest(unittest.TestCase):
+    def test_integer_owner_and_completion_diagnostics_are_interval_deltas(self):
+        text = counter_log(cases=1)
+        for fence in (0, 1):
+            text += f'\n[EVU-INTCTX] fence={fence} candidate={100 + fence * 9} raw={50 + fence * 3} destination={20 + fence * 2} independent={30 + fence * 4} second={5 + fence * 8} overlap={2 + fence * 6}'
+            text += f'\n[EVU-OWNER] fence={fence} full_release={10 + fence * 7} reuse={3 + fence * 5}'
+            text += f'\n[EVU-COMPLETION] fence={fence} write={40 + fence * 13} tracker={50 + fence * 11} transport={60 + fence * 17}'
+        row, = summarize_counters(text)
+        expected = {'int_context_candidate': 9, 'int_context_raw': 3,
+                    'int_context_destination': 2, 'int_context_independent': 4,
+                    'int_context_second': 8, 'int_context_overlap': 6,
+                    'reduction_full_with_release': 7, 'reduction_owner_reuse': 5,
+                    'completion_head_write_wait': 13, 'completion_head_tracker_wait': 11,
+                    'completion_head_transport_wait': 17}
+        for key, value in expected.items():
+            self.assertEqual(row[key], value, key)
+        with self.assertRaisesRegex(ValueError, 'missing counter'):
+            summarize_counters(text.replace('reuse=8', '', 1))
+
     def test_integer_divider_dispatch_and_job_diagnostics_use_interval_deltas(self):
         text = counter_log(cases=1)
         for fence in (0, 1):

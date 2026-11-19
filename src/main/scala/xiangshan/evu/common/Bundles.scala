@@ -139,6 +139,18 @@ class VectorWrite(writeBits: Int)(implicit p: Parameters) extends CoreBundle()(p
   val mask = UInt(writeBits.W)
 }
 
+object ByteWriteMask {
+  def pack(mask: UInt): UInt = VecInit(mask.asBools.grouped(8).map(_.reduce(_ && _)).toSeq).asUInt
+  def expand(mask: UInt): UInt = FillInterleaved(8, mask)
+}
+
+class ByteMaskedVectorWrite(writeBits: Int)(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams {
+  val eg = UInt(log2Ceil(32 * vLen / writeBits).W)
+  val data = UInt(writeBits.W)
+  val byteMask = UInt((writeBits / 8).W)
+  def mask: UInt = ByteWriteMask.expand(byteMask)
+}
+
 /** A buffered write remains a dependency until its physical 1RW bank commits it. */
 class VectorWriteHazard(implicit p: Parameters) extends PipeHazard(0) {
   val mask = UInt(dLen.W)
@@ -357,6 +369,17 @@ class EvuFuPerf extends Bundle {
 }
 
 class EvuExecutionPerf extends Bundle {
+  val intCandidateIdle = UInt(64.W)
+  val intCandidateRaw = UInt(64.W)
+  val intCandidateDestination = UInt(64.W)
+  val intCandidateIndependent = UInt(64.W)
+  val intSecondIssues = UInt(64.W)
+  val intSecondOverlapIssues = UInt(64.W)
+  val reductionReleaseFull = UInt(64.W)
+  val reductionOwnerReuse = UInt(64.W)
+  val completionHeadWriteWait = UInt(64.W)
+  val completionHeadTrackerWait = UInt(64.W)
+  val completionHeadTransportWait = UInt(64.W)
   val dispatchBlocked = UInt(64.W)
   val dispatchQueueWait = Vec(EvuDispatchPerf.names.size, UInt(64.W))
   val vectorForwards = UInt(64.W)

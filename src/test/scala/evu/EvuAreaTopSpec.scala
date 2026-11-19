@@ -35,6 +35,10 @@ class EvuAreaTopSpec extends AnyFlatSpec with Matchers {
     ir should not include "opcodeByVat"
     ir should not include "vdByVat"
     ir should not include "epochByVat"
+    ir should not include "pageMapByVat"
+    ir should not include "virtualBaseByVat"
+    ir should not include "firstData"
+    ir should include ("module EvuMemoryContextTable")
     ir should not include "acceptedOrder"
     ir should not include "vat_valids"
     ir should not include "matrixInput"
@@ -56,6 +60,9 @@ class EvuAreaTopSpec extends AnyFlatSpec with Matchers {
     "\\breg(?:reset)?\\s+diag_\\w+".r.findFirstIn(ir) shouldBe None
     ir should include ("vxsfp_fma_3")
     ir should not include "vxsfp_fma_4"
+    ir should include ("vxsint_1")
+    ir should not include "vxsint_2"
+    ir should not include "vxuint_1"
     ir should not include "vmuRmwGets"
     ir should not include "vmuRmwMerges"
     ir should not include "module XSTop"

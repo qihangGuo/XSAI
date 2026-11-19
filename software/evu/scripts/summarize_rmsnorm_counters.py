@@ -20,7 +20,7 @@ def summarize_counters(text):
     hardware = re.sub(r"\[RN(?:-SAMPLE)?\][^\r\n]*(?:\r?\n)?", "", text)
     snapshots = {}
     for record in records(hardware.splitlines(keepends=True)):
-        match = re.match(r"\[EVU-(EXE|FU|MEM|VMU|JOB|DISPATCH|HANDOFF)\]", record)
+        match = re.match(r"\[EVU-(EXE|FU|MEM|VMU|JOB|DISPATCH|HANDOFF|INTCTX|OWNER|COMPLETION)\]", record)
         if not match:
             continue
         sample = fields(record)
@@ -64,6 +64,12 @@ def summarize_counters(text):
     diagnostics += tuple((f"DISPATCH:{path}", "queue", f"dispatch_{path}_blocked")
                          for path in ("all", "load", "store", "special", "int", "fp_fma", "fp_cmp",
                                       "fp_exp", "fp_div", "fp_conv", "fp_xx8", "fp_mxfp"))
+    diagnostics += tuple(("INTCTX", field, f"int_context_{field}")
+                         for field in ("candidate", "raw", "destination", "independent", "second", "overlap"))
+    diagnostics += (("OWNER", "full_release", "reduction_full_with_release"),
+                    ("OWNER", "reuse", "reduction_owner_reuse"))
+    diagnostics += tuple(("COMPLETION", field, f"completion_head_{field}_wait")
+                         for field in ("write", "tracker", "transport"))
     for sample in samples:
         key = sample["stage"], sample["schedule"], int(sample["sample"])
         if key not in expected or key in seen or int(sample["errors"]):

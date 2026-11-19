@@ -207,7 +207,8 @@ class VrfPerf extends Bundle {
 class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrites: Int, maxDepth: Int,
                    sramSuffix: String = "evu_vrf", prefetchPorts: Seq[(Int, Int)] = Seq.empty,
                    trackWrites: Boolean = false, scalarPorts: Seq[(Int, Int)] = Seq.empty,
-                   readClasses: Seq[Int] = Seq.empty, bypassPorts: Seq[(Int, Int)] = Seq.empty)
+                   readClasses: Seq[Int] = Seq.empty, bypassPorts: Seq[(Int, Int)] = Seq.empty,
+                   unusedReads: Set[(Int, Int)] = Set.empty, unusedMaskReads: Set[(Int, Int)] = Set.empty)
                   (implicit p: Parameters) extends CoreModule()(p) with HasVectorParams {
 
   val io = IO(new RegisterFileIO(reads, maskReads, pipeWrites, llWrites, maxDepth,
@@ -251,12 +252,26 @@ class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrit
     if (prefetchIndex >= 0) { collector.io.prefetch := io.prefetch(prefetchIndex) }
   }
   for (group <- reads.indices; port <- 0 until reads(group)) {
-    collect(io.read(group)(port), vrf.io.read(group)(port),
-      prefetchPorts.indexOf((group, port)), scalarPorts.indexOf((group, port)),
-      bypassPorts.indexOf((group, port)))
+    if (unusedReads((group, port))) {
+      io.read(group)(port).req.ready := false.B
+      io.read(group)(port).resp := 0.U
+      vrf.io.read(group)(port).req.valid := false.B
+      vrf.io.read(group)(port).req.bits := 0.U.asTypeOf(vrf.io.read(group)(port).req.bits)
+      vrf.io.read(group)(port).speculative := false.B
+    } else collect(io.read(group)(port), vrf.io.read(group)(port),
+        prefetchPorts.indexOf((group, port)), scalarPorts.indexOf((group, port)),
+        bypassPorts.indexOf((group, port)))
   }
-  for ((clients, ports) <- io.mask_read.zip(vrf.io.mask_read); (client, port) <- clients.zip(ports)) {
-    collect(client, port)
+  for (group <- maskReads.indices; index <- 0 until maskReads(group)) {
+    val client = io.mask_read(group)(index)
+    val port = vrf.io.mask_read(group)(index)
+    if (unusedMaskReads((group, index))) {
+      client.req.ready := false.B
+      client.resp := 0.U
+      port.req.valid := false.B
+      port.req.bits := 0.U.asTypeOf(port.req.bits)
+      port.speculative := false.B
+    } else collect(client, port)
   }
   io.perf := vrf.io.perf
   val operandWait = RegInit(0.U(64.W))
@@ -289,9 +304,15 @@ class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrit
   io.perf.prefetchUsed := diagnosticCount("prefetchUsed", PopCount(VecInit(collectors.map(_.io.prefetchUsed).toSeq)))
   io.perf.prefetchDiscarded := diagnosticCount("prefetchDiscarded",
     PopCount(VecInit(collectors.map(_.io.prefetchDiscarded).toSeq)))
-  require(readClasses.isEmpty || readClasses.size == collectors.size)
+  private val activeReadClasses = readClasses.zipWithIndex.filterNot { case (_, i) =>
+    val readIndex = reads.scanLeft(0)(_ + _)
+    val maskIndex = maskReads.scanLeft(reads.sum)(_ + _)
+    unusedReads.exists { case (g, p) => readIndex(g) + p == i } ||
+      unusedMaskReads.exists { case (g, p) => maskIndex(g) + p == i }
+  }.map(_._1)
+  require(readClasses.isEmpty || activeReadClasses.size == collectors.size)
   if (vParams.diagnosticCounters) {
-    val classes = if (readClasses.isEmpty) Seq.fill(collectors.size)(4) else readClasses
+    val classes = if (readClasses.isEmpty) Seq.fill(collectors.size)(4) else activeReadClasses
     for ((name, k) <- EvuReadClass.names.zipWithIndex) {
       val selected = collectors.zip(classes).collect { case (c, id) if id == k => c }
       val stat = io.perf.byRead(k)
@@ -413,7 +434,7 @@ class AraRegisterFile(
     Module(new Arbiter(new VectorWrite(dLen), llWrites))
   }
   // Stage LL writes to break the load-mask-read/write-ready combinational loop.
-  private val llPending = Reg(Vec(banksPerLane, new VectorWrite(dLen)))
+  private val llPending = Reg(Vec(banksPerLane, new ByteMaskedVectorWrite(dLen)))
   private val llPendingValid = RegInit(VecInit.fill(banksPerLane)(false.B))
   private val llOwners = Option.when(trackWrites) {
     RegInit(VecInit.fill(banksPerLane)(0.U.asTypeOf(Valid(UInt(vParams.vatSz.W)))))
@@ -431,7 +452,11 @@ class AraRegisterFile(
     }
     llArbiters(bank).io.out.ready := !llPendingValid(bank) || !pipeValid(bank)
     when (llArbiters(bank).io.out.fire) {
-      llPending(bank) := llArbiters(bank).io.out.bits
+      llPending(bank).eg := llArbiters(bank).io.out.bits.eg
+      llPending(bank).data := llArbiters(bank).io.out.bits.data
+      llPending(bank).byteMask := ByteWriteMask.pack(llArbiters(bank).io.out.bits.mask)
+      assert(llArbiters(bank).io.out.bits.mask === ByteWriteMask.expand(ByteWriteMask.pack(llArbiters(bank).io.out.bits.mask)),
+        "Buffered VRF write requires whole-byte enables")
       llPendingValid(bank) := true.B
       llOwners.foreach(_(bank) := io.llOwners.get(llArbiters(bank).io.chosen))
     } .elsewhen (llPendingValid(bank) && !pipeValid(bank)) {

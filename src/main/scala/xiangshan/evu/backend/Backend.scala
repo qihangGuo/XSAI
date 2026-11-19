@@ -35,6 +35,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
     val vat_tail = Input(UInt(vParams.vatSz.W))
     val vat_head = Input(UInt(vParams.vatSz.W))
+    val reportHead = Option.when(vParams.externalCommandTags && vParams.diagnosticCounters)(
+      Input(Valid(UInt(vParams.vatSz.W))))
 
     val vat_release = Output(Vec(nRelease, Valid(UInt(vParams.vatSz.W))))
     val completion_vxsat = Output(Vec(nRelease, Bool()))
@@ -87,7 +89,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
         Module(new ExecuteSequencer(s.insns, maxPipeDepth, s.fus.size,
           ordinaryOnly = layout.dedicated && layout.reductionOwner(c).isEmpty,
           reductionOnly = layout.reductionOwner(c).nonEmpty,
-          resultForwarding = forwardingNames.contains(s.name)))
+          resultForwarding = forwardingNames.contains(s.name),
+          restrictedInteger = s.name == "int" && c > 0))
           .suggestName(s"vxs${s.name}_$c")
       }
     }
@@ -179,17 +182,16 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   // Allocate a shared owner before either half of a reduction enters its
   // queue. VAT parity cannot select contexts: alternating sum/max commands
   // would otherwise pin every sum to the same context.
-  val reductionAllocated = RegInit(VecInit.fill(vParams.reductionContexts)(false.B))
-  val reductionChoice = PriorityEncoderOH(VecInit(reductionAllocated.map(!_)).asUInt)
+  val reductionOwners = Module(new ReductionOwnerAllocator(vParams.reductionContexts))
+  val reductionChoice = reductionOwners.io.choice
   val dispatchReduction = !vdq.io.deq.bits.vmu && dis_ctrl.bool(Reduction)
-  val reductionBlocked = interleave.B && dispatchReduction && reductionAllocated.asUInt.andR
+  reductionOwners.io.request := interleave.B && vdq.io.deq.valid && dispatchReduction
+  reductionOwners.io.dispatch := vdq.io.deq.fire
+  reductionOwners.io.release := VecInit(reductionSeqs.map(s => s.io.acc_done && s.io.busy)).asUInt
+  val reductionBlocked = reductionOwners.io.blocked
   io.executionPerf.reductionFull := perfCount(vdq.io.deq.valid && reductionBlocked)
-  for ((seq, c) <- reductionSeqs.zipWithIndex) {
-    when(seq.io.acc_done && seq.io.busy) { reductionAllocated(c) := false.B }
-    when(interleave.B && vdq.io.deq.fire && dispatchReduction && reductionChoice(c)) {
-      reductionAllocated(c) := true.B
-    }
-  }
+  io.executionPerf.reductionReleaseFull := diagnosticCount("diag_reductionReleaseFull", reductionOwners.io.fullWithRelease)
+  io.executionPerf.reductionOwnerReuse := diagnosticCount("diag_reductionOwnerReuse", reductionOwners.io.reused)
 
   // Load sequencer
   vlissq.io.enq.bits.nf_log2 := log2_up(vdq.io.deq.bits.nf, 8)
@@ -346,6 +348,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
   val vrf = Module(new RegisterAccess(flat_vxs.size, maxPipeDepth,
     reductionContexts = vParams.reductionContexts,
+    shortIntegerContexts = flat_vxs.zipWithIndex.collect { case (seq, i) if seq.restrictedInteger => i }.toSet,
     executionClasses = contextsByFu.zip(xissParams.flatMap(_.seqs)).flatMap { case (seqs, factory) =>
       Seq.fill(seqs.size)(EvuReadClass.names.indexOf(factory.name) match { case -1 => 4; case id => id })
     }))
@@ -617,6 +620,34 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       counters.queueWait := perfCount(queue.io.deq.valid && !queue.io.deq.ready)
       counters.dispatchBlocked := perfCount(vdq.io.deq.valid && issq_stall(3 + queueIndex))
       val pendingWork = queue.io.deq.valid || seqs.map(_.io.busy).reduce(_ || _)
+      if (factory.name == "int" && vParams.diagnosticCounters) {
+        val next = queue.io.deq.bits
+        val idle = queue.io.deq.valid && !queue.io.deq.ready && !xu.io.iss.fire
+        val candidate = idle && IntegerContextRules.accepts(next, dLen, vParams.alignedSlide, vParams.singleGroupSlide)
+        def archMask(groups: UInt): UInt = VecInit((0 until 32).map(r =>
+          groups((r + 1) * egsPerVReg - 1, r * egsPerVReg).orR)).asUInt
+        val reads = queue.io.hazards.map(h => Mux(h.valid && h.bits.vat === next.vat,
+          h.bits.rintent, 0.U(32.W))).foldLeft(0.U(32.W))(_ | _)
+        val writes = queue.io.hazards.map(h => Mux(h.valid && h.bits.vat === next.vat,
+          h.bits.wintent, 0.U(32.W))).foldLeft(0.U(32.W))(_ | _)
+        val olderWrites = forwardWriters.map(h => Mux(h.valid && vatOlder(h.bits.vat, next.vat),
+          archMask(h.bits.writes), 0.U(32.W))).foldLeft(0.U(32.W))(_ | _)
+        val queueReads = allIssQs.flatMap(_.io.hazards).map(h =>
+          Mux(h.valid && vatOlder(h.bits.vat, next.vat), h.bits.rintent, 0.U(32.W)))
+        val contextReads = allSeqs.map(_.io.seq_hazard).map(h =>
+          Mux(h.valid && vatOlder(h.bits.vat, next.vat), archMask(h.bits.rintent), 0.U(32.W)))
+        val olderReads = (queueReads ++ contextReads).foldLeft(0.U(32.W))(_ | _)
+        val raw = IntegerContextRules.raw(reads, olderWrites)
+        val destination = IntegerContextRules.destination(writes, olderReads, olderWrites)
+        io.executionPerf.intCandidateIdle := diagnosticCount("diag_intCandidateIdle", candidate)
+        io.executionPerf.intCandidateRaw := diagnosticCount("diag_intCandidateRaw", candidate && raw)
+        io.executionPerf.intCandidateDestination := diagnosticCount("diag_intCandidateDestination", candidate && destination)
+        io.executionPerf.intCandidateIndependent := diagnosticCount("diag_intCandidateIndependent", candidate && !raw && !destination)
+        val secondIssue = seqs.drop(1).map(_.io.iss.fire).foldLeft(false.B)(_ || _)
+        io.executionPerf.intSecondIssues := diagnosticCount("diag_intSecondIssues", secondIssue)
+        io.executionPerf.intSecondOverlapIssues := diagnosticCount("diag_intSecondOverlapIssues", secondIssue &&
+          (seqs.head.io.waitReason.dependency || seqs.head.io.waitReason.operands))
+      }
       counters.noWork := diagnosticCount(s"${factory.name}_noWork", !pendingWork)
       val loadWrites = vls.io.seq_hazard.bits.wintent & Fill(egsTotal, vls.io.seq_hazard.valid) |
         vlissq.io.hazards.map(h => Mux(h.valid, FillInterleaved(egsPerVReg, h.bits.wintent), 0.U)).reduce(_ | _)
@@ -855,7 +886,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   flat_vxs.foreach(_.io.vgu.gather_eidx.valid := false.B)
   flat_vxs.foreach(_.io.vgu.gather_eidx.bits := DontCare)
 
-  val perm_vxs = flat_vxs.filter(_.usesPerm)
+  val perm_vxs = flat_vxs.filter(_.ownsPermutationStream)
   require(perm_vxs.size == 1)
   vgu.io.vxs <> perm_vxs.head.io.vgu
 
@@ -921,7 +952,14 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     r_idx += 1
   }
 
-  val writeCompletion = Module(new WriteCompletionTracker(vParams.vatSz, flat_vxus.size + 1))
+  val writeCompletion = Module(new WriteCompletionTracker(vParams.vatSz, flat_vxus.size + 1,
+    diagnostics = vParams.diagnosticCounters))
+  writeCompletion.io.tail := io.vat_tail
+  writeCompletion.io.reportHead.foreach { head =>
+    head := io.reportHead.getOrElse(0.U.asTypeOf(head))
+  }
+  io.executionPerf.completionHeadWriteWait := diagnosticCount("diag_completionHeadWriteWait", writeCompletion.io.headWriteWait)
+  io.executionPerf.completionHeadTrackerWait := diagnosticCount("diag_completionHeadTrackerWait", writeCompletion.io.headTrackerWait)
   writeCompletion.io.tails(0).valid := vls.io.iss.fire && vls.io.iss.bits.tail
   writeCompletion.io.tails(0).bits := vls.io.iss.bits.vat
   for ((xu, i) <- flat_vxus.zipWithIndex) { writeCompletion.io.tails(i + 1) := xu.io.completed }

@@ -12,7 +12,7 @@ import xiangshan.{ExternalVectorKey, XSCoreParamsKey, XSTileKey}
 import xiangshan.backend.BackendParams
 import xiangshan.backend.fu.matrix.Bundles.AmuCtrlIO
 import xiangshan.backend.rob.AmuCtrlBuffer
-import xiangshan.evu.{EvuCompletion, EvuCoreCommand}
+import xiangshan.evu.{EvuCompletion, EvuCoreCommand, EvuPageMap}
 
 class EvuAmuCompletionHarness(implicit p: Parameters) extends Module {
   private implicit val backend: BackendParams = p(XSCoreParamsKey).backendParams
@@ -28,10 +28,16 @@ class EvuAmuCompletionHarness(implicit p: Parameters) extends Module {
     val needAmu = Input(Bool())
     val pc = Input(UInt(64.W))
     val instr = Input(UInt(32.W))
+    val pageMap = Input(new EvuPageMap(ep))
+    val matrix = Input(Bool())
+    val matrixData = Input(UInt(150.W))
     val issueReady = Input(Bool())
     val issued = Output(Valid(new Bundle {
       val pc = UInt(64.W)
       val instr = UInt(32.W)
+      val pageMap = new EvuPageMap(ep)
+      val matrix = Bool()
+      val matrixData = UInt(150.W)
     }))
     val completion = Flipped(Decoupled(new EvuCompletion(ep)))
     val status = Output(Valid(new EvuCompletion(ep)))
@@ -46,15 +52,18 @@ class EvuAmuCompletionHarness(implicit p: Parameters) extends Module {
   amu.io.enq(0).reqValid := io.enqueue
   amu.io.enq(0).allocPtr.value := io.index
   amu.io.enq(0).needAMU := io.needAmu
+  amu.io.enq(0).evuMemory := !io.matrix && (xiangshan.evu.EvuIsa.isLoad(io.instr(31, 25)) ||
+    xiangshan.evu.EvuIsa.isStore(io.instr(31, 25)))
   amu.io.wb := 0.U.asTypeOf(amu.io.wb)
   val command = WireDefault(0.U.asTypeOf(new EvuCoreCommand(ep)))
   command.pc := io.pc
   command.instr := io.instr
+  command.pageMap := io.pageMap
   val wb = amu.io.wb.find(_.bits.amuCtrl.nonEmpty).get
   wb.valid := io.writeback
   wb.bits.robIdx.value := io.index
-  wb.bits.amuCtrl.get.evu := true.B
-  wb.bits.amuCtrl.get.data := command.asUInt
+  wb.bits.amuCtrl.get.evu := !io.matrix
+  wb.bits.amuCtrl.get.data := Mux(io.matrix, io.matrixData, command.asUInt)
   amu.io.deqCommit := 0.U.asTypeOf(amu.io.deqCommit)
   amu.io.deqCommit(0).valid := io.commit
   amu.io.deqCommit(0).ptr.value := io.index
@@ -70,6 +79,9 @@ class EvuAmuCompletionHarness(implicit p: Parameters) extends Module {
   io.issued.valid := issue.io.out.fire
   io.issued.bits.pc := issued.pc
   io.issued.bits.instr := issued.instr
+  io.issued.bits.pageMap := issued.pageMap
+  io.issued.bits.matrix := !issue.io.out.bits.evu
+  io.issued.bits.matrixData := issue.io.out.bits.data(149, 0)
   amu.io.evuCompletion.get <> io.completion
   io.status := amu.io.evuStatus.get
   io.busy := amu.io.evuBusy
@@ -79,6 +91,89 @@ class EvuAmuCompletionHarness(implicit p: Parameters) extends Module {
 
 class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with Matchers {
   behavior of "AMU ordered EVU completions"
+
+  it should "restore separate page maps while preserving arithmetic and CUTE payloads" in {
+    val (base, _, _) = ArgParser.parse(Array("--config", "DefaultExternalVectorMatrixConfig",
+      "--disable-perf", "--disable-alwaysdb"))
+    implicit val p: Parameters = base.alterPartial {
+      case XSCoreParamsKey => base(XSTileKey).head.copy(RobSize = 32)
+    }
+    test(new EvuAmuCompletionHarness).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      def clear(x: Data): Unit = x match {
+        case b: Bool => b.poke(false.B)
+        case u: UInt => u.poke(0.U)
+        case v: Vec[_] => v.foreach(clear)
+        case b: Bundle => b.elements.values.foreach(clear)
+      }
+      dut.io.index.poke(0.U)
+      dut.io.enqueue.poke(false.B)
+      dut.io.writeback.poke(false.B)
+      dut.io.commit.poke(false.B)
+      dut.io.needAmu.poke(true.B)
+      dut.io.pc.poke(0.U)
+      dut.io.instr.poke(0.U)
+      dut.io.matrix.poke(false.B)
+      dut.io.matrixData.poke(0.U)
+      dut.io.issueReady.poke(false.B)
+      dut.io.redirect.poke(false.B)
+      dut.io.completion.valid.poke(false.B)
+      clear(dut.io.completion.bits)
+      clear(dut.io.pageMap)
+      val functions = Seq(0x10, 0x30, 0x11)
+      for ((function, index) <- functions.zipWithIndex) {
+        dut.io.index.poke(index.U)
+        dut.io.pc.poke((0x80004000L + index * 4).U)
+        dut.io.instr.poke(((BigInt(function) << 25) | 0xb).U)
+        dut.io.enqueue.poke(true.B)
+        dut.clock.step()
+        dut.io.enqueue.poke(false.B)
+        dut.io.pageMap.enabled.poke(true.B)
+        dut.io.pageMap.base.poke((0x10000 + index * 4096).U)
+        dut.io.pageMap.length.poke((64 + index).U)
+        dut.io.pageMap.ppn.zipWithIndex.foreach { case (ppn, page) => ppn.poke((100 + index * 3 + page).U) }
+        dut.io.writeback.poke(true.B)
+        dut.clock.step()
+        dut.io.writeback.poke(false.B)
+        dut.io.commit.poke(true.B)
+        dut.clock.step()
+        dut.io.commit.poke(false.B)
+      }
+      dut.io.issueReady.poke(true.B)
+      for (index <- 0 until 3) {
+        dut.io.issued.valid.expect(true.B)
+        dut.io.issued.bits.pc.expect((0x80004000L + index * 4).U)
+        dut.io.issued.bits.instr.expect(((BigInt(functions(index)) << 25) | 0xb).U)
+        dut.io.issued.bits.matrix.expect(false.B)
+        if (index == 1) dut.io.issued.bits.pageMap.enabled.expect(false.B)
+        else {
+          dut.io.issued.bits.pageMap.enabled.expect(true.B)
+          dut.io.issued.bits.pageMap.base.expect((0x10000 + index * 4096).U)
+          dut.io.issued.bits.pageMap.ppn.zipWithIndex.foreach { case (ppn, page) => ppn.expect((100 + index * 3 + page).U) }
+        }
+        dut.clock.step()
+      }
+      dut.io.issueReady.poke(false.B)
+      dut.io.index.poke(3.U)
+      dut.io.matrix.poke(true.B)
+      val cute = (BigInt(1) << 149) | BigInt("123456789abcdef", 16)
+      dut.io.matrixData.poke(cute.U)
+      dut.io.enqueue.poke(true.B)
+      dut.clock.step()
+      dut.io.enqueue.poke(false.B)
+      dut.io.writeback.poke(true.B)
+      dut.clock.step()
+      dut.io.writeback.poke(false.B)
+      dut.io.commit.poke(true.B)
+      dut.clock.step()
+      dut.io.commit.poke(false.B)
+      dut.io.issueReady.poke(true.B)
+      dut.io.issued.valid.expect(true.B)
+      dut.io.issued.bits.matrix.expect(true.B)
+      dut.io.issued.bits.matrixData.expect(cute.U)
+      dut.clock.step()
+      dut.io.issued.valid.expect(false.B)
+    }
+  }
 
   it should "drain retired memory before traps without waiting for a faulting uncommitted instruction" in {
     val (base, _, _) = ArgParser.parse(Array("--config", "DefaultExternalVectorMatrixConfig",

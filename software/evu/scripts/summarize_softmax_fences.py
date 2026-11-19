@@ -8,13 +8,16 @@ from pathlib import Path
 
 
 FIELDS = re.compile(r"(\w+)=[ \t]*([^\s\[]+)")
-KINDS = "VMU|EXE|FU|PREFLIGHT|SCHED|OP|RED|READ|MEM|LAT|CONFIG|HANDOFF|TAIL|READHINT|JOB|DISPATCH"
+KINDS = "VMU|EXE|FU|PREFLIGHT|SCHED|OP|RED|READ|MEM|LAT|CONFIG|HANDOFF|TAIL|READHINT|JOB|DISPATCH|INTCTX|OWNER|COMPLETION"
 RECORD = re.compile(r"\[EVU-(" + KINDS + r")\]\s+|\[OS\]\s+(?=(?:r|first)=)")
 HARDWARE = re.compile(r"\[EVU-(?:" + KINDS + r")\]\s+")
 GUEST = re.compile(r"\[OS\]\s+(?:r=|first=|DONE\b|PASS\b)[^\r\n]*(?:\r?\n)?")
 PATHS = ("fp_fma", "fp_cmp", "fp_exp")
 REQUIRED = {"VMU", "EXE"} | {"FU:" + path for path in PATHS}
 DIAGNOSTICS = {
+    "INTCTX": ((), ("candidate", "raw", "destination", "independent", "second", "overlap")),
+    "OWNER": ((), ("full_release", "reuse")),
+    "COMPLETION": ((), ("write", "tracker", "transport")),
     "JOB": ((), ("full", "head", "release")),
     "DISPATCH": (("path",), ("queue",)),
     "HANDOFF": (("path",), ("eligible", "idle")),
@@ -79,6 +82,11 @@ def summarize_run(header, fences, results):
             if "CONFIG" not in start or "CONFIG" not in end:
                 raise ValueError("incomplete formal CONFIG snapshot")
             keys = ("dlen", "mlen", "vlen", "fma_contexts", "reduction_contexts")
+            keys += tuple(key for key in ("int_contexts", "reduction_owner_lookahead", "oldest_completion",
+                                          "command_depth", "unified_commands", "completion_fifo")
+                          if key in start["CONFIG"] or key in end["CONFIG"])
+            if any(k not in start["CONFIG"] or k not in end["CONFIG"] for k in keys):
+                raise ValueError("incomplete formal CONFIG fields")
             if any(start["CONFIG"][k] != end["CONFIG"][k] for k in keys):
                 raise ValueError("configuration changed inside formal interval")
             output.append("[OS-CONFIG] first=" + result["first"] + " " + " ".join(

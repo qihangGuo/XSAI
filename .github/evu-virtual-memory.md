@@ -134,24 +134,12 @@ The Saturn integration test also checks source IDs in 0 through N-2 and
 illegal `0x38` rejection without a memory request. Its default 64-byte TL port
 does not replace the removed 32-byte multi-beat runtime test.
 
-### Native MMU Reference Harness
+### Removed Native Harness
 
-This runs without RTL, using the freshly configured NEMU headers/library:
-
-```sh
-cd "$XSAI_REPO"
-mkdir -p out
-cc -std=gnu11 -O2 -D__ISA__=riscv64 \
-  -I "$NEMU_REPO/include" -I "$NEMU_REPO/src/isa/riscv64/include" \
-  -I "$NEMU_REPO/src/isa/riscv64/instr" \
-  software/evu/host/evu_mmu_ref_test.c -o out/evu-mmu-ref-test -ldl
-./out/evu-mmu-ref-test "$NEMU_REPO/build/riscv64-nemu-interpreter-so"
-```
-
-Acceptance requires exit 0 and the final `EVU MMU` success summary. One
-physical-store/guard mismatch is deliberately injected and must be rejected;
-that diagnostic alone is not a failure if the harness reaches its success
-summary. The retired `0x38` instruction must trap without memory/VRF effects.
+The standalone native MMU reference harness was removed on 2026-11-19.
+Its historical source remains in Git. Use the virtual-memory guest above
+for current RTL validation; this does not claim equivalent standalone
+reference-model regression coverage.
 
 Old incremental transfer lists/checksums describe earlier source snapshots.
 Use current source synchronization, including deleted files, as described in

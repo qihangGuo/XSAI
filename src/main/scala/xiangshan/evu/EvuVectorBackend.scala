@@ -54,6 +54,8 @@ class EvuVectorBackendIO(p: EvuParams, unifiedCommands: Boolean) extends Bundle 
   val commandHead = Option.when(unifiedCommands)(Input(UInt(log2Ceil(p.commandDepth).W)))
   val commandTail = Option.when(unifiedCommands)(Input(UInt(log2Ceil(p.commandDepth).W)))
   val commandEpoch = Option.when(unifiedCommands)(Input(UInt(2.W)))
+  val reportHead = Option.when(unifiedCommands && p.enableDifftest)(
+    Input(Valid(UInt(log2Ceil(p.commandDepth).W))))
   val scheduleRelease = Option.when(unifiedCommands)(Output(UInt(p.commandDepth.W)))
   val traceId = Option.when(unifiedCommands && p.enableDifftest)(Output(UInt(log2Ceil(p.commandDepth).W)))
   val tracePc = Option.when(unifiedCommands && p.enableDifftest)(Input(UInt(64.W)))
@@ -121,6 +123,7 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
   }
   saturn.io.commandHead.foreach(_ := io.commandHead.get)
   saturn.io.commandTail.foreach(_ := io.commandTail.get)
+  saturn.io.reportHead.foreach(_ := io.reportHead.get)
   io.scheduleRelease.foreach(_ := saturn.io.scheduleRelease.get)
   io.debugVrf.foreach(_ := saturn.io.debugVrf.get)
   io.vrfPerf := saturn.io.vrfPerf
@@ -341,8 +344,14 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
   val epochByVat = Option.when(!unifiedCommands)(Reg(Vec(vatEntries, UInt(2.W))))
   def jobForVat(vat: UInt): UInt = jobIdByVat.map(_(vat)).getOrElse(vat)
   def epochForVat(vat: UInt): UInt = epochByVat.map(_(vat)).getOrElse(io.commandEpoch.get)
-  val pageMapByVat = Reg(Vec(vatEntries, new EvuPageMap(p)))
-  val virtualBaseByVat = Reg(Vec(vatEntries, UInt(64.W)))
+  val memoryContexts = Module(new EvuMemoryContextTable(p, saturnParams.vatSz))
+  memoryContexts.io.flush := io.flush
+  memoryContexts.io.allocate.valid := saturn.io.issue.fire && isMemory
+  memoryContexts.io.allocate.bits.tag := nextVat
+  memoryContexts.io.allocate.bits.pageMap := cmd.pageMap
+  memoryContexts.io.allocate.bits.virtualBase := Mux(cmd.pageMap.enabled, cmd.base & ~4095.U(64.W), 0.U)
+  memoryContexts.io.release.valid := false.B
+  memoryContexts.io.release.bits := 0.U
   val memoryErrorAddress = RegInit(VecInit.fill(vatEntries)(0.U(64.W)))
   val memoryErrorSticky = RegInit(VecInit.fill(vatEntries)(false.B))
   val memoryFaultSticky = RegInit(VecInit.fill(vatEntries)(EvuFault.None))
@@ -387,8 +396,6 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
     opcodeByVat.foreach(_(nextVat) := cmd.opcode)
     vdByVat.foreach(_(nextVat) := cmd.vd)
     epochByVat.foreach(_(nextVat) := cmd.epoch)
-    pageMapByVat(nextVat) := cmd.pageMap
-    virtualBaseByVat(nextVat) := Mux(cmd.pageMap.enabled, cmd.base & ~4095.U(64.W), 0.U)
     memoryErrorSticky(nextVat) := false.B
     memoryFaultSticky(nextVat) := EvuFault.None
     if (!unifiedCommands) { nextVat := nextVat + 1.U }
@@ -408,11 +415,18 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
     }
   }
   val visibleReleases = pendingReleases | releasedThisCycle
-  val completionVat = PriorityEncoder(visibleReleases)
+  val completionSelector = Module(new xiangshan.evu.common.CompletionSelector(saturnParams.vatSz))
+  completionSelector.io.pending := visibleReleases
+  completionSelector.io.tail := io.commandTail.getOrElse(nextVat)
+  completionSelector.io.flush := io.flush
+  val completionVat = completionSelector.io.out.bits
   val completionFaultNow = returningMemoryFault.valid && returningMemoryFault.bits.vat === completionVat
   val completionMemoryError = memoryErrorSticky(completionVat) || completionFaultNow
   val saturnCompletion = Wire(Decoupled(new EvuCompletion(p)))
-  saturnCompletion.valid := visibleReleases.orR && !io.flush
+  saturnCompletion.valid := completionSelector.io.out.valid
+  completionSelector.io.out.ready := saturnCompletion.ready
+  memoryContexts.io.release.valid := saturnCompletion.fire && memoryByVat(completionVat)
+  memoryContexts.io.release.bits := completionVat
   saturnCompletion.bits.opcode := opcodeByVat.map(_(completionVat)).getOrElse(0.U)
   saturnCompletion.bits.vd := vdByVat.map(_(completionVat)).getOrElse(0.U)
   saturnCompletion.bits.pc := pcByVat.map(_(completionVat)).getOrElse(0.U)
@@ -451,6 +465,14 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
   completionArbiter.io.in(0) <> saturnCompletion
   completionArbiter.io.in(1) <> zeroCompletion
   io.completion <> completionArbiter.io.out
+  io.reportHead.foreach { head =>
+    val waiting = head.valid && (visibleReleases(head.bits) ||
+      (zeroCompletionPending && zeroCompletionReg.jobId === head.bits))
+    val delivered = io.completion.fire && io.completion.bits.jobId === head.bits
+    val counter = RegInit(0.U(64.W)).suggestName("diag_completionHeadTransportWait")
+    when(waiting && !delivered && !io.flush) { counter := counter + 1.U }
+    io.executionPerf.completionHeadTransportWait := counter
+  }
   when (zeroCompletion.fire) { zeroCompletionPending := false.B }
   when(io.flush) {
     contextLive.foreach(_.foreach(_ := false.B))
@@ -499,11 +521,12 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
   requestArbiter.io.flush := io.flush
   val chooseStore = requestArbiter.io.chooseStore
   val requestVat = Mux(chooseStore, saturn.io.dmem.store_req.bits.vat, saturn.io.dmem.load_req.bits.vat)
-  val requestVirtualAddress = virtualBaseByVat(requestVat) +
+  memoryContexts.io.lookup := requestVat
+  val requestVirtualAddress = memoryContexts.io.virtualBase +
     (Mux(chooseStore, saturn.io.dmem.store_req.bits.addr, saturn.io.dmem.load_req.bits.addr) &
       ~(p.mlenBytes - 1).U(64.W))
   val translate = Module(new EvuPageTranslate(p))
-  translate.io.pageMap := pageMapByVat(requestVat)
+  translate.io.pageMap := memoryContexts.io.pageMap
   translate.io.vaddr := requestVirtualAddress & ~63.U(64.W)
 
   io.memory.req.valid := hasFreeTag &&
@@ -511,7 +534,10 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
   io.memory.req.bits.addr := translate.io.paddr | requestVirtualAddress(5, 0)
   io.memory.req.bits.jobId := jobForVat(requestVat)
   io.memory.req.bits.epoch := epochForVat(requestVat)
-  when(io.memory.req.valid) { assert(translate.io.legal, "VMU request escaped its preflight page map") }
+  when(io.memory.req.valid) {
+    assert(memoryContexts.io.found, "VMU request lost its translation owner")
+    assert(translate.io.legal, "VMU request escaped its preflight page map")
+  }
   io.memory.req.bits.data := Mux(chooseStore, saturn.io.dmem.store_req.bits.data, 0.U)
   io.memory.req.bits.mask := Mux(chooseStore, saturn.io.dmem.store_req.bits.mask,
     ((BigInt(1) << p.mlenBytes) - 1).U)

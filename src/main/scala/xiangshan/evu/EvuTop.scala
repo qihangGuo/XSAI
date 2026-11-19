@@ -121,6 +121,10 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   commandTable.io.flush := io.flush
   vectorBackend.io.commandHead.get := commandTable.io.scheduleHead
   vectorBackend.io.commandTail.get := nextJobId
+  vectorBackend.io.reportHead.foreach { head =>
+    head.valid := commandTable.io.busy && !commandTable.io.completed(commandTable.io.head)
+    head.bits := commandTable.io.head
+  }
   vectorBackend.io.commandEpoch.get := currentEpoch
   commandTable.io.scheduleRelease := vectorBackend.io.scheduleRelease.get
   commandTable.io.traceId.foreach(_ := vectorBackend.io.traceId.get)
@@ -495,11 +499,14 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
     when(io.completion.fire && io.completion.bits.opcode === EvuOpcode.Fence) {
       fenceIndex := fenceIndex + 1.U
       when(trace.asBool) {
-        printf(p"[EVU-CONFIG] fence=${fenceIndex} dlen=${ep.dlenBits.U} mlen=${ep.mlenBits.U} vlen=${ep.vlenBits.U} fma_contexts=${ep.fmaOrdinaryContexts.U} reduction_contexts=${ep.reductionContexts.U} fp32_div_lanes=${(if (ep.parallelFp32Div) ep.dlenBits / 32 else 1).U} slide_prefetch=${ep.slidePrefetch.B} command_depth=${ep.commandDepth.U} unified_commands=1 completion_fifo=0\n")
+        printf(p"[EVU-CONFIG] fence=${fenceIndex} dlen=${ep.dlenBits.U} mlen=${ep.mlenBits.U} vlen=${ep.vlenBits.U} fma_contexts=${ep.fmaOrdinaryContexts.U} int_contexts=${(if (ep.splitFpIssue) 2 else 1).U} reduction_contexts=${ep.reductionContexts.U} reduction_owner_lookahead=1 oldest_completion=1 fp32_div_lanes=${(if (ep.parallelFp32Div) ep.dlenBits / 32 else 1).U} slide_prefetch=${ep.slidePrefetch.B} command_depth=${ep.commandDepth.U} unified_commands=1 completion_fifo=0\n")
         printf(p"[EVU-JOB] fence=${fenceIndex} full=${jobPerf.io.full} head=${jobPerf.io.headBlocked} release=${jobPerf.io.fullRelease}\n")
         printf(p"[EVU-VMU] fence=${fenceIndex} t=${perfCycles} cmd=${memoryCounters(0)} tag=${memoryCounters(1)} get=${memoryCounters(2)} put=${memoryCounters(3)} partial=${memoryCounters(4)} full=${memoryCounters(5)} ack=${memoryCounters(6)} entry=${memoryCounters(7)} win=${vectorBackend.io.memoryOrderStalls} merge=${perfVmuStoreMerges} rmwget=${rmwGets} rmwmerge=${rmwMerges}\n")
         val exe = vectorBackend.io.executionPerf
         val vrf = vectorBackend.io.vrfPerf
+        printf(p"[EVU-INTCTX] fence=${fenceIndex} candidate=${exe.intCandidateIdle} raw=${exe.intCandidateRaw} destination=${exe.intCandidateDestination} independent=${exe.intCandidateIndependent} second=${exe.intSecondIssues} overlap=${exe.intSecondOverlapIssues}\n")
+        printf(p"[EVU-OWNER] fence=${fenceIndex} full_release=${exe.reductionReleaseFull} reuse=${exe.reductionOwnerReuse}\n")
+        printf(p"[EVU-COMPLETION] fence=${fenceIndex} write=${exe.completionHeadWriteWait} tracker=${exe.completionHeadTrackerWait} transport=${exe.completionHeadTransportWait}\n")
         printf(p"[EVU-DISPATCH] fence=${fenceIndex} path=all queue=${exe.dispatchBlocked}\n")
         for ((name, index) <- xiangshan.evu.common.EvuDispatchPerf.names.zipWithIndex) {
           printf(p"[EVU-DISPATCH] fence=${fenceIndex} path=${name} queue=${exe.dispatchQueueWait(index)}\n")

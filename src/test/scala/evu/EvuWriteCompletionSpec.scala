@@ -59,6 +59,7 @@ class EvuWriteCompletionSpec extends AnyFlatSpec with ChiselScalatestTester {
 
   it should "hold completed tails until every buffered bank write drains and retain simultaneous tails" in {
     test(new WriteCompletionTracker(3, 3)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      dut.io.tail.poke(0.U)
       dut.io.tails.foreach { t => t.valid.poke(false.B); t.bits.poke(0.U) }
       dut.io.pendingWrites.poke(2.U)
       dut.io.tails(0).valid.poke(true.B)

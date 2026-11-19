@@ -94,39 +94,10 @@ NEMU's automatic build commit.
 
 ## Native Reference Regression
 
-This exercises the reference API without RTL; passing does not validate CUTE
-or the full-core EVU integration.
-
-```sh
-cd "$XSAI_REPO"
-mkdir -p out
-cc -std=gnu11 -O2 -D__ISA__=riscv64 \
-  -I "$NEMU_REPO/include" -I "$NEMU_REPO/src/isa/riscv64/include" \
-  -I "$NEMU_REPO/src/isa/riscv64/instr" \
-  software/evu/host/evu_matrix_ref_test.c -o out/evu-matrix-ref-test -ldl
-./out/evu-matrix-ref-test "$NEMU_REPO/build/riscv64-nemu-interpreter-so"
-```
-
-Acceptance requires exit 0 and the final summary reporting three launches,
-6,144 result beats and 6,144 RMW stores. Deliberately injected wrong data,
-flags, guards, duplicate beats and early drains must be rejected. The third
-launch checks inexact arithmetic, WAIT's zero flags and FENCE's NX. A CHECK
-failure or missing final summary is a failure, even if mismatch diagnostics
-also appear during intentional negative checks.
-
-The combined rebuild and native validation command is:
-
-```sh
-cd "$XSAI_REPO"
-set -o pipefail
-bash software/evu/scripts/check_matrix_ref.sh "$NEMU_REPO" --rebuild \
-  2>&1 | tee check_matrix_ref.log
-```
-
-Synchronize all NEMU sources first, including `instr/ame/mcompute.h`,
-`instr/ame/mldst_impl.c` and `instr/evu/`. This command replaces NEMU's
-configuration with the EVU reference preset and cleans its build directory.
-The final `EVU matrix reference PASS` is required before the full-core run.
+This section is historical. The matrix-coupled guest/reference harness and
+its rebuild script were retired with the pure-vector ISA. They are not
+present-day validation entry points; current supported tests and build
+instructions are in [software/evu/README.md](../software/evu/README.md).
 
 ## Diagnose a Matrix Event Failure
 

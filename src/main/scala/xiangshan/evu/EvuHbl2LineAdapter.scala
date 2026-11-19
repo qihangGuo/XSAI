@@ -53,7 +53,6 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
   val second = RegInit(VecInit.fill(n)(false.B))
   val crosses = Reg(Vec(n, Bool()))
   val dropped = RegInit(VecInit.fill(n)(false.B))
-  val firstData = Reg(Vec(n, UInt(512.W)))
   val putData = Reg(Vec(n, UInt(512.W)))
   val results = Reg(Vec(n, new EvuLineMemoryResponse(p)))
 
@@ -144,7 +143,8 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
     !dropped(d.tag) && !io.flush &&
     (d.error || states(d.tag) === writeWait || !requests(d.tag).write)
   val bypass = finalResponse && !responses.io.out.valid
-  val combinedReadData = Mux(second(d.tag), Cat(d.data, firstData(d.tag)), Cat(0.U(512.W), d.data))
+  // Until the second line arrives, the response buffer holds the raw first line.
+  val combinedReadData = Mux(second(d.tag), Cat(d.data, results(d.tag).data), Cat(0.U(512.W), d.data))
   val returnedReadData = (combinedReadData >> (requests(d.tag).addr(5, 0) << 3))(511, 0)
   val bypassBits = WireDefault(results(d.tag))
   bypassBits.error := d.error
@@ -175,6 +175,9 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
         states(i) := idle
         dropped(i) := false.B
       }.elsewhen(d.error) {
+        when(second(i) && !requests(i).write) {
+          results(i).data := results(i).data >> (requests(i).addr(5, 0) << 3)
+        }
         results(i).error := true.B
         results(i).fault := d.fault
         states(i) := respond
@@ -184,8 +187,7 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
         states(i) := writeReq
       }.otherwise {
         when(states(i) === readWait) {
-          firstData(i) := d.data
-          results(i).data := returnedReadData
+          results(i).data := Mux(!second(i) && crosses(i), d.data, returnedReadData)
         }
         finishPart()
       }

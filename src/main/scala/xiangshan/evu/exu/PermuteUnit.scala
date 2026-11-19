@@ -47,10 +47,10 @@ class PermuteUnit(implicit p: Parameters) extends PipelinedFunctionalUnit(1)(p) 
   val compress_bit = (io.pipe(0).bits.rvs1_data >> io.pipe(0).bits.eidx(log2Ceil(dLen)-1,0))(0)
   val compress_eidx = Mux(io.pipe(0).bits.head, 0.U, result_reg)(log2Ceil(maxVLMax),0)
 
-  when (io.pipe(0).valid && io.pipe(0).bits.head && rgather) {
+  when (io.pipe(0).valid && io.pipe(0).bits.head && !io.pipe(0).bits.tail && rgather) {
     result_reg := elem
   }
-  when (io.pipe(0).valid && io.pipe(0).bits.head) {
+  when (io.pipe(0).valid && io.pipe(0).bits.head && compress) {
     wvd_reg := io.pipe(0).bits.wvd_eg >> log2Ceil(egsPerVReg)
   }
   when (io.pipe(0).valid && compress) {

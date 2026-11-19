@@ -3,7 +3,7 @@ package xiangshan.evu
 import chisel3._
 import chisel3.util._
 
-class EvuCoreCommand(p: EvuParams) extends Bundle {
+class EvuCoreCommandData(p: EvuParams) extends Bundle {
   val pc = UInt(64.W)
   val config = new EvuExecutionConfig(p)
   val instr  = UInt(32.W)
@@ -11,7 +11,24 @@ class EvuCoreCommand(p: EvuParams) extends Bundle {
   val vl     = UInt(log2Ceil(p.vlenBits + 1).W)
   val length = UInt(32.W)
   val aux    = UInt(8.W)
+}
+
+class EvuCoreCommand(p: EvuParams) extends EvuCoreCommandData(p) {
   val pageMap = new EvuPageMap(p)
+}
+
+object EvuCoreCommandData {
+  def compact(full: EvuCoreCommand, p: EvuParams): EvuCoreCommandData = {
+    val result = Wire(new EvuCoreCommandData(p))
+    result.elements.foreach { case (name, field) => field := full.elements(name) }
+    result
+  }
+  def expand(data: EvuCoreCommandData, map: EvuPageMap, p: EvuParams): EvuCoreCommand = {
+    val result = Wire(new EvuCoreCommand(p))
+    data.elements.foreach { case (name, field) => result.elements(name) := field }
+    result.pageMap := map
+    result
+  }
 }
 
 /**

@@ -50,6 +50,8 @@ object EvuAreaMain {
       |  "command_depth": ${ep.commandDepth}, "unified_commands": true, "completion_fifo_depth": 0,
       |  "reduction_contexts": ${ep.reductionContexts},
       |  "fma_ordinary_contexts": ${ep.fmaOrdinaryContexts},
+      |  "int_ordinary_contexts": ${if (ep.splitFpIssue) 2 else 1},
+      |  "reduction_owner_lookahead": true, "oldest_completion": true,
       |  "fp32_div_lanes": ${if (ep.parallelFp32Div) ep.dlenBits / 32 else 1},
       |  "eg_chaining": ${ep.egChaining}, "vmu_line_coalescing": ${ep.vmuLineCoalescing},
       |  "split_fp_issue": ${ep.splitFpIssue}, "scalar_instructions": ${ep.scalarInstructions},

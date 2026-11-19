@@ -8,7 +8,7 @@ import freechips.rocketchip.util._
 import xiangshan.evu.common._
 
 class RegisterAccess(exSeqs: Int, maxExuDepth: Int, reductionContexts: Int = 1,
-    executionClasses: Seq[Int] = Seq.empty)(implicit p: Parameters)
+    executionClasses: Seq[Int] = Seq.empty, shortIntegerContexts: Set[Int] = Set.empty)(implicit p: Parameters)
     extends CoreModule()(p) with HasVectorParams {
   val io = IO(new Bundle {
     val vls = new Bundle {
@@ -75,7 +75,9 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, reductionContexts: Int = 1,
     trackWrites = true,
     scalarPorts = (0 until exSeqs).flatMap(i => (0 until 3).map(group => (group, i))) :+ (2, exSeqs),
     readClasses = readClasses,
-    bypassPorts = (0 until exSeqs).flatMap(i => (0 until 3).map(group => (group, i))) :+ (2, exSeqs)
+    bypassPorts = (0 until exSeqs).flatMap(i => (0 until 3).map(group => (group, i))) :+ (2, exSeqs),
+    unusedReads = shortIntegerContexts.map(i => (2, i)),
+    unusedMaskReads = shortIntegerContexts.map(i => (0, i))
   ))
   val resetting = RegInit(true.B)
   io.perf := vrf.io.perf

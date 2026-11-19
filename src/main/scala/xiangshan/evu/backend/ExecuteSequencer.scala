@@ -54,10 +54,13 @@ class ExecuteSequencerIO(maxDepth: Int, nFUs: Int, forwarding: Boolean = false)(
   val acc_merge = Output(Bool())
 }
 
-class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs: Int,
+class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs: Int,
     ordinaryOnly: Boolean = false, val reductionOnly: Boolean = false,
-    resultForwarding: Boolean = false)(implicit p: Parameters) extends Sequencer[ExecuteMicroOp]()(p) {
+    resultForwarding: Boolean = false, val restrictedInteger: Boolean = false)(implicit p: Parameters)
+    extends Sequencer[ExecuteMicroOp]()(p) {
+  val supported_insns = if (restrictedInteger) IntegerContextRules.instructions(allInsns) else allInsns
   def usesPerm = supported_insns.count(_.props.contains(UsesGatherUnit.Y)) > 0
+  def ownsPermutationStream: Boolean = usesPerm && !restrictedInteger
   def usesAcc = supported_insns.count(_.props.contains(Reduction.Y)) > 0
   def usesRvd = supported_insns.count(_.props.contains(ReadsVD.Y)) > 0
   def usesCompress = supported_insns.count(_.props.contains(F6(OPMFunct6.compress))) > 0
@@ -65,7 +68,8 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   def accepts(inst: VectorIssueInst) = {
     val ctrl = new VectorDecoder(inst, supported_insns, Seq(Reduction))
     !inst.vmu && ctrl.matched && (!ordinaryOnly.B || !ctrl.bool(Reduction)) &&
-      (!reductionOnly.B || ctrl.bool(Reduction))
+      (!reductionOnly.B || ctrl.bool(Reduction)) &&
+      (!restrictedInteger.B || IntegerContextRules.accepts(inst, dLen, vParams.alignedSlide, vParams.singleGroupSlide))
   }
 
   val io = IO(new ExecuteSequencerIO(maxPipeDepth, nFUs, resultForwarding))
@@ -77,8 +81,8 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   val rvmCaptured = RegInit(false.B)
   val rvs1Data = Reg(UInt(dLen.W))
   val rvs2Data = Reg(UInt(dLen.W))
-  val rvdData = Reg(UInt(dLen.W))
-  val rvmData = Reg(UInt(dLen.W))
+  val rvdData = Option.when(!restrictedInteger)(Reg(UInt(dLen.W)))
+  val rvmData = Option.when(!restrictedInteger)(Reg(UInt(dLen.W)))
   val inst  = Reg(new BackendIssueInst)
   val lowPrecision = EvuLowPrecision.backend(inst.funct3, inst.funct6)
   val head  = Reg(Bool())
@@ -143,7 +147,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   val renv2    = Mux(rgather_ix, head, inst.renv2) && (!inst.reduction || (!acc_fold && !acc_merge)) &&
     (!aligned_slide || slide_source_valid)
   val renvd    = inst.renvd && usesRvd.B
-  val renvm    = inst.renvm
+  val renvm    = inst.renvm && !restrictedInteger.B
   val renacc   = inst.reduction && usesAcc.B
   // Forward only FP32 E0 operands. A full EG, mask, gather, or reduction
   // source must still read the preserved vector bytes from the SRAM.
@@ -162,7 +166,25 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   io.dis.ready := (!valid || (tail && io.iss.fire)) && !io.dis_stall
 
   when (io.dis.fire) {
-    val dis_inst = io.dis.bits
+    val dis_inst = WireInit(io.dis.bits)
+    if (restrictedInteger) {
+      dis_inst.renvd := false.B
+      dis_inst.renvm := false.B
+      dis_inst.reduction := false.B
+      dis_inst.wide_vd := false.B
+      dis_inst.wide_vs2 := false.B
+      dis_inst.reads_vs1_mask := false.B
+      dis_inst.reads_vs2_mask := false.B
+      dis_inst.writes_mask := false.B
+      dis_inst.vconfig.vtype.vsew := 2.U
+      dis_inst.vconfig.vtype.vlmul_mag := 0.U
+      dis_inst.vconfig.vtype.vlmul_sign := false.B
+      dis_inst.vstart := 0.U
+    }
+    if (restrictedInteger) {
+      assert(IntegerContextRules.accepts(io.dis.bits, dLen, vParams.alignedSlide, vParams.singleGroupSlide),
+        "Restricted integer context received an unsupported instruction")
+    }
 
     rvs1Captured := false.B
     rvs2Captured := false.B
@@ -223,7 +245,7 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
       Mux(dis_exp2, dis_inst.vstart, 0.U))
     assert(dis_inst.vstart === 0.U || dis_exp2)
     valid         := true.B
-    inst          := io.dis.bits
+    inst          := dis_inst
     inst.renv2    := dis_inst.renv2 || dis_direct_slide
     eidx          := dis_start
     wvd_mask      := Mux(dis_inst.wvd               , FillInterleaved(egsPerVReg, dis_vd_arch_mask), 0.U)
@@ -425,13 +447,13 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
     when(inst.scalarVrfSource && !io.dis.fire) { rvs1_mask := 0.U }
   }
   when (io.rvs2.req.fire) { rvs2Data := io.rvs2.resp; rvs2Captured := keepOperands }
-  when (io.rvd.req.fire)  { rvdData := io.rvd.resp; rvdCaptured := keepOperands }
-  when (io.rvm.req.fire)  { rvmData := io.rvm.resp; rvmCaptured := keepOperands }
+  rvdData.foreach { data => when(io.rvd.req.fire) { data := io.rvd.resp; rvdCaptured := keepOperands } }
+  rvmData.foreach { data => when(io.rvm.req.fire) { data := io.rvm.resp; rvmCaptured := keepOperands } }
   val source1 = Mux(rvs1Captured, rvs1Data, io.rvs1.resp)
   io.rvs1_data := Mux(inst.scalarVrfSource, Fill(dLen / 32, source1(31, 0)), source1)
   io.rvs2_data := Mux(rvs2Captured, rvs2Data, io.rvs2.resp)
-  io.rvd_data := Mux(rvdCaptured, rvdData, io.rvd.resp)
-  io.rvm_data := Mux(rvmCaptured, rvmData, io.rvm.resp)
+  io.rvd_data := rvdData.map(data => Mux(rvdCaptured, data, io.rvd.resp)).getOrElse(0.U(dLen.W))
+  io.rvm_data := rvmData.map(data => Mux(rvmCaptured, data, io.rvm.resp)).getOrElse(0.U(dLen.W))
 
   val exu_scheduler = Module(new PipeScheduler(1, maxPipeDepth))
   exu_scheduler.io.reqs(0).request := valid && pipelined
@@ -493,6 +515,10 @@ class ExecuteSequencer(supported_insns: Seq[VectorInstruction], maxPipeDepth: In
   )
   io.vgu.slide_req.valid := iss_valid && read_slide_buffer && io.iss.ready && usesPerm.B
   io.vgu.gather_eidx.ready := iss_valid && read_eidx_buffer && io.iss.ready && usesPerm.B
+  if (restrictedInteger) {
+    assert(!io.vgu.slide_req.valid && !io.vgu.gather_eidx.ready,
+      "Restricted integer context tried to consume the shared permutation stream")
+  }
   io.iss.valid := iss_valid
   io.acc_ready := iss_valid && renacc && usesAcc.B
 

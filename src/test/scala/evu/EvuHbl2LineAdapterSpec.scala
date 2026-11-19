@@ -188,6 +188,27 @@ class EvuHbl2LineAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with
       dut.io.client.resp.bits.data.expect((combined & lineMask).U)
       dut.clock.step()
       dut.io.busy.expect(false.B)
+
+      // A second-line fault must preserve the same first-line payload even
+      // though the shared response buffer held the unshifted first line.
+      dut.io.client.resp.ready.poke(false.B)
+      request(60, 0, 0xff, 8, write = false, tag = 2)
+      busRequest(0, write = false)
+      dut.io.memory.resp.bits.tag.poke(2.U)
+      response(old0)
+      busRequest(64, write = false)
+      dut.io.memory.resp.bits.error.poke(true.B)
+      dut.io.memory.resp.bits.fault.poke(EvuFault.Access)
+      response(0)
+      await(dut.io.client.resp.valid)
+      dut.io.client.resp.bits.error.expect(true.B)
+      dut.io.client.resp.bits.fault.expect(EvuFault.Access)
+      dut.io.client.resp.bits.data.expect((old0 >> (60 * 8)).U)
+      dut.clock.step(3)
+      dut.io.client.resp.bits.data.expect((old0 >> (60 * 8)).U)
+      dut.io.client.resp.ready.poke(true.B)
+      dut.clock.step()
+      dut.io.busy.expect(false.B)
     }
   }
 

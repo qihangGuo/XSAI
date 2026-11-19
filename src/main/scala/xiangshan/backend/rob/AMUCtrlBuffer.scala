@@ -11,8 +11,9 @@ import utils.OptionWrapper
 import xiangshan._
 import xiangshan.backend.BackendParams
 import xiangshan.backend.Bundles.DynInst
+import xiangshan.backend.fu.FuType
 import xiangshan.backend.fu.matrix.Bundles._
-import xiangshan.evu.{EvuCompletion, EvuCoreCommand}
+import xiangshan.evu.{EvuCompletion, EvuCoreCommand, EvuCoreCommandData, EvuIsa, EvuPageMap, EvuPageMapPool}
 
 class AmuCtrlBufferIO()(implicit val p: Parameters, val params: BackendParams) extends Bundle with HasXSParameter {
   // rob enq
@@ -21,6 +22,7 @@ class AmuCtrlBufferIO()(implicit val p: Parameters, val params: BackendParams) e
     val reqValid = Bool()  // Req valid
     val allocPtr = new RobPtr
     val needAMU = Bool()
+    val evuMemory = Bool()
     val pc = Option.when(env.EnableDifftest && HasMatrixExtension)(UInt(VAddrBits.W))
     val pcTransType = Option.when(env.EnableDifftest && HasMatrixExtension)(new AddrTransType)
   }
@@ -66,12 +68,22 @@ class AmuCtrlBufferIO()(implicit val p: Parameters, val params: BackendParams) e
 }
 
 
+class AmuStoredCtrl(implicit p: Parameters) extends XSBundle {
+  val op = UInt(2.W)
+  val evu = Bool()
+  val data = UInt((if (p(ExternalVectorKey).enable)
+    math.max(150, (new EvuCoreCommandData(p(ExternalVectorKey))).getWidth) else 150).W)
+  val pc = Option.when(env.EnableDifftest)(UInt(64.W))
+  val coreid = Option.when(env.EnableDifftest)(UInt(hartIdLen.W))
+}
+
 class AmuCtrlEntry(implicit p: Parameters) extends XSBundle {
   val valid = Bool()
   val needAMU = Bool()
   val writebacked = Bool()
   val committed = Bool()
-  val amuCtrl = new AmuCtrlIO
+  val amuCtrl = new AmuStoredCtrl
+  val mapSlot = Option.when(p(ExternalVectorKey).enable)(UInt(5.W))
   val canDeq = Bool()
   val evuAccepted = Bool()
   val evuException = Bool()
@@ -138,6 +150,9 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
       io.enq(i).reqValid := robImp.io.enq.req(i).valid
       io.enq(i).allocPtr := robImp.allocatePtrVec(i)
       io.enq(i).needAMU := robImp.io.enq.req(i).bits.needAmuCtrl.get
+      val inst = robImp.io.enq.req(i).bits
+      io.enq(i).evuMemory := p(ExternalVectorKey).enable.B && inst.fuType === FuType.evu.U &&
+        (EvuIsa.isLoad(inst.instr(31, 25)) || EvuIsa.isStore(inst.instr(31, 25)))
 
       if (env.EnableDifftest && HasMatrixExtension) {
         io.enq(i).pc.get := robImp.io.enq.req(i).bits.pc
@@ -160,6 +175,48 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
   }
 
   val amuCtrlEntries = RegInit(VecInit.fill(RobSize)(AmuCtrlEntry.zero))
+  val amuCtrlWb = io.wb.filter(_.bits.amuCtrl.nonEmpty).toSeq
+  val mapPool = Option.when(p(ExternalVectorKey).enable) {
+    Module(new EvuPageMapPool(p(ExternalVectorKey), RobSize, RenameWidth, amuCtrlWb.size, CommitWidth))
+  }
+  val cancelledOwners = VecInit((0 until RobSize).map { i =>
+    io.redirect.valid && (io.redirect.all || Mux(io.redirect.end > io.redirect.begin,
+      i.U > io.redirect.begin && i.U < io.redirect.end,
+      i.U > io.redirect.begin || i.U < io.redirect.end))
+  }).asUInt
+  val mapCapacityReady = mapPool.map { pool =>
+    pool.io.cancelOwners := cancelledOwners
+    pool.io.release := 0.U
+    for (i <- 0 until RenameWidth) {
+      pool.io.reserve(i).valid := io.enq(i).valid && io.enq(i).evuMemory && !io.redirect.valid
+      pool.io.reserve(i).bits := io.enq(i).allocPtr.value
+    }
+    for ((wb, i) <- amuCtrlWb.zipWithIndex) {
+      val payload = wb.bits.amuCtrl.get.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey)))
+      val memory = EvuIsa.isLoad(payload.instr(31, 25)) || EvuIsa.isStore(payload.instr(31, 25))
+      pool.io.write(i).valid := wb.valid && wb.bits.amuCtrl.get.evu && memory && !cancelledOwners(wb.bits.robIdx.value)
+      pool.io.write(i).bits.slot := amuCtrlEntries(wb.bits.robIdx.value).mapSlot.get
+      pool.io.write(i).bits.owner := wb.bits.robIdx.value
+      pool.io.write(i).bits.map := payload.pageMap
+    }
+    val requested = PopCount(io.enq.map(e => e.reqValid && e.evuMemory))
+    // Leave a full rename group of credits for the registered admission signal.
+    GatedValidRegNext(pool.io.occupied +& requested <= (32 - RenameWidth).U, true.B)
+  }.getOrElse(true.B)
+
+  def expandControl(entry: AmuCtrlEntry, map: EvuPageMap): AmuCtrlIO = {
+    val result = Wire(new AmuCtrlIO)
+    result.op := entry.amuCtrl.op
+    result.evu := entry.amuCtrl.evu
+    val identity = entry.amuCtrl.data.asTypeOf(new EvuCoreCommandData(p(ExternalVectorKey)))
+    val memory = EvuIsa.isLoad(identity.instr(31, 25)) || EvuIsa.isStore(identity.instr(31, 25))
+    val commandMap = Mux(memory, map, 0.U.asTypeOf(map))
+    result.data := Mux(entry.amuCtrl.evu,
+      EvuCoreCommandData.expand(identity, commandMap, p(ExternalVectorKey)).asUInt, entry.amuCtrl.data)
+    result.pc.foreach(_ := entry.amuCtrl.pc.get)
+    result.coreid.foreach(_ := entry.amuCtrl.coreid.get)
+    result
+  }
 
   // Difftest
   val dt_pc = Option.when(env.EnableDifftest && HasMatrixExtension)(DebugMem(RobSize, UInt(VAddrBits.W)))
@@ -178,8 +235,9 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
     numValidEntries + numNewEntries <= (RobSize - RenameWidth * 2).U,
     true.B
   )
-  io.canEnqueue := canEnqueue
-  io.canEnqueueForDispatch := canEnqueueForDispatch
+  io.canEnqueue := canEnqueue && mapCapacityReady
+  io.canEnqueueForDispatch := canEnqueueForDispatch && mapCapacityReady
+  XSPerfAccumulate("evu_translation_pool_full", !mapCapacityReady)
 
   // Enqueue (Sync with outer ROB)
   // DynInst does not carry amuCtrl info,
@@ -193,6 +251,9 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
       entry := AmuCtrlEntry.zero
       entry.valid := true.B
       entry.needAMU := needOH.asUInt.orR
+      entry.mapSlot.foreach { slot =>
+        slot := Mux1H(io.enq.zip(enqOH).map { case (enq, hit) => hit && enq.evuMemory }, mapPool.get.io.slots)
+      }
       if (env.EnableDifftest && HasMatrixExtension) {
         val pcData = Mux1H(
           io.enq.zip(indexMatch).map { case (enq, imatch) => imatch && enq.valid },
@@ -210,7 +271,6 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
   }
 
   // Writeback (Sync with outer ROB)
-  val amuCtrlWb = io.wb.filter(_.bits.amuCtrl.nonEmpty).toSeq
   for (i <- 0 until RobSize) {
     val amu_data = amuCtrlWb.map{ wb =>
       val valid_match = wb.valid && wb.bits.robIdx.value === i.U
@@ -221,7 +281,11 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
     assert(!amu_data.orR || entry.valid, s"AMUCtrl entry $i is invalid but has amu_data")
     when (amu_data.orR) {
       entry.writebacked := true.B
-      entry.amuCtrl := amu_data.asTypeOf(new AmuCtrlIO)
+      val incoming = amu_data.asTypeOf(new AmuCtrlIO)
+      entry.amuCtrl.op := incoming.op
+      entry.amuCtrl.evu := incoming.evu
+      entry.amuCtrl.data := Mux(incoming.evu, EvuCoreCommandData.compact(
+        incoming.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey))), p(ExternalVectorKey)).asUInt, incoming.data)
       // The matrix probe observes the serialized output after arbitration.
       if (env.EnableDifftest && HasMatrixExtension) {
         entry.amuCtrl.pc.get := Mux(dt_pcTransType.get(i).shouldBeSext, SignExt(dt_pc.get(i), XLEN), dt_pc.get(i))
@@ -248,8 +312,11 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
     deq.valid && entry.needAMU && entry.writebacked && entry.amuCtrl.evu
   }
   io.evuRetired.valid := retiringEvu.reduce(_ || _)
-  io.evuRetired.bits := PriorityMux(retiringEvu.zip(io.deqCommit.map { deq =>
-    amuCtrlEntries(deq.ptr.value).amuCtrl.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey)))
+  io.evuRetired.bits := PriorityMux(retiringEvu.zip(io.deqCommit.zipWithIndex.map { case (deq, i) =>
+    val entry = amuCtrlEntries(deq.ptr.value)
+    // CSR retirement consumes instruction/config identity, never translations.
+    expandControl(entry, 0.U.asTypeOf(new EvuPageMap(p(ExternalVectorKey)))).data
+      .asTypeOf(new EvuCoreCommand(p(ExternalVectorKey)))
   }))
 
   // Redirect (Sync with outer ROB)
@@ -300,7 +367,10 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
     deqEntry.checkSanity(s"AMUCtrlBuffer: deqEntry[$i]")
     amuCtrl.valid := deqEntry.amuReqValid && !io.redirect.valid &&
       (if (separateIssue) olderIssued && !issueBarrier else true.B)
-    amuCtrl.bits := Mux(deqEntry.amuReqValid, deqEntry.amuCtrl, 0.U.asTypeOf(new AmuCtrlIO))
+    mapPool.foreach(_.io.read(i) := deqEntry.mapSlot.get)
+    val expanded = expandControl(deqEntry, mapPool.map(_.io.data(i)).getOrElse(
+      0.U.asTypeOf(new EvuPageMap(p(ExternalVectorKey)))))
+    amuCtrl.bits := Mux(deqEntry.amuReqValid, expanded, 0.U.asTypeOf(new AmuCtrlIO))
     when (amuCtrl.fire) {
       // XSCore serializes these lanes through a fixed-priority arbiter.
       assert(!olderAmuReqValid, s"AMUCtrlBuffer: toAMU[$i] fired before an older AMU request")
@@ -351,6 +421,14 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
 
   }
 
+  mapPool.foreach { pool =>
+    pool.io.release := io.toAMU.zip(issueEntries).map { case (port, entry) =>
+      val f7 = port.bits.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey))).instr(31, 25)
+      Mux(port.fire && port.bits.evu && (EvuIsa.isLoad(f7) || EvuIsa.isStore(f7)),
+        UIntToOH(entry.mapSlot.get, 32), 0.U(32.W))
+    }.reduce(_ | _)
+  }
+
   // Skip only the completed prefix being cleared this cycle. The target is
   // still the oldest unfinished entry, never a younger command behind it.
   io.evuCompletion.foreach { completion =>
@@ -378,7 +456,7 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
     XSPerfAccumulate("evu_amu_completion_consecutive", completion.fire && previousFire)
     if (env.EnableDifftest) {
       val event = DifftestModule(new DiffEvuCompletionEvent, delay = 3)
-      val payload = entry.amuCtrl.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey)))
+      val payload = entry.amuCtrl.data.asTypeOf(new EvuCoreCommandData(p(ExternalVectorKey)))
       event.valid := completion.fire
       event.coreid := io.hartId.get
       event.pc := entry.amuCtrl.pc.get
@@ -404,7 +482,7 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
   // older control commands and the status pipeline, not ordinary memory.
   // The VMU now owns per-command translations, ordering and asynchronous faults.
   io.evuPreflightBusy := amuCtrlEntries.map { e =>
-    val f7 = e.amuCtrl.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey))).instr(31, 25)
+    val f7 = e.amuCtrl.data.asTypeOf(new EvuCoreCommandData(p(ExternalVectorKey))).instr(31, 25)
     val serial = f7 === xiangshan.evu.EvuIsa.fence || f7 === xiangshan.evu.EvuIsa.setvli ||
       f7 === xiangshan.evu.EvuIsa.setvl
     e.valid && e.needAMU && e.writebacked && e.amuCtrl.evu && !e.canDeq && serial

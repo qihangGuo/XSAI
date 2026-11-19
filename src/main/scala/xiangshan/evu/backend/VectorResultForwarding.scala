@@ -13,6 +13,13 @@ class VectorForwardResult(implicit p: Parameters) extends freechips.rocketchip.t
   val vat = UInt(vParams.vatSz.W)
 }
 
+class RetainedVectorForwardResult(implicit p: Parameters) extends freechips.rocketchip.tile.CoreBundle with HasVectorParams {
+  val eg = UInt(log2Ceil(egsTotal).W)
+  val data = UInt(dLen.W)
+  val byteMask = UInt(dLenB.W)
+  val vat = UInt(vParams.vatSz.W)
+}
+
 class VectorForwardWriter(implicit p: Parameters) extends freechips.rocketchip.tile.CoreBundle with HasVectorParams {
   val vat = UInt(vParams.vatSz.W)
   val writes = UInt(egsTotal.W)
@@ -44,7 +51,7 @@ class VectorResultForwarding(sources: Int, readers: Int, nWriters: Int,
     val newerWriter = Output(Vec(readers, Bool()))
   })
   val recent = if (retainCycles > 0 && sources > 0) {
-    val data = Reg(Vec(sources, new VectorForwardResult))
+    val data = Reg(Vec(sources, new RetainedVectorForwardResult))
     val remaining = RegInit(VecInit.fill(sources)(0.U(log2Ceil(retainCycles + 1).W)))
     val previousTail = RegNext(io.tail, 0.U)
     val wrapped = io.tail < previousTail
@@ -52,12 +59,20 @@ class VectorResultForwarding(sources: Int, readers: Int, nWriters: Int,
       val changed = io.invalidate.map(w => w.valid && w.bits === data(i).eg).foldLeft(false.B)(_ || _)
       val result = Wire(Valid(new VectorForwardResult))
       result.valid := remaining(i) =/= 0.U && !changed && !wrapped
-      result.bits := data(i)
+      result.bits.eg := data(i).eg
+      result.bits.data := data(i).data
+      result.bits.mask := ByteWriteMask.expand(data(i).byteMask)
+      result.bits.vat := data(i).vat
       when(remaining(i) =/= 0.U) { remaining(i) := remaining(i) - 1.U }
       when(changed || wrapped) { remaining(i) := 0.U }
       // Capture accepted writes only; a held iterative result is still a live source.
       when(io.results(i).valid && io.accepted.get(i) && io.results(i).bits.mask.orR) {
-        data(i) := io.results(i).bits
+        data(i).eg := io.results(i).bits.eg
+        data(i).data := io.results(i).bits.data
+        data(i).byteMask := ByteWriteMask.pack(io.results(i).bits.mask)
+        data(i).vat := io.results(i).bits.vat
+        assert(io.results(i).bits.mask === ByteWriteMask.expand(ByteWriteMask.pack(io.results(i).bits.mask)),
+          "Retained forwarding result requires whole-byte enables")
         remaining(i) := retainCycles.U
       }
       result
