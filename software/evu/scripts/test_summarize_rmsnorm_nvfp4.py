@@ -31,7 +31,26 @@ def complete_log(samples=3, compact=False, cases=11, single=False):
     return "\n".join(lines + ["[RN] PASS", "HIT GOOD TRAP"])
 
 
+def tile_log(text=None):
+    if text is None:
+        text = complete_log(samples=1, cases=1, single=True)
+    return (text.replace("rows=4 cols=512", "rows=128 cols=64")
+            .replace("format=11", "format=12")
+            .replace("profile=fused_row_major", "profile=fused_tile128x64_row_major")
+            .replace("quant_schedule=overlap", "quant_schedule=batch_rows4 row_batch=4"))
+
+
 class RmsnormSummaryTest(unittest.TestCase):
+    def test_tile128x64_uses_its_own_shape_and_profile(self):
+        row, = summarize(tile_log())
+        self.assertEqual((row['rows'], row['cols']), (128, 64))
+        self.assertEqual(row['cycles_per_row'], 200 / 128)
+        for old, new in (("row_batch=4", "row_batch=8"), ("quant_vl=16", "quant_vl=64"),
+                         ("format=12", "format=11"), ("rows=128", "rows=64"),
+                         ("profile=fused_tile128x64_row_major", "profile=fused_row_major")):
+            with self.subTest(old=old), self.assertRaises(ValueError):
+                summarize(tile_log().replace(old, new))
+
     def test_fused_only_profile_reports_exactly_one_case(self):
         for samples in (1, 3):
             text = complete_log(samples=samples, cases=1, single=samples == 1, compact=True)

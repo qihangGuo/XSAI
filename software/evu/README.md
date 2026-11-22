@@ -24,6 +24,8 @@ Use the server's existing `AM_HOME`, RISC-V LLVM toolchain and NEMU checkout.
 | `slide_evu_test` | 216 slide-up/down cases covering widths, LMUL, aliases, offsets and tails |
 | `rmsnorm_nvfp4_evu_test` | EVU RMSNorm and full NVFP4 with final-output-only stores; 11 cases |
 | `rmsnorm_nvfp4_fused_evu_test` | Only fused NVFP4 row-major; timed FENCE snapshots and CPU-only checking |
+| `rmsnorm_nvfp4_tile128x64_evu_test` | Fused RMSNorm/NVFP4 on 128 rows of 64 FP32 elements; exact output checking |
+| `rmsnorm_nvfp4_tile128x64_perf_evu_test` | Optimized sixteen-row tile schedule without guest CPU reference; cycles-only output |
 
 `Makefile` defaults to `vector_add_evu_test`. The old fused FlashAttention and
 `quanti8mma_evu_example` programs are retired; their binaries cannot run on the
@@ -199,3 +201,67 @@ timing. There is no empty-case subtraction. Compare the same image, options,
 sample index and timing boundaries between hardware revisions. FENCE-delta
 counters isolate an interval only when the corresponding hardware snapshots
 are present; end-of-guest wait counters are not automatically interval counts.
+
+For a `[128,64]` tile, use the independent test below. Each row has its own
+64-element RMSNorm reduction (mean divisor 64), with shared gamma[64]. Four
+rows stay resident at a time and form one batch of sixteen NVFP4 blocks.
+The kernel reuses gamma and constants across all 32 batches, never stores
+intermediate normalized values, and keeps scale bytes in a register until
+four batches fill a cache line. The final outputs are 4,096 FP4 bytes and
+512 scale bytes: 72 aligned 64-byte stores. The 1/512 constant in the scale
+encoding is the E4M3 minimum subnormal, not the RMSNorm mean divisor.
+
+```sh
+make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM NAME=rmsnorm_nvfp4_tile128x64_evu_test
+./build/emu --diff ../NEMU/build/riscv64-nemu-interpreter-so \
+  -C 100000000 -i software/evu/build/rmsnorm_nvfp4_tile128x64_evu_test-riscv64-xs.bin \
+  -- +evu_mem_trace=1 2>&1 | tee rmsnorm_nvfp4_tile128x64_evu_test.log
+/usr/bin/python3 software/evu/scripts/summarize_rmsnorm_nvfp4.py rmsnorm_nvfp4_tile128x64_evu_test.log
+```
+
+Only `stage=fused_nvfp4 schedule=row_major` runs, once without warmup by default.
+Timing includes constants/gamma/input loads, vector configuration, all 128 row
+computations, quantization, output stores and final acknowledgement drain.
+CPU initialization, the DLEN=512 reduction oracle and byte-exact checking are
+outside timing. `EVU_RMS_SAMPLES`, `EVU_RMS_BF16_INPUT`, `EVU_RMS_EPS` and
+`EVU_RMS_ALPHA` remain configurable; nondefault settings have distinct image
+paths. Format 12 identifies this four-row-batched tile schedule, which is not
+the original format-11 cross-batch overlap schedule. The counter summary
+script also accepts this profile and requires 4,608 final output bytes when
+hardware FENCE snapshots are available. Do not compare raw cycles against the
+`[4,512]` workload as a speedup: both its shape and element count differ.
+
+For cycles-only profiling without guest-side CPU reference computation:
+
+```sh
+make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM NAME=rmsnorm_nvfp4_tile128x64_perf_evu_test
+./build/emu --diff ../NEMU/build/riscv64-nemu-interpreter-so \
+  -C 100000000 -i software/evu/build/rmsnorm_nvfp4_tile128x64_perf_evu_test-riscv64-xs.bin \
+  2>&1 | tee rmsnorm_nvfp4_tile128x64_perf_evu_test.log
+```
+
+This independent image leaves the checked test unchanged but uses an optimized
+sixteen-row schedule. Four-row loads are interleaved with square/reduction work;
+sixteen row sums are collected into one EG so RMSNorm square root and reciprocal
+use all sixteen FP32 lanes instead of issuing one E0 operation per row. Gamma
+is reloaded once per sixteen rows because quantization reuses its register.
+The four quantization batches overlap amax, scale and packing, recycling input
+registers only after their values have been consumed. FP32 arithmetic order
+within each row, scale formulas, output layout and 72 aligned stores are
+unchanged. Static schedule checks count 6,855 timed commands including the final
+FENCE, 3,504 FMA-path issues and 112 DIV/SQRT issues; these are work counts,
+not measured cycles or a speedup claim.
+
+The image initializes identical inputs/gamma but does not calculate reference
+RMSNorm, scale or FP4 results, allocate reference arrays, or compare output
+bytes. A lookup table reduces input initialization from 8,192 scalar divisions
+to 509 while preserving the input bits. Timing still includes all kernel
+loads, computation, stores and final acknowledgement drain. The default run
+prints only one application line: `[RN-PERF] ... cycles=...`. Hardware
+status/invalid-operation/divide-by-zero errors still fail the guest, and the
+server's NEMU difftest remains enabled by the command above. The application
+does not claim numerical PASS. The Python schedule model checks every normalized
+element and output byte against the same reference; the checked image remains
+available as the unoptimized baseline. The minimal perf output is intentionally
+not accepted by the checked-log summary scripts. The schedules and preparation
+histories differ, so their cycle counts need not match.

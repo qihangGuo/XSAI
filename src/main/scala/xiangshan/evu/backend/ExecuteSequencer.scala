@@ -141,20 +141,20 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   val rgather    = inst.opif6 === OPIFunct6.rgather && usesPerm.B
   val rgather_ix = rgather && inst.funct3.isOneOf(OPIVX, OPIVI)
   val rgather_v  = rgather && inst.funct3.isOneOf(OPIVV)
-  val renv1    = inst.renv1 && !inst.reduction
+  val renv1    = inst.renv1 && (!inst.reduction || acc_direct)
   val slide_source_index = Mux(slide_up, eidx - slide_offset, eidx +& slide_offset)
   val slide_source_valid = slide_source_index < inst.vconfig.vtype.vlMax
   val renv2    = Mux(rgather_ix, head, inst.renv2) && (!inst.reduction || (!acc_fold && !acc_merge)) &&
     (!aligned_slide || slide_source_valid)
   val renvd    = inst.renvd && usesRvd.B
   val renvm    = inst.renvm && !restrictedInteger.B
-  val renacc   = inst.reduction && usesAcc.B
+  val renacc   = inst.reduction && usesAcc.B && !acc_direct
   // Forward only FP32 E0 operands. A full EG, mask, gather, or reduction
   // source must still read the preserved vector bytes from the SRAM.
   val scalarOperation = inst.isOpf && eff_vl === 1.U && eidx === 0.U && !inst.reduction &&
     !uses_perm && !renvm && !inst.writes_mask && vd_eew === 2.U
   io.e0Read(0) := valid && inst.isOpf && renv1 && vs1_eew === 2.U &&
-    !inst.reads_vs1_mask && (inst.scalarVrfSource || scalarOperation)
+    !inst.reads_vs1_mask && (inst.scalarVrfSource || scalarOperation || acc_direct)
   io.e0Read(1) := valid && renv2 && vs2_eew === 2.U && scalarOperation && !inst.reads_vs2_mask
   io.e0Read(2) := valid && renvd && vs3_eew === 2.U && scalarOperation
 
@@ -195,6 +195,8 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
       SetsWMask, UsesGatherUnit, Elementwise, UsesNarrowingSext, ZextImm5,
       PipelinedExecution, PipelineStagesMinus1, FUSel(nFUs)
     ))).decode(dis_inst)
+    val dis_direct_minmax = usesAcc.B && VectorFastPaths.singleGroupMinMax(dis_inst, dLen,
+      vParams.fp32MinMaxTree && vParams.singleGroupMinMax)
 
     val dis_slide = (dis_inst.funct6.isOneOf(OPIFunct6.slideup.litValue.U, OPIFunct6.slidedown.litValue.U)
       && dis_inst.funct3 =/= OPIVV) && usesPerm.B
@@ -246,17 +248,19 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
     assert(dis_inst.vstart === 0.U || dis_exp2)
     valid         := true.B
     inst          := dis_inst
+    inst.renv1    := dis_inst.renv1 || dis_direct_minmax
     inst.renv2    := dis_inst.renv2 || dis_direct_slide
     eidx          := dis_start
     wvd_mask      := Mux(dis_inst.wvd               , FillInterleaved(egsPerVReg, dis_vd_arch_mask), 0.U)
-    rvs1_mask     := Mux(dis_inst.renv1             , FillInterleaved(egsPerVReg, dis_vs1_arch_mask), 0.U)
+    rvs1_mask     := Mux(dis_direct_minmax,
+      UIntToOH(getEgId(dis_inst.rs1, 0.U, dis_vs1_eew, false.B), egsTotal),
+      Mux(dis_inst.renv1, FillInterleaved(egsPerVReg, dis_vs1_arch_mask), 0.U))
     rvs2_mask     := Mux(dis_inst.renv2 || dis_direct_slide, FillInterleaved(egsPerVReg, dis_vs2_arch_mask), 0.U)
     rvd_mask      := Mux(dis_inst.renvd && usesRvd.B, FillInterleaved(egsPerVReg, dis_vd_arch_mask), 0.U)
     rvm_mask      := Mux(dis_inst.renvm             , ~(0.U(egsPerVReg.W)), 0.U)
     head          := true.B
     acc_fold      := false.B
-    acc_direct    := usesAcc.B && VectorFastPaths.singleGroupMinMax(dis_inst, dLen,
-      vParams.fp32MinMaxTree && vParams.singleGroupMinMax)
+    acc_direct    := dis_direct_minmax
     acc_fold_id   := 0.U
     parallel_acc  := dis_inst.opff6.isOneOf(OPFFunct6.fredusum, OPFFunct6.fredmin, OPFFunct6.fredmax)
     acc_stream_slot := 0.U
@@ -351,7 +355,7 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
     def ordinaryMask(eew: UInt): UInt = byteRange((eidx << eew)(dLenOffBits - 1, 0),
       (next_eidx - eidx) << eew)
     val source1 = Mux(lowPrecision && inst.funct6 >= 0x3c.U, byteRange(0.U, 1.U),
-      Mux(inst.scalarVrfSource, byteRange(0.U, 4.U), ordinaryMask(vs1_eew)))
+      Mux(inst.scalarVrfSource || acc_direct, byteRange(0.U, 4.U), ordinaryMask(vs1_eew)))
     val groupSlideSource = byteRange(Mux(slide_up, 0.U, slide_offset << vs2_eew),
       Mux(slide_up, inst.vconfig.vl - slide_offset, inst.vconfig.vl) << vs2_eew)
     val gatherSource = byteRange((rgather_eidx << vs2_eew)(dLenOffBits - 1, 0), 1.U << vs2_eew)
@@ -372,7 +376,8 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   val war_hazard = inst.wvd && io.older_reads(io.iss.bits.wvd_eg)
   val data_hazard = raw_hazard || waw_hazard || war_hazard
 
-  io.rvs1.req.bits.eg := getEgId(inst.rs1, Mux(inst.scalarVrfSource, 0.U, eidx), vs1_eew, inst.reads_vs1_mask)
+  io.rvs1.req.bits.eg := getEgId(inst.rs1, Mux(inst.scalarVrfSource || acc_direct, 0.U, eidx),
+    vs1_eew, inst.reads_vs1_mask)
   io.rvs2.req.bits.eg := Mux(rgather || rgatherei16,
     getEgId(inst.rs2, rgather_eidx, vs2_eew, false.B),
     getEgId(inst.rs2, Mux(aligned_slide, slide_source_index, eidx), vs2_eew, inst.reads_vs2_mask)

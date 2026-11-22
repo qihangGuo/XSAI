@@ -9,6 +9,7 @@ import xiangshan.evu.insns._
 class SpecialSequencerIO(implicit p: Parameters) extends SequencerIO(new SpecialMicroOp) {
   val rvs2 = Decoupled(new VectorReadReq)
   val rvm  = Decoupled(new VectorReadReq)
+  val e0Read = Output(Bool())
 
   val acc_data = Decoupled(UInt(dLen.W))
   val acc_other_data = Output(UInt(dLen.W))
@@ -35,7 +36,9 @@ class SpecialSequencer(exu_insns: Seq[VectorInstruction], context: Int = 0, cont
     val gather = !inst.vmu && ctrl.bool(UsesGatherUnit) &&
       !VectorFastPaths.alignedSlide(inst, dLen, vParams.alignedSlide) &&
       !VectorFastPaths.singleGroupSlide(inst, dLen, vParams.singleGroupSlide)
-    val reduction = !inst.vmu && ctrl.bool(Reduction)
+    val directMinMax = VectorFastPaths.singleGroupMinMaxInstruction(inst, dLen,
+      vParams.fp32MinMaxTree && vParams.singleGroupMinMax)
+    val reduction = !inst.vmu && ctrl.bool(Reduction) && !directMinMax
     ((needs_mask || needs_index || gather) && (context == 0).B) ||
       (reduction && (dynamicContext.B || (inst.vat % contexts.U) === context.U))
   }
@@ -70,6 +73,7 @@ class SpecialSequencer(exu_insns: Seq[VectorInstruction], context: Int = 0, cont
 
   val renvm = inst.renvm
   val renv2 = Mux(acc, acc_e0, inst.renv2)
+  io.e0Read := valid && acc && acc_e0 && vd_eew === 2.U
   val incr_eew = Mux(inst.vmu, inst.mem_idx_size,
     Mux(gatherei16, 1.U, inst.vconfig.vtype.vsew))
   val eff_vl = Mux(slide,

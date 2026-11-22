@@ -185,7 +185,10 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   val reductionOwners = Module(new ReductionOwnerAllocator(vParams.reductionContexts))
   val reductionChoice = reductionOwners.io.choice
   val dispatchReduction = !vdq.io.deq.bits.vmu && dis_ctrl.bool(Reduction)
-  reductionOwners.io.request := interleave.B && vdq.io.deq.valid && dispatchReduction
+  val dispatchDirectMinMax = dispatchReduction && VectorFastPaths.singleGroupMinMaxInstruction(vdq.io.deq.bits,
+    dLen, vParams.fp32MinMaxTree && vParams.singleGroupMinMax)
+  val dispatchNeedsAccumulator = dispatchReduction && !dispatchDirectMinMax
+  reductionOwners.io.request := interleave.B && vdq.io.deq.valid && dispatchNeedsAccumulator
   reductionOwners.io.dispatch := vdq.io.deq.fire
   reductionOwners.io.release := VecInit(reductionSeqs.map(s => s.io.acc_done && s.io.busy)).asUInt
   val reductionBlocked = reductionOwners.io.blocked
@@ -218,7 +221,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     vxissq.io.enq.bits.writes_mask := dis_ctrl.bool(WritesAsMask)
     vxissq.io.enq.bits.reads_vs1_mask := dis_ctrl.bool(ReadsVS1AsMask)
     vxissq.io.enq.bits.reads_vs2_mask := dis_ctrl.bool(ReadsVS2AsMask)
-    vxissq.io.enq.bits.renv1 := dis_ctrl.bool(ReadsVS1) && !dis_ctrl.bool(Reduction)
+    vxissq.io.enq.bits.renv1 := (dis_ctrl.bool(ReadsVS1) && !dis_ctrl.bool(Reduction)) || dispatchDirectMinMax
     vxissq.io.enq.bits.renv2 := dis_ctrl.bool(ReadsVS2) ||
       VectorFastPaths.alignedSlide(vdq.io.deq.bits, dLen, vParams.alignedSlide) ||
       VectorFastPaths.singleGroupSlide(vdq.io.deq.bits, dLen, vParams.singleGroupSlide)
@@ -318,9 +321,10 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
     val accepts = group.seqs.zipWithIndex.map { case (seq, c) =>
       val contextAllowed = if (!interleave) true.B else if (group.issq == vpissq) {
-        !dispatchReduction || reductionChoice(c)
+        !dispatchNeedsAccumulator || reductionChoice(c)
       } else seq match {
-        case s: ExecuteSequencer if s.reductionOnly => reductionChoice(reductionOwnerBySequencer(s).get)
+        case s: ExecuteSequencer if s.reductionOnly =>
+          dispatchDirectMinMax || reductionChoice(reductionOwnerBySequencer(s).get)
         case _ => true.B
       }
       seq.accepts(vdq.io.deq.bits) && contextAllowed
@@ -341,6 +345,10 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       s.io.dis.bits := group.issq.io.deq.bits.viewAsSupertype(new BackendIssueInst)
     }
     group.issq.io.deq.ready := (valid_seqs & ready_seqs) =/= 0.U
+  }
+  when(vdq.io.deq.fire && dispatchDirectMinMax) {
+    assert(!reductionOwners.io.request && !vpissq.io.enq.fire,
+      "Single-EG min/max must not allocate an accumulator owner or seed task")
   }
 
   // ======================================
@@ -442,6 +450,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   for ((seq, i) <- reductionSeqs.zipWithIndex) {
     vrf.io.vps(i).rvs2.req <> seq.io.rvs2
     vrf.io.vps(i).rvm.req <> seq.io.rvm
+    vrf.io.vps(i).e0Read := seq.io.e0Read
     seq.io.acc_init_resp := vrf.io.vps(i).rvs2.resp
     seq.io.rvm_resp := vrf.io.vps(i).rvm.resp
     if (i != 0) { seq.io.iss.ready := false.B }
@@ -516,18 +525,18 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     candidate.bits.viewAsSupertype(new ExecuteMicroOp(vxu.nFUs)) := vxs.io.iss.bits
     executeCandidates += candidate
 
-    when (vxs_iss.acc) {
+    when (vxs_iss.acc_direct) {
+      // Direct reductions collect their own seed; no SpecialSequencer owns this instruction.
+      vxu_iss.wmask := eewByteMask(vxs_iss.vd_eew)
+      vxu_iss.rvs1_elem := rvs1_data(31, 0)
+      vxu_iss.rvs1_data := rvs1_data(31, 0)
+      vxu_iss.rvs1_eew := vxs_iss.vd_eew
+    } .elsewhen (vxs_iss.acc) {
       val owners = reductionSeqs.map(s => s.io.busy && s.io.vat === vxs.io.vat)
       val acc_data = Mux1H(owners, reductionSeqs.map(_.io.acc_data.bits))
       val acc_other_data = Mux1H(owners, reductionSeqs.map(_.io.acc_other_data))
       val acc_init = Mux1H(owners, reductionSeqs.map(_.io.acc_init))
-      when (vxs_iss.acc_direct) {
-        // Keep the raw source EG; only the seed comes from the reduction owner.
-        vxu_iss.wmask := eewByteMask(vxs_iss.vd_eew)
-        vxu_iss.rvs1_elem := acc_data(31, 0)
-        vxu_iss.rvs1_data := acc_data(31, 0)
-        vxu_iss.rvs1_eew := vxs_iss.vd_eew
-      } .elsewhen (vxs_iss.acc_merge) {
+      when (vxs_iss.acc_merge) {
         vxu_iss.wmask := ~(0.U(dLenB.W))
         vxu_iss.rvs1_elem := acc_data
         vxu_iss.rvs1_data := acc_data
@@ -905,7 +914,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     vxs.io.acc_return := false.B
     if (vxs.usesAcc) {
       for (seq <- reductionSeqs) {
-        when (vxs.io.vat === seq.io.vat && vxs.io.busy && seq.io.busy) {
+        when (vxs.io.vat === seq.io.vat && vxs.io.busy && seq.io.busy && !vxs.io.iss.bits.acc_direct) {
           seq.io.acc_data.ready := vxs.io.acc_ready && vxs.io.iss.ready
           seq.io.acc_slot := vxs.io.acc_slot
           seq.io.acc_other_slot := vxs.io.acc_other_slot

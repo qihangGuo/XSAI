@@ -3,7 +3,7 @@ import re
 
 from summarize_rmsnorm_counters import summarize_counters
 from summarize_rmsnorm_nvfp4 import CASE_SETS
-from test_summarize_rmsnorm_nvfp4 import complete_log
+from test_summarize_rmsnorm_nvfp4 import complete_log, tile_log
 
 
 def counter_log(cases=11):
@@ -23,6 +23,14 @@ def counter_log(cases=11):
 
 
 class RmsnormCountersTest(unittest.TestCase):
+    def test_tile128x64_requires_4608_final_output_bytes(self):
+        text = tile_log(counter_log(cases=1)).replace('logical_store=1152', 'logical_store=4608')
+        row, = summarize_counters(text)
+        self.assertEqual((row['rows'], row['cols']), (128, 64))
+        self.assertEqual(row['logical_store_bytes'], 4608)
+        with self.assertRaisesRegex(ValueError, '4608'):
+            summarize_counters(text.replace('logical_store=4608', 'logical_store=1152'))
+
     def test_integer_owner_and_completion_diagnostics_are_interval_deltas(self):
         text = counter_log(cases=1)
         for fence in (0, 1):

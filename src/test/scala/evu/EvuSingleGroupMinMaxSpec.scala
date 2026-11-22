@@ -164,6 +164,7 @@ class EvuSingleGroupMinMaxSpec extends AnyFlatSpec with ChiselScalatestTester wi
             }
             dut.clock.step()
             dut.io.command.foreach(_.valid.poke(false.B))
+            if (direct && !masked && length == 16) dut.io.ownerBusy.foreach(_.expect(false.B))
             var cycles = 0
             while (!dut.io.completed.forall(_.peek().litToBoolean) && cycles < 150) {
               dut.io.sourceReady(0).poke((cycles % 7 != 0).B)
@@ -193,7 +194,7 @@ class EvuSingleGroupMinMaxSpec extends AnyFlatSpec with ChiselScalatestTester wi
     }
   }
 
-  it should "retain operands under RAW/WAR/WAW and seed/write/issue backpressure, then reuse owners" in {
+  it should "retain operands under RAW/WAR/WAW and seed/write/issue backpressure without allocating owners" in {
     implicit val p: Parameters = EvuVectorParameters(base, 4096, 512, 512,
       VectorParams.lgvParams.copy(fp32MinMaxTree = true, singleGroupMinMax = true,
         reductionContexts = 2, interleaveReductions = true))
@@ -213,6 +214,7 @@ class EvuSingleGroupMinMaxSpec extends AnyFlatSpec with ChiselScalatestTester wi
         }
         dut.clock.step()
         dut.io.command.foreach(_.valid.poke(false.B))
+        dut.io.ownerBusy.foreach(_.expect(false.B))
         dut.clock.step(3)
         dut.io.issues.foreach(_.expect(0.U))
         dut.io.olderWrites.foreach(_.poke(0.U))
@@ -249,7 +251,7 @@ class EvuSingleGroupMinMaxSpec extends AnyFlatSpec with ChiselScalatestTester wi
         dut.io.issues.foreach(_.expect(1.U))
         dut.io.returns.foreach(_.expect(0.U))
         dut.io.ownerBusy.foreach(_.expect(false.B))
-        // Reuse both owners without reset, with a different seed and source.
+        // Reuse both CMP contexts without reset, with a different seed and source.
         for (context <- 0 until 2) {
           command(dut.io.command(context).bits, context, 16, masked = false)
           dut.io.source(context).poke(pack(Seq.fill(16)(0x40400000L)).U)
@@ -264,6 +266,41 @@ class EvuSingleGroupMinMaxSpec extends AnyFlatSpec with ChiselScalatestTester wi
         dut.io.result(1).expect(0x40800000L.U)
         dut.io.issues.foreach(_.expect(2.U))
         dut.io.returns.foreach(_.expect(0.U))
+        dut.io.ownerBusy.foreach(_.expect(false.B))
+        dut.io.flags.expect(0.U)
+      }
+  }
+
+  it should "wait for an older seed writer while collecting the independent source without an owner" in {
+    implicit val p: Parameters = EvuVectorParameters(base, 4096, 512, 512,
+      VectorParams.lgvParams.copy(fp32MinMaxTree = true, singleGroupMinMax = true,
+        reductionContexts = 2, interleaveReductions = true))
+    test(LazyModule(new EvuSharedReductionShell(maximum = true, operandInputs = true, controlled = true)).module)
+      .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+        dut.io.issueReady.poke(true.B)
+        dut.io.writeReady.poke(true.B)
+        for (context <- 0 until 2) {
+          command(dut.io.command(context).bits, context, 16, masked = false)
+          dut.io.source(context).poke(pack(Seq.fill(16)(0x3f800000L)).U)
+          dut.io.seed(context).poke(0x40000000L.U)
+          dut.io.sourceReady(context).poke(true.B)
+          dut.io.seedReady(context).poke(true.B)
+          dut.io.olderWrites(context).poke((BigInt(1) << ((context + 5) * 8)).U)
+          dut.io.olderReads(context).poke(0.U)
+          dut.io.command(context).valid.poke(true.B)
+        }
+        dut.clock.step()
+        dut.io.command.foreach(_.valid.poke(false.B))
+        dut.clock.step(3)
+        dut.io.ownerBusy.foreach(_.expect(false.B))
+        dut.io.seedReads.foreach(_.expect(0.U))
+        dut.io.issues.foreach(_.expect(0.U))
+        dut.io.source.foreach(_.poke(0.U))
+        dut.io.olderWrites.foreach(_.poke(0.U))
+        dut.clock.step(12)
+        dut.io.seedReads.foreach(_.expect(1.U))
+        dut.io.result(0).expect(0x3f800000L.U)
+        dut.io.result(1).expect(0x40000000L.U)
         dut.io.ownerBusy.foreach(_.expect(false.B))
         dut.io.flags.expect(0.U)
       }

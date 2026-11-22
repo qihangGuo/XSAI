@@ -78,15 +78,17 @@ def summarize_counters(text):
         start, end = map(int, sample["fences"].split(":"))
         if end != start + 1:
             raise ValueError("expected exactly two adjacent measurement fences")
-        result = {"stage": key[0], "schedule": key[1], "sample": key[2],
+        result = {"rows": aggregates[0]["rows"], "cols": aggregates[0]["cols"],
+                  "stage": key[0], "schedule": key[1], "sample": key[2],
                   "cycles": int(sample["cycles"]), "fences": sample["fences"]}
         for kind, field, label in counters:
             result[label] = counter_delta(snapshots[start, kind], snapshots[end, kind], field)
         for kind, field, label in diagnostics:
             before, after = snapshots.get((start, kind), {}), snapshots.get((end, kind), {})
             result[label] = counter_delta(before, after, field) if field in before or field in after else ""
-        if key[0] in ("quant_evu", "fused_nvfp4") and result["logical_store_bytes"] != 1152:
-            raise ValueError("NVFP4 timed interval must store exactly 1152 logical bytes")
+        expected_bytes = result["rows"] * result["cols"] * 9 // 16
+        if key[0] in ("quant_evu", "fused_nvfp4") and result["logical_store_bytes"] != expected_bytes:
+            raise ValueError(f"NVFP4 timed interval must store exactly {expected_bytes} logical bytes")
         output.append(result)
     if seen != expected:
         raise ValueError("require all timed samples: build EVU_RMS_VERBOSE=1 and run +evu_mem_trace=1")

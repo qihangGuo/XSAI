@@ -45,6 +45,8 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
     val directs = Output(Vec(2, UInt(32.W)))
     val returns = Output(Vec(2, UInt(32.W)))
     val ownerBusy = Output(Vec(2, Bool()))
+    val seedReads = Output(Vec(2, UInt(32.W)))
+    val seedE0Read = Output(Vec(2, Bool()))
   })
   val factory: FunctionalUnitFactory = if (maximum) FPCmpFactory else SIMDFPFMAFactory(4, true)
   val insns = VXSequencerParams("fp_fma", Seq(factory)).insns
@@ -74,9 +76,11 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
   val issues = RegInit(VecInit.fill(2)(0.U(32.W)))
   val directs = RegInit(VecInit.fill(2)(0.U(32.W)))
   val returns = RegInit(VecInit.fill(2)(0.U(32.W)))
+  val seedReads = RegInit(VecInit.fill(2)(0.U(32.W)))
   io.issues := issues
   io.directs := directs
   io.returns := returns
+  io.seedReads := seedReads
   for (context <- 0 until 2) {
     when(fu.io.iss.fire && fu.io.iss.bits.vat === (context + 1).U) {
       issues(context) := issues(context) + 1.U
@@ -100,9 +104,6 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
   }
   io.switched := switched
   for (((seq, acc), i) <- execute.zip(accumulators).zipWithIndex) {
-    io.command(i).ready := seq.io.dis.ready && acc.io.dis.ready
-    seq.io.dis.valid := io.command(i).valid && acc.io.dis.ready
-    acc.io.dis.valid := io.command(i).valid && seq.io.dis.ready
     val dispatched = WireInit(io.command(i).bits)
     if (maximum) {
       // This fixture exercises only FP32 min/max. Constant decode fields let
@@ -124,6 +125,11 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
       dispatched.renvm := !io.command(i).bits.vm
       dispatched.wvd := true.B
     }
+    val direct = VectorFastPaths.singleGroupMinMax(dispatched, dLen,
+      vParams.fp32MinMaxTree && vParams.singleGroupMinMax)
+    io.command(i).ready := seq.io.dis.ready && (direct || acc.io.dis.ready)
+    seq.io.dis.valid := io.command(i).valid && (direct || acc.io.dis.ready)
+    acc.io.dis.valid := io.command(i).valid && seq.io.dis.ready && !direct
     seq.io.dis.bits := dispatched
     acc.io.dis.bits := dispatched
     seq.io.dis_stall := false.B
@@ -131,7 +137,7 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
     seq.io.older_reads := (if (controlled) io.olderReads(i) else 0.U)
     seq.io.older_writes := (if (controlled) io.olderWrites(i) else 0.U)
     acc.io.older_reads := 0.U
-    acc.io.older_writes := 0.U
+    acc.io.older_writes := (if (controlled) io.olderWrites(i) else 0.U)
     seq.io.vat_head := 0.U
     acc.io.vat_head := 0.U
     seq.io.vgu.slide_req.ready := true.B
@@ -139,14 +145,16 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
     seq.io.vgu.gather_eidx.valid := false.B
     seq.io.vgu.gather_eidx.bits := 0.U
     for ((read, port) <- Seq(seq.io.rvs1, seq.io.rvs2, seq.io.rvd, seq.io.rvm).zipWithIndex) {
-      read.req.ready := io.sourceReady(i)
+      read.req.ready := (if (controlled && port == 0) io.seedReady(i) else io.sourceReady(i))
       read.resp := (if (operandInputs) {
-        if (port == 3) io.mask(i) else io.source(i)
-      } else Fill(dLen / 32, (if (i == 0) 0x3f800000L else 0x40000000L).U(32.W)))
+        if (port == 0) io.seed(i) else if (port == 3) io.mask(i) else io.source(i)
+      } else if (port == 0) 0.U else Fill(dLen / 32, (if (i == 0) 0x3f800000L else 0x40000000L).U(32.W)))
     }
     acc.io.rvs2.ready := (if (controlled) io.seedReady(i) else io.sourceReady(i))
     acc.io.rvm.ready := io.sourceReady(i)
     acc.io.acc_init_resp := (if (operandInputs) io.seed(i) else 0.U)
+    io.seedE0Read(i) := acc.io.e0Read
+    when(acc.io.rvs2.fire || seq.io.rvs1.req.fire) { seedReads(i) := seedReads(i) + 1.U }
     acc.io.rvm_resp := 0.U
     acc.io.iss.ready := false.B
     acc.io.acc_slot := seq.io.acc_slot
@@ -156,7 +164,8 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
     seq.io.acc_valid := acc.io.acc_data.valid && acc.io.busy && seq.io.vat === acc.io.vat
     seq.io.acc_return := acc.io.acc_return
     seq.io.lookahead := 0.U.asTypeOf(seq.io.lookahead)
-    acc.io.acc_done := seq.io.iss.fire && seq.io.iss.bits.acc && seq.io.iss.bits.tail
+    acc.io.acc_done := seq.io.iss.fire && seq.io.iss.bits.acc && seq.io.iss.bits.tail &&
+      !seq.io.iss.bits.acc_direct && acc.io.busy && seq.io.vat === acc.io.vat
     acc.io.acc_fu_resp.valid := fu.io.acc_write.valid && fu.io.accWriteVat === acc.io.vat
     acc.io.acc_fu_resp.bits := fu.io.acc_write.bits
     acc.io.acc_fu_resp_slot := fu.io.acc_write_slot
@@ -178,8 +187,8 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
     candidate.bits.rvs1_eew := seq.io.iss.bits.vd_eew
     when(seq.io.iss.bits.acc_direct) {
       candidate.bits.wmask := 15.U
-      candidate.bits.rvs1_data := acc.io.acc_data.bits(31, 0)
-      candidate.bits.rvs1_elem := acc.io.acc_data.bits(31, 0)
+      candidate.bits.rvs1_data := seq.io.rvs1_data(31, 0)
+      candidate.bits.rvs1_elem := seq.io.rvs1_data(31, 0)
     }.elsewhen(seq.io.iss.bits.acc_merge) {
       candidate.bits.wmask := Fill(dLenB, 1.U(1.W))
       candidate.bits.rvs2_data := acc.io.acc_other_data
@@ -223,7 +232,7 @@ class EvuSharedReductionShellImp(outer: EvuSharedReductionShell)(implicit p: Par
   io <> harness.io
 }
 
-class EvuInterleavedBackendHarness(implicit p: Parameters) extends CoreModule with HasVectorParams {
+class EvuInterleavedBackendHarness(allowMinMax: Boolean = false)(implicit p: Parameters) extends CoreModule with HasVectorParams {
   val backend = Module(new VectorBackend)
   val io = IO(new Bundle {
     val instruction = Flipped(Decoupled(new VectorIssueInst))
@@ -232,16 +241,21 @@ class EvuInterleavedBackendHarness(implicit p: Parameters) extends CoreModule wi
     val release = Output(Vec(nRelease, Valid(UInt(vParams.vatSz.W))))
     val flags = Output(Vec(nRelease, UInt(5.W)))
     val perf = Output(new EvuExecutionPerf)
+    val vrfPerf = Output(new xiangshan.evu.backend.VrfPerf)
     val busy = Output(Bool())
   })
   backend.io.dis <> io.instruction
   // Restrict test decode to load, sum and add so Treadle can discard unused
   // div/exp/int logic while retaining the production queues and shared FMA.
   val source = io.instruction.bits.bits
+  val function = if (allowMinMax) {
+    MuxCase(OPFFunct6.fadd.asUInt, Seq(OPFFunct6.fredusum, OPFFunct6.fredmin, OPFFunct6.fredmax).map(f =>
+      (io.instruction.bits.opff6 === f) -> f.asUInt))
+  } else Mux(io.instruction.bits.opff6 === OPFFunct6.fredusum,
+    OPFFunct6.fredusum.asUInt, OPFFunct6.fadd.asUInt)
   backend.io.dis.bits.bits := Mux(io.instruction.bits.vmu,
     Cat(0.U(6.W), true.B, 0.U(5.W), source(19, 15), 6.U(3.W), source(11, 7), 7.U(7.W)),
-    Cat(Mux(io.instruction.bits.opff6 === OPFFunct6.fredusum,
-      OPFFunct6.fredusum.asUInt, OPFFunct6.fadd.asUInt), true.B,
+    Cat(function, true.B,
       source(24, 15), VectorConsts.OPFVV, source(11, 7), VectorConsts.opcVector))
   backend.io.dis.bits.vconfig.vtype.vsew := 2.U
   backend.io.dis.bits.mop := 0.U
@@ -271,10 +285,11 @@ class EvuInterleavedBackendHarness(implicit p: Parameters) extends CoreModule wi
   io.release := backend.io.vat_release
   io.flags := backend.io.completion_fflags
   io.perf := backend.io.executionPerf
+  io.vrfPerf := backend.io.vrfPerf
   io.busy := backend.io.busy
 }
 
-class EvuInterleavedBackendShell(implicit p: Parameters) extends LazyModule {
+class EvuInterleavedBackendShell(val allowMinMax: Boolean = false)(implicit p: Parameters) extends LazyModule {
   val client = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1("reduction-test")))))
   val sink = TLManagerNode(Seq(TLSlavePortParameters.v1(Seq(TLSlaveParameters.v1(
     address = Seq(AddressSet(0, 0xffffffffL)), supportsGet = TransferSizes(1, 64))), beatBytes = 64)))
@@ -284,7 +299,7 @@ class EvuInterleavedBackendShell(implicit p: Parameters) extends LazyModule {
 
 class EvuInterleavedBackendShellImp(outer: EvuInterleavedBackendShell)(implicit p: Parameters)
     extends LazyModuleImp(outer) {
-  val harness = Module(new EvuInterleavedBackendHarness()(p.alterPartial { case TileVisibilityNodeKey => outer.client }))
+  val harness = Module(new EvuInterleavedBackendHarness(outer.allowMinMax)(p.alterPartial { case TileVisibilityNodeKey => outer.client }))
   val io = IO(chiselTypeOf(harness.io))
   io <> harness.io
 }

@@ -15,7 +15,7 @@ def compare(before, after):
     output = []
     for key in sorted(previous.keys() & current.keys()):
         old, new = previous[key], current[key]
-        parameters = ("input", "eps_bits") + (("alpha_bits",) if key[0] in ("quant_evu", "fused_nvfp4") else ())
+        parameters = ("rows", "cols", "input", "eps_bits") + (("alpha_bits",) if key[0] in ("quant_evu", "fused_nvfp4") else ())
         if any(old[field] != new[field] for field in parameters):
             raise ValueError("different numerical configuration for " + str(key))
         output.append({"stage": key[0], "schedule": key[1], "before_cycles": old["cycles_median"],

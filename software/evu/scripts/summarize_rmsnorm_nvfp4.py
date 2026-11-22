@@ -41,13 +41,18 @@ def summarize(text):
     if len(headers) != 1:
         raise ValueError("expected exactly one run header; summarize each run separately")
     header = dict(FIELDS.findall(headers[0]))
-    if header.get("rows") != "4" or header.get("cols") != "512" or header.get("cases") not in CASE_SETS:
+    shape = header.get("rows"), header.get("cols")
+    tile = shape == ("128", "64")
+    if (shape not in (("4", "512"), ("128", "64")) or header.get("cases") not in CASE_SETS or
+            tile and header["cases"] != "1"):
         raise ValueError("unexpected benchmark shape or case count")
     expected = CASE_SETS[header["cases"]]
-    if header["cases"] == "1" and (header.get("profile") != "fused_row_major" or
-                                    header.get("format") != "11" or header.get("oracle_dlen") != "512"):
-        raise ValueError("expected fused_row_major format-11 profile with the DLEN=512 oracle")
-    if header["cases"] in ("1", "11", "23") and (header.get("format") not in (("5", "6", "7", "8", "10", "11") if header["cases"] in ("1", "11") else ("4",)) or
+    profile, format_version = ("fused_tile128x64_row_major", "12") if tile else ("fused_row_major", "11")
+    if header["cases"] == "1" and (header.get("profile") != profile or
+                                    header.get("format") != format_version or header.get("oracle_dlen") != "512"):
+        raise ValueError(f"expected {profile} format-{format_version} profile with the DLEN=512 oracle")
+    full_formats = ("12",) if tile else ("5", "6", "7", "8", "10", "11")
+    if header["cases"] in ("1", "11", "23") and (header.get("format") not in (full_formats if header["cases"] in ("1", "11") else ("4",)) or
                                     header.get("workload") != "rmsnorm_nvfp4_evu" or
                                     header.get("quantization") != "evu" or "alpha_bits" not in header):
         raise ValueError("expected full EVU RMSNorm/NVFP4 header matching the case format")
@@ -58,10 +63,10 @@ def summarize(text):
     samples = int(header["samples"])
     if samples < 1 or header.get("input") not in ("fp32", "bf16_rounded_fp32"):
         raise ValueError("invalid sample count or input mode")
-    if header.get("format") in ("6", "7", "8", "10", "11") and header.get("warmup") != "0":
-        raise ValueError("format 6/7/8/10/11 requires warmup=0")
-    if header.get("format") in ("7", "8", "10", "11") and header.get("quant_batch") != "16":
-        raise ValueError("format 7/8/10/11 requires quant_batch=16")
+    if header.get("format") in ("6", "7", "8", "10", "11", "12") and header.get("warmup") != "0":
+        raise ValueError("format 6/7/8/10/11/12 requires warmup=0")
+    if header.get("format") in ("7", "8", "10", "11", "12") and header.get("quant_batch") != "16":
+        raise ValueError("format 7/8/10/11/12 requires quant_batch=16")
     if header.get("format") in ("8", "10", "11") and (header.get("quant_vl") != "16" or
                                         header.get("quant_sew") != "32" or
                                         header.get("quant_schedule") != "overlap"):
@@ -71,6 +76,10 @@ def summarize(text):
         raise ValueError("format 10/11 requires lane_sum and quant_rename switches")
     if header.get("format") == "11" and header.get("quant_banked") not in ("0", "1"):
         raise ValueError("format 11 requires a quant_banked switch")
+    if tile and (header.get("quant_vl") != "16" or header.get("quant_sew") != "32" or
+                 header.get("quant_schedule") != "batch_rows4" or header.get("row_batch") != "4" or
+                 header.get("quant_banked") not in ("0", "1")):
+        raise ValueError("format 12 requires e32/VL16 quantization in four-row batches")
     if "[RN] PASS" not in text or "HIT GOOD TRAP" not in text:
         raise ValueError("require both [RN] PASS and emulator HIT GOOD TRAP")
     if re.search(r"\[RN\] FAIL|HIT BAD TRAP|ABORT|Assertion.*failed|Assertion fail", text):
@@ -115,12 +124,13 @@ def summarize(text):
     output = []
     for (stage, schedule), (minimum, median, maximum, instructions) in aggregates.items():
         record = {
+            "rows": int(header["rows"]), "cols": int(header["cols"]),
             "input": header["input"], "alpha_bits": header.get("alpha_bits", ""), "eps_bits": header["eps_bits"],
             "workload": header.get("workload", "rmsnorm_nvfp4_cpu_fallback"),
             "quantization": header.get("quantization", "cpu_fallback"),
             "stage": stage, "schedule": schedule, "samples": samples,
             "cycles_min": minimum, "cycles_median": median, "cycles_max": maximum,
-            "cycles_per_row": median / 4,
+            "cycles_per_row": median / int(header["rows"]),
             "instructions_median": instructions,
             "speedup_vs_row_major": "",
         }

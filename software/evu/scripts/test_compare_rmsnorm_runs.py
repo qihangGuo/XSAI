@@ -1,10 +1,17 @@
 import unittest
 
 from compare_rmsnorm_runs import compare
-from test_summarize_rmsnorm_nvfp4 import complete_log
+from test_summarize_rmsnorm_nvfp4 import complete_log, tile_log
 
 
 class CompareRmsnormTest(unittest.TestCase):
+    def test_rejects_speedup_between_different_tile_shapes(self):
+        previous = complete_log(samples=1, cases=1, single=True)
+        with self.assertRaisesRegex(ValueError, 'different numerical configuration'):
+            compare(previous, tile_log())
+        row, = compare(tile_log(), tile_log())
+        self.assertEqual(row['speedup'], 1)
+
     def test_matches_common_cases(self):
         for rms_cases, full_cases in ((8, 11), (17, 23)):
             with self.subTest(rms_cases=rms_cases, full_cases=full_cases):

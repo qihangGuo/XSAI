@@ -33,6 +33,7 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, reductionContexts: Int = 1,
     val vps = Vec(reductionContexts, new Bundle {
       val rvs2 = Flipped(new VectorReadIO)
       val rvm = Flipped(new VectorReadIO)
+      val e0Read = Input(Bool())
     })
 
     val frontend = new Bundle {
@@ -73,7 +74,8 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, reductionContexts: Int = 1,
     maxExuDepth,
     prefetchPorts = (0 until exSeqs).flatMap(i => (0 until 3).map(group => (group, i))),
     trackWrites = true,
-    scalarPorts = (0 until exSeqs).flatMap(i => (0 until 3).map(group => (group, i))) :+ (2, exSeqs),
+    scalarPorts = ((0 until exSeqs).flatMap(i => (0 until 3).map(group => (group, i))) :+ (2, exSeqs)) ++
+      (0 until reductionContexts).map(i => (0, exSeqs + i)),
     readClasses = readClasses,
     bypassPorts = (0 until exSeqs).flatMap(i => (0 until 3).map(group => (group, i))) :+ (2, exSeqs),
     unusedReads = shortIntegerContexts.map(i => (2, i)),
@@ -99,6 +101,9 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, reductionContexts: Int = 1,
   }
   vrf.io.e0Read(exSeqs * 3) := io.vss.e0Read && !resetting
   vrf.io.bypass(exSeqs * 3) := io.vss.bypass && !resetting
+  for (i <- 0 until reductionContexts) {
+    vrf.io.e0Read(exSeqs * 3 + 1 + i) := io.vps(i).e0Read && !resetting
+  }
 
   io.debug.foreach(_ := vrf.io.debug.get)
   val reset_ctr = RegInit(0.U(log2Ceil(egsTotal).W))
