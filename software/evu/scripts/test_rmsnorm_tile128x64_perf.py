@@ -112,7 +112,7 @@ class Tile128x64PerfTest(unittest.TestCase):
         self.assertEqual(driver.count('execute_perf_tile();'), 1)
         self.assertEqual(source.count('printf('), 1)
         self.assertIn('[RN-PERF] rows=128 cols=64', driver)
-        self.assertIn('schedule=pack_interleaved_amax12_frontload_sum2_norm8_vl97 ', driver)
+        self.assertIn('schedule=pack_interleaved_amax12_frontload_sum2_collect8_norm8_vl65 ', driver)
         self.assertIn('cycles=%lu', driver)
         self.assertNotIn('instructions=', driver)
         self.assertNotIn('PASS', driver)
@@ -135,8 +135,13 @@ class Tile128x64PerfTest(unittest.TestCase):
         self.assertEqual(trace['execute_perf_tile'][0], ('xv_setvli', '16', '0x10'))
         self.assertEqual(trace['perf_load_gamma'][0], ('xv_setvli', 'COLS', '0x10'))
         self.assertEqual(trace['perf_sum_rows'][0][0], 'XV_LOAD')
-        self.assertEqual([op[1] for op in trace['perf_sum_rows'] if op[0] == 'xv_setvli'],
-                         ['16', 'COLS'] * 3 + ['16'])
+        reduced, switches = 0, []
+        for op in trace['perf_sum_rows']:
+            if op[0] == 'XV_FREDUCE_SUM':
+                reduced += 1
+            elif op[0] == 'xv_setvli':
+                switches.append((reduced, op[1]))
+        self.assertEqual(switches, [(8, '16'), (8, 'COLS'), (16, '16')])
         normalize = trace['perf_normalize_rows']
         self.assertEqual([op[1] for op in normalize if op[0] == 'xv_setvli'],
                          ['COLS', '16', 'COLS'])
@@ -185,10 +190,12 @@ class Tile128x64PerfTest(unittest.TestCase):
                 inputs = list(map(rounded, values))
                 gamma = [rounded(fp32(0.5 + ((col * 13) % 101) / 128)) for col in range(64)]
                 epsilon = fp32(1e-5)
-                normalized = []
+                normalized, sum_words = [], []
                 for row in range(128):
                     current = inputs[row * 64:(row + 1) * 64]
-                    mean = fp32(checked.sum64([fp32(value * value) for value in current]) / 64)
+                    row_sum = checked.sum64([fp32(value * value) for value in current])
+                    sum_words.append(bits(row_sum))
+                    mean = fp32(row_sum / 64)
                     inverse = fp32(1 / fp32(math.sqrt(fp32(mean + epsilon))))
                     normalized.extend(fp32(fp32(value * inverse) * weight) for value, weight in zip(current, gamma))
                 machine = PerfTileMachine(inputs, gamma, alpha, epsilon)
@@ -206,6 +213,7 @@ class Tile128x64PerfTest(unittest.TestCase):
                 for tile in range(8):
                     run(trace['perf_load_gamma'], tile)
                     run(trace['perf_sum_rows'], tile)
+                    self.assertEqual(list(machine.words(23)[:16]), sum_words[16 * tile:16 * (tile + 1)])
                     run(trace['perf_normalize_rows'], tile)
                     for row in range(16):
                         first = (16 * tile + row) * 64
@@ -225,9 +233,9 @@ class Tile128x64PerfTest(unittest.TestCase):
                 self.assertEqual(counts['XV_BLOCK_AMAX'], 96)
                 self.assertEqual(counts['XV_FABS'], 128)
                 self.assertEqual(counts['XV_FREDUCE_MAX'], 128)
-                self.assertEqual(len(events) + 1, 2615)  # Include the final EVU FENCE.
+                self.assertEqual(len(events) + 1, 2583)  # Include the final EVU FENCE.
                 self.assertEqual(counts['XV_FSGNJX'], 32)
-                self.assertEqual(counts['xv_setvli'], 97)
+                self.assertEqual(counts['xv_setvli'], 65)
                 self.assertEqual(counts['XV_CVT_MXFP4_F32'], 0)
                 self.assertEqual(counts['XV_LOAD'], 136)
                 self.assertEqual(counts['XV_FSQRT'], 8)

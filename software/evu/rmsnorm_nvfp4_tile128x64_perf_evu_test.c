@@ -8,27 +8,38 @@
 #error "The optimized tile schedule requires the bank-aware register layout"
 #endif
 
-/* v0-v15 hold sixteen 64-element rows. Four scratch registers collect row
- * sums into v23; v20 then holds sixteen RMS reciprocals, one per row.
- * Enter at VL=64 and leave at VL=16 after collecting the row sums. */
-#define PERF_SUM_FOUR(tile, r0, r1, r2, r3, index) do { \
+/* Keep each pair of squares and sums together at VL=64. The reduction
+ * destinations may outlive the square scratch registers for the next pair. */
+#define PERF_SUM_FOUR(tile, r0, r1, r2, r3, s0, s1, s2, s3) do { \
   XV_LOAD(r0, &inputs[(16 * (tile) + (r0)) * COLS], 2); \
   XV_LOAD(r1, &inputs[(16 * (tile) + (r1)) * COLS], 2); \
   XV_LOAD(r2, &inputs[(16 * (tile) + (r2)) * COLS], 2); \
   XV_LOAD(r3, &inputs[(16 * (tile) + (r3)) * COLS], 2); \
   XV_FMUL(16, r0, r0, 2); \
   XV_FMUL(18, r1, r1, 2); \
-  XV_FREDUCE_SUM(RN_BATCH_MAX_DEST(index, 16), RN_QUANT_ZERO, 16, 2); \
-  XV_FREDUCE_SUM(18, RN_QUANT_ZERO, 18, 2); \
+  XV_FREDUCE_SUM(RN_BATCH_MAX_DEST(r0, s0), RN_QUANT_ZERO, 16, 2); \
+  XV_FREDUCE_SUM(s1, RN_QUANT_ZERO, 18, 2); \
   XV_FMUL(19, r2, r2, 2); \
   XV_FMUL(20, r3, r3, 2); \
-  XV_FREDUCE_SUM(19, RN_QUANT_ZERO, 19, 2); \
-  XV_FREDUCE_SUM(20, RN_QUANT_ZERO, 20, 2); \
+  XV_FREDUCE_SUM(s2, RN_QUANT_ZERO, 19, 2); \
+  XV_FREDUCE_SUM(s3, RN_QUANT_ZERO, 20, 2); \
+} while (0)
+
+#define PERF_COLLECT_FOUR(index, s0, s1, s2, s3) do { \
+  RN_BATCH_MAX_INSERT(index, s0); \
+  XV_SLIDEUP(RN_QUANT_MAXIMA, (index) + 1, s1, 2); \
+  XV_SLIDEUP(RN_QUANT_MAXIMA, (index) + 2, s2, 2); \
+  XV_SLIDEUP(RN_QUANT_MAXIMA, (index) + 3, s3, 2); \
+} while (0)
+
+/* The first quartet's sums survive reuse of v16/v18/v19/v20. Row zero
+ * can still reduce directly into v23.E0 with the direct-maxima layout. */
+#define PERF_SUM_EIGHT(tile, r0, r1, r2, r3, r4, r5, r6, r7) do { \
+  PERF_SUM_FOUR(tile, r0, r1, r2, r3, 22, 21, 30, 24); \
+  PERF_SUM_FOUR(tile, r4, r5, r6, r7, 16, 18, 19, 20); \
   (void)xv_setvli(16, 0x10); \
-  RN_BATCH_MAX_INSERT(index, 16); \
-  XV_SLIDEUP(RN_QUANT_MAXIMA, (index) + 1, 18, 2); \
-  XV_SLIDEUP(RN_QUANT_MAXIMA, (index) + 2, 19, 2); \
-  XV_SLIDEUP(RN_QUANT_MAXIMA, (index) + 3, 20, 2); \
+  PERF_COLLECT_FOUR(r0, 22, 21, 30, 24); \
+  PERF_COLLECT_FOUR(r4, 16, 18, 19, 20); \
 } while (0)
 
 #define PERF_APPLY_FOUR(r0, r1, r2, r3, s0, s1, s2, s3) do { \
@@ -136,14 +147,10 @@ static void perf_load_gamma(void) {
 }
 
 static void perf_sum_rows(unsigned tile) {
-  /* The gamma load already selected VL=64 for the first four rows. */
-  PERF_SUM_FOUR(tile, 0, 1, 2, 3, 0);
+  /* The gamma load already selected VL=64 for the first eight rows. */
+  PERF_SUM_EIGHT(tile, 0, 1, 2, 3, 4, 5, 6, 7);
   (void)xv_setvli(COLS, 0x10);
-  PERF_SUM_FOUR(tile, 4, 5, 6, 7, 4);
-  (void)xv_setvli(COLS, 0x10);
-  PERF_SUM_FOUR(tile, 8, 9, 10, 11, 8);
-  (void)xv_setvli(COLS, 0x10);
-  PERF_SUM_FOUR(tile, 12, 13, 14, 15, 12);
+  PERF_SUM_EIGHT(tile, 8, 9, 10, 11, 12, 13, 14, 15);
   XV_LOAD_E0(19, &constants[1]);
   XV_LOAD_E0(18, &constants[2]);
   XV_FMUL_SCALAR(20, 19, RN_QUANT_MAXIMA);
@@ -249,7 +256,7 @@ __attribute__((used, noinline)) static int rmsnorm_nvfp4_tile_perf_main(void) {
     const uint64_t end = read_cycle();
     if (end <= start || (XV_CSR_READ(XV_EVSTATUS) & 2) ||
         (XV_CSR_READ(XV_EFFLAGS) & 0x18)) return 1;
-    printf("[RN-PERF] rows=128 cols=64 stage=fused_nvfp4 schedule=pack_interleaved_amax12_frontload_sum2_norm8_vl97 sample=%u cycles=%lu\n",
+    printf("[RN-PERF] rows=128 cols=64 stage=fused_nvfp4 schedule=pack_interleaved_amax12_frontload_sum2_collect8_norm8_vl65 sample=%u cycles=%lu\n",
       sample, (unsigned long)(end - start));
   }
   return 0;
