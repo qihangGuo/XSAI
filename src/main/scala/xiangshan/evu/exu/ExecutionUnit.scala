@@ -10,6 +10,7 @@ import xiangshan.evu.common._
 
 class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p: Parameters) extends CoreModule()(p) with HasVectorParams {
   override def desiredName = s"ExecutionUnit$desc"
+  val descName: String = desc
 
   val fus = genFUs.map(gen => Module(gen.generate(p)))
   val nFUs = fus.size
@@ -18,6 +19,15 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
   val iter_fus: Seq[(IterativeFunctionalUnit, Int)] = fus.zipWithIndex.collect { case (f: IterativeFunctionalUnit, i: Int) => (f, i) }
 
   val maxPipeDepth = (pipe_fus.map(_._1.depth) :+ 0).max
+  val packProducer = fus.collectFirst { case f: FPFMAPipe if f.blockPort => f }
+  val packConsumer = fus.collectFirst { case f: FPLowPrecisionFU if f.packInput.nonEmpty => f }
+  val packOut = packProducer.map(f => IO(Output(chiselTypeOf(f.toPack.get))))
+  val packBack = packProducer.map(f => IO(Input(chiselTypeOf(f.fromPack.get))))
+  val pipePackSlots = packProducer.map(_ => IO(Output(Vec(maxPipeDepth, Valid(UInt(3.W))))))
+  val packIn = packConsumer.map(f => IO(Input(chiselTypeOf(f.packInput.get))))
+  val packedOut = packConsumer.map(f => IO(Output(chiselTypeOf(f.packResult.get))))
+  packProducer.foreach { f => packOut.get := f.toPack.get; f.fromPack.get := packBack.get }
+  packConsumer.foreach { f => f.packInput.get := packIn.get; packedOut.get := f.packResult.get }
 
   val io = IO(new Bundle {
     val iss = Flipped(Decoupled(new ExecuteMicroOpWithData(nFUs)))
@@ -174,6 +184,10 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
       io.pipe_hazards(i).valid       := pipe_valids(i)
       io.pipe_hazards(i).bits.vat    := pipe_bits(i).vat
       io.pipe_hazards(i).bits.eg     := pipe_bits(i).wvd_eg
+      pipePackSlots.foreach { slots =>
+        slots(i).valid := pipe_valids(i) && xiangshan.evu.EvuBlock.pack(pipe_bits(i).funct3, pipe_bits(i).funct6)
+        slots(i).bits := xiangshan.evu.EvuBlock.packSlot(pipe_bits(i).scalar)
+      }
     }
 
     // Compress instructions need special handling

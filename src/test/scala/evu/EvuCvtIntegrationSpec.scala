@@ -112,10 +112,10 @@ class EvuCvtIntegrationSpec extends AnyFlatSpec with ChiselScalatestTester with 
     Op("f32.e2m1", 0x2c, LowpReference.E2M1, true),
     Op("bf16.f32", 0x2d, -1, false, bf16 = true),
     Op("f32.bf16", 0x2e, -1, true, bf16 = true),
-    Op("mxe5m2.f32", 0x76, LowpReference.E5M2, false, scaled = true),
-    Op("f32.mxe4m3", 0x77, LowpReference.E4M3, true, scaled = true),
-    Op("f32.mxe5m2", 0x78, LowpReference.E5M2, true, scaled = true),
-    Op("f32.mxfp4", 0x79, LowpReference.E2M1, true, scaled = true))
+    Op("mxe5m2.f32", 0x78, LowpReference.E5M2, false, scaled = true),
+    Op("f32.mxe4m3", 0x79, LowpReference.E4M3, true, scaled = true),
+    Op("f32.mxe5m2", 0x7a, LowpReference.E5M2, true, scaled = true),
+    Op("f32.mxfp4", 0x7b, LowpReference.E2M1, true, scaled = true))
   private def op(f7: Int): Op = ops.find(_.f7 == f7).get
   private def mask(bits: Int): BigInt = (BigInt(1) << bits) - 1
   private def pack(values: Seq[BigInt], bits: Int): BigInt =
@@ -339,7 +339,7 @@ class EvuCvtIntegrationSpec extends AnyFlatSpec with ChiselScalatestTester with 
         // FP4 payloads occupy only 64 bytes at VL128. Submit the decoder
         // immediately after its producer so all eight logical beats must see
         // the newly packed bytes, including producer/consumer partial masks.
-        for ((encode, decode, factor) <- Seq((op(0x2a), op(0x2c), 127), (op(0x75), op(0x79), 128))) {
+        for ((encode, decode, factor) <- Seq((op(0x2a), op(0x2c), 127), (op(0x75), op(0x7b), 128))) {
           load(12, sentinel); load(13, sentinel)
           if (encode.scaled) load(6, BigInt(factor))
           val payload = chainInput.map(encode.result(_, factor)._1)
@@ -361,7 +361,7 @@ class EvuCvtIntegrationSpec extends AnyFlatSpec with ChiselScalatestTester with 
         val oldPayload = (sentinel & (mask(ep.vlenBits) ^ mask(512))) | pack(oldFp4, 4)
         val overwriteInput = (0 until 128).map(i => fp((100 + i).toFloat + 0.25f))
         load(3, pack(overwriteInput, 32))
-        for ((decode, factor) <- Seq((op(0x2c), 127), (op(0x79), 128))) {
+        for ((decode, factor) <- Seq((op(0x2c), 127), (op(0x7b), 128))) {
           load(12, oldPayload); load(13, sentinel)
           if (decode.scaled) load(6, BigInt(factor))
           val decoded = expected(decode, oldFp4, 128, factor)
@@ -420,6 +420,29 @@ class EvuCvtIntegrationSpec extends AnyFlatSpec with ChiselScalatestTester with 
         checkReg(8, expected(op(0x71), chainInput, 17, 127)._1, "generic held completion")
         checkReg(9, expected(op(0x2d), chainInput, 17, 127)._1, "BF16 held completion")
         scenarios += 1
+
+        // Upstream PACK borrows the MX numeric core after its FP32 multiply.
+        // Interleave both MX directions and BF16 without draining between jobs.
+        // All products here are exact: 1.0 * 1.0 -> E2M1 code 2 (0x22/byte).
+        val ones = Seq.fill(128)(fp(1f))
+        load(1, pack(ones, 32)); load(6, BigInt(127))
+        load(12, pack(Seq.fill(16)(BigInt("bf800000", 16)), 32))
+        for (reg <- Seq(8, 9, 10, 11)) load(reg, sentinel)
+        for (slot <- 0 until 8) {
+          send(0x77, 8, 1, 16, job = 1, base = 12 | (slot << 11))
+          send(0x78, 9, 1, 16, vs1 = 6, job = 2)
+          send(0x7a, 10, 9, 16, vs1 = 6, job = 3)
+          send(0x2d, 11, 1, 16, job = 4)
+          for (job <- 1 to 4) waitFor(job)
+        }
+        val packResult = (sentinel & ~mask(512)) | pack(Seq.fill(64)(BigInt(0x22)), 8)
+        checkReg(8, packResult, "PACK/MX shared provider preserves eight slots")
+        checkReg(9, expected(op(0x78), ones, 16, 127)._1, "MX encode adjacent to PACK")
+        checkReg(10, (sentinel & ~mask(512)) | pack(ones.take(16), 32), "MX decode adjacent to PACK")
+        checkReg(11, expected(op(0x2d), ones, 16, 127)._1, "BF16 adjacent to PACK")
+        scenarios += 1
+        // Restore the payload expected by following original cases.
+        load(1, pack(chainInput, 32))
 
         // Invalid commands remain illegal even at VL=0 and preserve all bytes.
         load(2, sentinel)

@@ -15,6 +15,7 @@
 #define XV_CAP_RETURNED_VL (UINT64_C(1) << 27)
 #define XV_CAP_RVV_MATH (UINT64_C(1) << 28)
 #define XV_CAP_LOW_PRECISION (UINT64_C(1) << 29)
+#define XV_CAP_BLOCK_QUANT (UINT64_C(1) << 30)
 #define XV_CONTEXT_MAGIC UINT64_C(0x4556554354580002)
 #define XV_EVSTATUS 0xcd2
 #define XV_EVCAUSE 0xcd3
@@ -166,8 +167,8 @@ static inline int xv_context_restore(const xv_context *ctx) {
 }
 
 /* Packed CVT groups: each bit promises the complete group. */
-#define XV_CAP_CVT_RAW_EXTENSION (UINT64_C(1) << 30)
-#define XV_CAP_CVT_MX_EXTENSION (UINT64_C(1) << 31)
-#define XV_CAP_CVT_BF16 (UINT64_C(1) << 32)
+#define XV_CAP_CVT_RAW_EXTENSION (UINT64_C(1) << 31)
+#define XV_CAP_CVT_MX_EXTENSION (UINT64_C(1) << 32)
+#define XV_CAP_CVT_BF16 (UINT64_C(1) << 33)
 
 #endif

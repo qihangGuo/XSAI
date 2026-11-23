@@ -23,21 +23,23 @@ object EvuLowPrecision {
     Entry(0x73, 0x3b, Some(0), 2, true, false, 8, 32, 29),
     Entry(0x74, 0x3c, None, 2, false, true, 32, 8, 29),
     Entry(0x75, 0x3d, None, 4, false, true, 32, 4, 29),
-    Entry(0x27, 0x38, Some(1), 1, false, false, 32, 8, 30),
-    Entry(0x28, 0x38, Some(2), 0, true, false, 8, 32, 30),
-    Entry(0x29, 0x38, Some(3), 1, true, false, 8, 32, 30),
-    Entry(0x2a, 0x39, Some(1), 4, false, false, 32, 4, 30),
-    Entry(0x2b, 0x3a, Some(1), 3, true, false, 8, 32, 30),
-    Entry(0x2c, 0x3b, Some(1), 4, true, false, 4, 32, 30),
-    Entry(0x2d, 0x3b, Some(2), 5, false, false, 32, 16, 32),
-    Entry(0x2e, 0x3b, Some(3), 5, true, false, 16, 32, 32),
-    Entry(0x76, 0x3e, None, 3, false, true, 32, 8, 31),
-    Entry(0x77, 0x32, None, 2, true, true, 8, 32, 31),
-    Entry(0x78, 0x33, None, 3, true, true, 8, 32, 31),
-    Entry(0x79, 0x34, None, 4, true, true, 4, 32, 31)
+    Entry(0x27, 0x38, Some(1), 1, false, false, 32, 8, 31),
+    Entry(0x28, 0x38, Some(2), 0, true, false, 8, 32, 31),
+    Entry(0x29, 0x38, Some(3), 1, true, false, 8, 32, 31),
+    Entry(0x2a, 0x39, Some(1), 4, false, false, 32, 4, 31),
+    Entry(0x2b, 0x3a, Some(1), 3, true, false, 8, 32, 31),
+    Entry(0x2c, 0x3b, Some(1), 4, true, false, 4, 32, 31),
+    Entry(0x2d, 0x3b, Some(2), 5, false, false, 32, 16, 33),
+    Entry(0x2e, 0x3b, Some(3), 5, true, false, 16, 32, 33),
+    Entry(0x78, 0x36, None, 3, false, true, 32, 8, 32),
+    Entry(0x79, 0x32, None, 2, true, true, 8, 32, 32),
+    Entry(0x7a, 0x33, None, 3, true, true, 8, 32, 32),
+    Entry(0x7b, 0x34, None, 4, true, true, 4, 32, 32)
   )
   require(entries.map(_.opcode).distinct.size == entries.size)
   require(entries.map(e => (e.funct6, e.subop)).distinct.size == entries.size)
+  require(entries.forall(e => e.funct6 != 0x3e && e.funct6 != 0x3f),
+    "CVT must not overlap block AMAX/PACK backend tags")
   def operations: Seq[UInt] = entries.map(_.opcode.U(8.W))
   private def selected(f6: UInt, rs1: UInt, predicate: Entry => Boolean): Bool =
     entries.filter(predicate).map(_.matches(f6, rs1)).reduce(_ || _)

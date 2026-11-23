@@ -32,6 +32,7 @@ for o in ops:assert enum[o['internal_f6']]=='_',o
 for i,o in enumerate(ops):
  for p in ops[i+1:]:
   assert o['internal_f6']!=p['internal_f6'] or (o['internal_rs1'] is not None and p['internal_rs1'] is not None and o['internal_rs1']!=p['internal_rs1']), (o,p)
+assert all(o['internal_f6'] not in (0x3e,0x3f) for o in ops), 'block AMAX/PACK tag collision'
 # Existing source macros and external selectors remain identical.
 macros=(X/'software/evu/include/evu_intrinsics.h').read_text()
 for o in ops:assert re.search(r'#define '+o['name']+r'\([^\n]*XV_BINARY\(0x'+format(o['funct7'],'x')+',',macros),o
@@ -49,5 +50,5 @@ for o in ops:
     internal=(o['internal_f6']<<26)|(1<<25)|(src<<20)|(sub<<15)|(rd<<7)|0x57
     matches=[p for p in ops if p['internal_f6']==internal>>26 and (p['internal_rs1'] is None or p['internal_rs1']==((internal>>15)&31))]
     assert matches==[o];checks+=1
-r={'status':'PASS','scope':'static descriptor, macro and collision check; dynamic RTL checked separately','operations':18,'existing':6,'new':12,'encoding_cases':checks,'new_external_selectors':[hex(o['funct7']) for o in ops if o['status']!='existing'],'internal_reserved_enum_verified':True,'capability_allocation':'implemented 30/raw,31/MX,32/BF16; allocation pending review'}
+r={'status':'PASS','scope':'static descriptor, macro and collision check; dynamic RTL checked separately','operations':18,'existing':6,'new':12,'encoding_cases':checks,'new_external_selectors':[hex(o['funct7']) for o in ops if o['status']!='existing'],'internal_reserved_enum_verified':True,'capability_allocation':'implemented 31/raw,32/MX,33/BF16; allocation pending review'}
 print(json.dumps(r,indent=2))

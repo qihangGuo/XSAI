@@ -32,6 +32,8 @@ class EvuSaturnExp2ShellImp(outer: EvuSaturnExp2Shell)(implicit p: Parameters) e
     val flush = Input(Bool())
     val vstart = Input(UInt(log2Ceil(ep.vlenBits + 1).W))
     val scalarForwards = Output(UInt(64.W))
+    val packSlotIssues = Output(UInt(64.W))
+    val packSlotCandidates = Output(UInt(64.W))
     val lmul = Option.when(outer.configurableLmul)(Input(UInt(3.W)))
   })
   val backend = Module(new EvuVectorBackend(ep)(p.alterPartial {
@@ -42,6 +44,8 @@ class EvuSaturnExp2ShellImp(outer: EvuSaturnExp2Shell)(implicit p: Parameters) e
   io.memory <> backend.io.memory
   io.vrf := backend.io.debugVrf.get
   io.scalarForwards := backend.io.vrfPerf.scalarForwards
+  io.packSlotIssues := backend.io.executionPerf.packSlotIssues
+  io.packSlotCandidates := backend.io.executionPerf.packSlotCandidates
   backend.io.flush := io.flush
   backend.io.vta := false.B
   backend.io.vma := false.B

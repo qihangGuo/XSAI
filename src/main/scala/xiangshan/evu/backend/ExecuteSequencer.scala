@@ -85,6 +85,20 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   val rvmData = Option.when(!restrictedInteger)(Reg(UInt(dLen.W)))
   val inst  = Reg(new BackendIssueInst)
   val lowPrecision = EvuLowPrecision.backend(inst.funct3, inst.funct6, inst.rs1)
+  val blockMax = xiangshan.evu.EvuBlock.amax(inst.funct3, inst.funct6)
+  val blockPack = xiangshan.evu.EvuBlock.pack(inst.funct3, inst.funct6)
+  private val packCapable = !reductionOnly && dLen == 512 && supported_insns.exists(i =>
+    i.props.contains(F3(OPIVV)) && i.props.contains(F6(0x3f.U(6.W))))
+  val packWaw = Option.when(packCapable)(IO(new Bundle {
+    val writer = Output(Valid(UInt(3.W)))
+    val noConflict = Input(Bool())
+    val candidate = Output(Bool())
+    val issued = Output(Bool())
+  }))
+  packWaw.foreach { port =>
+    port.writer.valid := valid && blockPack
+    port.writer.bits := xiangshan.evu.EvuBlock.packSlot(inst.rs1_data)
+  }
   val head  = Reg(Bool())
   val wvd_mask  = Reg(UInt(egsTotal.W))
   val rvs1_mask = Reg(UInt(egsTotal.W))
@@ -378,7 +392,8 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
     io.rvd.req.bits.eg, io.rvm.req.bits.eg)).map { case (waiting, eg) =>
     Mux(waiting, UIntToOH(eg, egsTotal), 0.U(egsTotal.W))
   }.reduce(_ | _)
-  val waw_hazard = inst.wvd && io.older_writes(io.iss.bits.wvd_eg)
+  val groupWaw = inst.wvd && io.older_writes(io.iss.bits.wvd_eg)
+  val waw_hazard = groupWaw && !packWaw.map(p => p.writer.valid && p.noConflict).getOrElse(false.B)
   val war_hazard = inst.wvd && io.older_reads(io.iss.bits.wvd_eg)
   val data_hazard = raw_hazard || waw_hazard || war_hazard
 
@@ -386,7 +401,8 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
     vs1_eew, inst.reads_vs1_mask)
   io.rvs2.req.bits.eg := Mux(rgather || rgatherei16,
     getEgId(inst.rs2, rgather_eidx, vs2_eew, false.B),
-    getEgId(inst.rs2, Mux(aligned_slide, slide_source_index, sourceIndex), vs2_eew, inst.reads_vs2_mask)
+    getEgId(inst.rs2, Mux(blockPack, inst.rs1_data(6,5) << 4,
+      Mux(aligned_slide, slide_source_index, sourceIndex)), vs2_eew, inst.reads_vs2_mask)
   )
   io.rvd.req.bits.eg  := getEgId(inst.rd , eidx     , vs3_eew, false.B)
   io.rvm.req.bits.eg  := getEgId(0.U     , eidx     , 0.U    , true.B)
@@ -472,7 +488,7 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   exu_scheduler.io.reqs(0).depth := effective_pipe_stages
 
   val destIndex = Mux(lowPrecision && EvuLowPrecision.packed(inst.funct6, inst.rs1), eidx >> 1, eidx)
-  val wvd_eg = getEgId(inst.rd, Mux(inst.reduction, 0.U, destIndex), vd_eew, inst.writes_mask)
+  val wvd_eg = getEgId(inst.rd, Mux(inst.reduction || blockMax, 0.U, destIndex), vd_eew, inst.writes_mask)
   val read_slide_buffer = slide && !aligned_slide && !group_slide && Mux(slide_up,
     next_eidx > slide_offset,
     eidx +& slide_offset < inst.vconfig.vtype.vlMax)
@@ -531,6 +547,10 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
       "Restricted integer context tried to consume the shared permutation stream")
   }
   io.iss.valid := iss_valid
+  packWaw.foreach { port =>
+    port.candidate := iss_valid && groupWaw
+    port.issued := io.iss.fire && groupWaw
+  }
   io.acc_ready := iss_valid && renacc && usesAcc.B
 
   io.iss.bits.rvs1_eew  := vs1_eew
@@ -587,6 +607,7 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   io.iss.bits.scalar := Mux(rgather_v || rgatherei16,
     rgather_eidx,
     Mux(zext_imm5, uscalar, sscalar))
+  when(blockPack) { io.iss.bits.scalar := inst.rs1_data }
   io.iss.bits.use_zero_rvs2 := (rgather_zero && (rgather || rgatherei16)) ||
     (aligned_slide && !slide_source_valid)
 
@@ -623,7 +644,7 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
       acc_fold_id := acc_fold_id + 1.U
     } .otherwise {
       if (vParams.enableChaining) {
-        when (next_is_new_eg(eidx, next_eidx, vd_eew, inst.writes_mask) && !inst.reduction && !compress && !lowPrecision) {
+        when (next_is_new_eg(eidx, next_eidx, vd_eew, inst.writes_mask) && !inst.reduction && !compress && !lowPrecision && !blockMax) {
           val wvd_clr_mask = UIntToOH(io.iss.bits.wvd_eg)
           wvd_mask  := wvd_mask  & ~wvd_clr_mask
         }

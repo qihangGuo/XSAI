@@ -74,7 +74,7 @@ evu_cvt_args=(-i -j 1)
 case "$evu_cvt_mode" in
   test)
     unset EVU_CVT_DISABLE_FORWARDING
-    evu_cvt_args+=(evuCheck.test.testOnly evu.EvuLowPrecisionDecodeSpec evu.EvuCvtIntegrationSpec)
+    evu_cvt_args+=(evuCheck.test.testOnly evu.EvuLowPrecisionDecodeSpec evu.EvuCvtIntegrationSpec evu.EvuPackConvertSpec evu.EvuConfigRulesSpec)
     ;;
   no-forward)
     export EVU_CVT_DISABLE_FORWARDING=1
@@ -108,6 +108,16 @@ set +e
 "$evu_cvt_mill" "${evu_cvt_args[@]}" 2>&1 | tee "$evu_cvt_prefix.log"
 evu_cvt_status="${PIPESTATUS[0]}"
 set -e
+# SRAMTemplate caches Chisel Definition objects within one test JVM. Elaborating
+# the second full backend in that JVM refers to a definition from the first one.
+# Start PACK-slot in a fresh Mill test invocation, preserving both logs/statuses.
+if [[ "$evu_cvt_status" == 0 && "$evu_cvt_mode" == test ]]; then
+  printf 'additional_command=%q -i -j 1 evuCheck.test.testOnly evu.EvuPackSlotSpec\n' "$evu_cvt_mill" >> "$evu_cvt_prefix.manifest.txt"
+  set +e
+  "$evu_cvt_mill" -i -j 1 evuCheck.test.testOnly evu.EvuPackSlotSpec 2>&1 | tee -a "$evu_cvt_prefix.log"
+  evu_cvt_status="${PIPESTATUS[0]}"
+  set -e
+fi
 printf '%s\n' "$evu_cvt_status" > "$evu_cvt_prefix.exitcode"
 if [[ "$evu_cvt_status" == 0 && "$evu_cvt_mode" != rtl ]]; then
   if ! grep -Eq 'EVU_CVT_INTEGRATION_PASS operations=18 .*byteComparisons=[1-9][0-9]* .*memoryRequests=[1-9][0-9]*' "$evu_cvt_prefix.log"; then

@@ -73,6 +73,12 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
   val vxus = xissParams.map(_.seqs.map(s => Module(new ExecutionUnit(s.fus, s.name)).suggestName(s"vxu${s.name}")))
   val flat_vxus = vxus.flatten
+  flat_vxus.foreach(_.packIn.foreach(i => i := 0.U.asTypeOf(i)))
+  flat_vxus.filter(_.packOut.nonEmpty).foreach { fma =>
+    val cvt = flat_vxus.find(_.packIn.nonEmpty).get
+    cvt.packIn.get := fma.packOut.get
+    fma.packBack.get := cvt.packedOut.get
+  }
   val forwardingNames = Set("fp_fma", "fp_cmp", "fp_exp") ++
     (if (vParams.extendedResultForwarding) Set("int", "fp_div", "fp_conv", "fp_xx8", "fp_mxfp", "fp_bf16") else Set.empty[String])
   val maxPipeDepth = flat_vxus.map(_.maxPipeDepth).max
@@ -309,6 +315,33 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       seq.io.older_writes := older_pipe_writes | older_iter_writes | older_buffered_writes | older_wintents
       seq.io.older_reads := older_rintents
 
+      seq match {
+        case x: ExecuteSequencer => x.packWaw.foreach { pack =>
+          val eg = x.io.iss.bits.wvd_eg
+          val slot = pack.writer.bits
+          // Unknown writers are never waived. Do not subtract an eligible writer
+          // from older_writes: a second writer may still cover the same EG.
+          val unknown = (older_issq_wintents | older_other_pipe_writes |
+            older_iter_writes | older_buffered_writes)(eg)
+          val contextConflict = otherSeqs.map { s =>
+            val h = s.io.seq_hazard
+            val disjoint = s match {
+              case y: ExecuteSequencer => y.packWaw.map(p => p.writer.valid &&
+                y.io.iss.bits.wvd_eg === eg && p.writer.bits =/= slot).getOrElse(false.B)
+              case _ => false.B
+            }
+            h.valid && vatOlder(h.bits.vat, vat) && h.bits.wintent(eg) && !disjoint
+          }.foldLeft(false.B)(_ || _)
+          val unit = same_vxu.get
+          val pipeConflict = unit.io.pipe_hazards.zip(unit.pipePackSlots.get).map { case (h, p) =>
+            h.valid && h.bits.vat =/= vat && h.bits.eg === eg &&
+              !(p.valid && p.bits =/= slot && vatOlder(h.bits.vat, vat))
+          }.foldLeft(false.B)(_ || _)
+          pack.noConflict := !unknown && !contextConflict && !pipeConflict
+        }
+        case _ =>
+      }
+
       if (!vParams.enableOOO) {
         // stall dispatch if any other sequencers are at the head and stalled
         seq.io.dis_stall := otherSeqs.map { s =>
@@ -457,6 +490,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   }
 
   val executeCandidates = scala.collection.mutable.ArrayBuffer.empty[DecoupledIO[ExecuteMicroOpWithData]]
+  val loadForwardHits = scala.collection.mutable.ArrayBuffer.empty[Bool]
   for (i <- 0 until flat_vxs.size) {
     val vxs = flat_vxs(i)
     val vxu = fuBySequencer(i)
@@ -473,7 +507,26 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       val base = forwardSeqs.indexOf(vxs) * 3
       for (((read, memory), port) <- Seq((vxs.io.rvs1, vrf.io.vxs(i).rvs1),
         (vxs.io.rvs2, vrf.io.vxs(i).rvs2), (vxs.io.rvd, vrf.io.vxs(i).rvd)).zipWithIndex) {
-        val result = forwarding.io.out(base + port)
+        val arithmeticResult = forwarding.io.out(base + port)
+        val result = WireInit(arithmeticResult)
+        // Only ordinary FMAs need the wide load bypass for load -> square.
+        if (port < 2 && vxu.descName == "fp_fma" && !vxs.reductionOnly) {
+          val eg = read.req.bits.eg
+          val load = vrf.io.pendingLoads(vrfBank(eg))
+          val vat = vxs.io.vat
+          val intervening = forwardWriters.toSeq.map { w =>
+            w.valid && w.bits.writes(eg) && vatOlder(load.bits.vat, w.bits.vat) && vatOlder(w.bits.vat, vat)
+          }.reduce(_ || _)
+          val operand = vxs.io.forward.get(port)
+          val hit = operand.eligible && load.valid && load.bits.eg === eg &&
+            vatOlder(load.bits.vat, vat) && !intervening && !arithmeticResult.valid
+          when(hit) {
+            result.valid := true.B
+            result.bits := load.bits.data & operand.mask
+          }
+          operand.available := result.valid
+          loadForwardHits += (hit && read.req.fire)
+        }
         memory.req.valid := read.req.valid && !result.valid
         read.req.ready := result.valid || memory.req.ready
         read.resp := Mux(result.valid, result.bits, memory.resp)
@@ -584,6 +637,11 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   io.executionPerf.executionWait := perfCount(flat_vxs.map(_.io.waitReason.execution).reduce(_ || _))
   io.executionPerf.earlyOperandReads := perfSum(flat_vxs.map(_.io.earlyOperandReads).reduce(_ +& _))
   io.executionPerf.reductionPrefetches := perfSum(flat_vxs.map(_.io.reductionPrefetch.asUInt).reduce(_ +& _))
+  val packPorts = flat_vxs.flatMap(_.packWaw)
+  io.executionPerf.packSlotCandidates := diagnosticCount("diag_packSlotCandidates",
+    packPorts.map(_.candidate).foldLeft(false.B)(_ || _))
+  io.executionPerf.packSlotIssues := diagnosticCount("diag_packSlotIssues",
+    packPorts.map(_.issued.asUInt).foldLeft(0.U)(_ +& _))
 
   // Contexts share one arithmetic unit and one physical result channel.
   // Reserve output time across all contexts, including different latencies.
@@ -607,7 +665,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       lookaheadEligible := prefetch.io.hints.map(_.valid).reduce(_ || _)
       slideLookaheadEligible := prefetch.io.slide
     }
-    val criticalPriority = factory.name == "fp_fma" || factory.name == "fp_cmp"
+    val criticalPriority = Set("fp_fma", "fp_cmp").contains(factory.name)
     val arb = Module(new SharedExecutionArbiter(seqs.size, maxPipeDepth, xu.nFUs, criticalPriority))
     for ((seq, c) <- seqs.zipWithIndex) { arb.io.in(c) <> executeCandidates(flat_vxs.indexOf(seq)) }
     xu.io.iss <> arb.io.out
@@ -932,6 +990,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   // ==============================
   // Connect ReductionSeq to writebacks
 
+  io.executionPerf.loadForwardOperands := diagnosticCount("diag_loadForwardOperands",
+    if (loadForwardHits.nonEmpty) PopCount(VecInit(loadForwardHits.toSeq)) else 0.U)
   val accRouter = Module(new ReductionReturnRouter(vParams.vatSz, log2Ceil(egsTotal), dLen,
     reductionSeqs.size, flat_vxus.size))
   for ((xu, i) <- flat_vxus.zipWithIndex) {

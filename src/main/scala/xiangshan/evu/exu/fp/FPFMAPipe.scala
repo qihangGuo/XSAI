@@ -347,7 +347,16 @@ case class SIMDFPFMAFactory(depth: Int, segmentedFPFMA: Boolean = false) extends
   def generate(implicit p: Parameters) = new FPFMAPipe(depth, segmentedFPFMA)(p)
 }
 
-class FPFMAPipe(depth: Int, segmentedFPFMA: Boolean)(implicit p: Parameters) extends PipelinedFunctionalUnit(depth)(p) with HasFPUParameters {
+case class SplitFMAFactory(depth: Int, segmented: Boolean) extends FMAFactory {
+  def insns = base_insns :+ xiangshan.evu.EvuBlock.instruction(true).pipelined(depth + 2)
+  def generate(implicit p: Parameters) = new FPFMAPipe(depth, segmented, true)
+}
+
+
+class FPFMAPipe(depth: Int, segmentedFPFMA: Boolean, val blockPort: Boolean = false)(implicit p: Parameters)
+    extends PipelinedFunctionalUnit(depth + (if (blockPort) 2 else 0))(p) with HasFPUParameters {
+  val toPack = Option.when(blockPort)(IO(Output(Valid(UInt(dLen.W)))))
+  val fromPack = Option.when(blockPort)(IO(Input(UInt((dLen / 8 + 5).W))))
   val supported_insns = SIMDFPFMAFactory(depth, segmentedFPFMA).insns
 
   io.stall := false.B
@@ -368,6 +377,9 @@ class FPFMAPipe(depth: Int, segmentedFPFMA: Boolean)(implicit p: Parameters) ext
   val one_bits = Mux1H(Seq(vd_eew === 2.U, vd_eew === 1.U),
                        Seq("h3F8000003F800000".U, "h3C003C003C003C00".U))
   val fmaCmd = ctrl.uint(FPFMACmd)
+  def packing(op: ExecuteMicroOpWithData): Bool = blockPort.B && xiangshan.evu.EvuBlock.pack(op.funct3, op.funct6)
+  val packMultiply = packing(io.pipe(0).bits)
+  val descriptor = io.pipe(0).bits.rvs1_data.asTypeOf(Vec(dLen / 32, UInt(32.W)))(io.pipe(0).bits.scalar(10,7))
 
   val vec_rvs1 = io.pipe(0).bits.rvs1_data.asTypeOf(Vec(nTandemFMA, UInt(64.W)))
   val vec_rvs2 = io.pipe(0).bits.rvs2_data.asTypeOf(Vec(nTandemFMA, UInt(64.W)))
@@ -394,12 +406,19 @@ class FPFMAPipe(depth: Int, segmentedFPFMA: Boolean)(implicit p: Parameters) ext
 
     val vs3_bits = vec_rvd(i)
 
-    fma_pipe.io.addsub := ctrl.bool(FPAdd) && !ctrl.bool(FPMul)
-    fma_pipe.io.mul := ctrl.bool(FPMul) && !ctrl.bool(FPAdd)
+    fma_pipe.io.addsub := !packMultiply && ctrl.bool(FPAdd) && !ctrl.bool(FPMul)
+    fma_pipe.io.mul := packMultiply || (ctrl.bool(FPMul) && !ctrl.bool(FPAdd))
     fma_pipe.io.out_eew := vd_eew
 
     // FMA
-    when (ctrl.bool(FPMul) && ctrl.bool(FPAdd)) {
+    when(packMultiply) {
+      fma_pipe.io.a := vs2_bits
+      fma_pipe.io.b := Fill(2, Cat(false.B, descriptor(30,0)))
+      fma_pipe.io.c := 0.U
+      fma_pipe.io.a_eew := 2.U
+      fma_pipe.io.b_eew := 2.U
+      fma_pipe.io.c_eew := 2.U
+    }.elsewhen (ctrl.bool(FPMul) && ctrl.bool(FPAdd)) {
       fma_pipe.io.b     := vs1_bits
       fma_pipe.io.b_eew := vs1_eew
       when (ctrl.bool(FPSwapVdV2)) {
@@ -443,7 +462,7 @@ class FPFMAPipe(depth: Int, segmentedFPFMA: Boolean)(implicit p: Parameters) ext
 
     fma_pipe.io.valid := io.pipe(0).valid
     fma_pipe.io.frm := io.pipe(0).bits.frm
-    fma_pipe.io.op := fmaCmd
+    fma_pipe.io.op := Mux(packMultiply, 0.U, fmaCmd)
 
     fma_pipe.io
   }
@@ -459,4 +478,27 @@ class FPFMAPipe(depth: Int, segmentedFPFMA: Boolean)(implicit p: Parameters) ext
   }.reduce(_|_)
   io.scalar_write.valid := false.B
   io.scalar_write.bits := DontCare
+  if (blockPort) {
+    val mid = io.pipe(depth - 1)
+    val converting = mid.valid && packing(mid.bits)
+    val keep = mid.bits.rvs1_data.asTypeOf(Vec(dLen / 32, UInt(32.W)))(mid.bits.scalar(10,7))(31)
+    toPack.get.valid := converting
+    toPack.get.bits := Mux(keep, pipe_out.map(_.out).asUInt, 0.U)
+    val productFlags = pipe_out.flatMap(_.exc).reduce(_ | _)
+    val flags = Pipe(converting, productFlags, 2).bits
+    when(converting) {
+      io.write.valid := false.B
+      io.set_fflags.valid := false.B
+    }
+    val last = io.pipe(depth + 1)
+    when(last.valid && packing(last.bits)) {
+      val shift = xiangshan.evu.EvuBlock.packSlot(last.bits.scalar) << 6
+      io.write.valid := true.B
+      io.write.bits.eg := last.bits.wvd_eg
+      io.write.bits.data := (fromPack.get(dLen / 8 - 1, 0) << shift).pad(dLen)(dLen-1,0)
+      io.write.bits.mask := (Fill(dLen / 8, true.B) << shift).pad(dLen)(dLen-1,0)
+      io.set_fflags.valid := true.B
+      io.set_fflags.bits := flags | fromPack.get(dLen / 8 + 4, dLen / 8)
+    }
+  }
 }

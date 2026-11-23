@@ -41,6 +41,22 @@ git -C yunsuan switch --detach 7b4f591ab8d302d879a74125f569837fb6742f7f
 git -C yunsuan rev-parse HEAD
 ```
 
+Once the provider branch is pushed to the author's fork, parallel draft review
+can fetch the exact gitlink without changing the committed `.gitmodules`:
+
+```sh
+git config submodule.yunsuan.url https://github.com/mydu-00/YunSuan.git
+git submodule update --init yunsuan
+```
+
+This command requires the fork branch to have been published. For an already
+initialized submodule whose origin still points upstream, explicitly fetch it:
+
+```sh
+git -C yunsuan fetch https://github.com/mydu-00/YunSuan.git feat/cvt-evu-provider
+git submodule update --init yunsuan
+```
+
 After the coordinated PRs publish and pin the provider, a fresh checkout uses
 `git submodule update --init yunsuan` at the finalized XSAI revision instead.
 The script manifest records the actual YunSuan HEAD and marks gitlink mismatch
@@ -74,9 +90,16 @@ YunSuan conversion sources. Run one Mill build at a time in this worktree.
 
 | Mode | Mill target | Configuration |
 |---|---|---|
-| `test` | `evuCheck.test.testOnly evu.EvuLowPrecisionDecodeSpec evu.EvuCvtIntegrationSpec` | Forwarding enabled; external decode plus backend checks |
+| `test` | `evuCheck.test.testOnly evu.EvuLowPrecisionDecodeSpec evu.EvuCvtIntegrationSpec evu.EvuPackConvertSpec evu.EvuConfigRulesSpec` | Forwarding enabled; decode, mixed PACK/CVT, PACK-slot and capability/configuration checks |
 | `no-forward` | `evuCheck.test.testOnly evu.EvuCvtIntegrationSpec` | `EVU_CVT_DISABLE_FORWARDING=1` disables short/extended result forwarding |
 | `rtl` | `evuCheck.runMain xiangshan.evu.area.EvuAreaMain --target-dir build/evu-cvt/rtl` | Default standalone EVU, VLEN4096/DLEN512/MLEN512, 8 lanes and 4 banks per lane |
+
+After the main `test` invocation, the script runs
+`evuCheck.test.testOnly evu.EvuPackSlotSpec` in a separate test process.
+The SRAM library caches Chisel Definition objects within a JVM; elaborating
+two complete banked backends in one process can reference the first circuit's
+definitions. Separate invocations preserve the original RTL and test behavior.
+Both invocations must pass; the script records their combined status.
 
 `rtl` emits split SystemVerilog and `area_config.json`; set `EVU_CVT_RTL_DIR`
 to choose another output directory. This elaborates the standalone EVU design.

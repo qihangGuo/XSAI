@@ -44,6 +44,13 @@ class FPLowPrecisionFU(family: String)(implicit p: Parameters)
     extends PipelinedFunctionalUnit(EvuConvertProvider.latency(family)) {
   require(Set("raw", "mx", "bf16").contains(family))
   require(dLen % 64 == 0)
+  val packInput = Option.when(family == "mx")(IO(Input(Valid(UInt(dLen.W)))))
+  val packResult = Option.when(family == "mx")(IO(Output(UInt((dLen / 8 + 5).W))))
+  val packing = packInput.map(_.valid).getOrElse(false.B)
+  // PACK follows the FMA result by exactly two edges and owns the input lane
+  // on that cycle. ExecutionUnit gates an ordinary issue with io.stall.
+  if (family == "mx") require(depth == 2, "PACK return must match the FMA reservation")
+  when(packing) { assert(!io.iss.valid, "PACK and ordinary MX conversion share one input") }
   val input = io.iss.op
   val output = io.pipe(depth - 1)
   val count = dLen / 32
@@ -72,12 +79,15 @@ class FPLowPrecisionFU(family: String)(implicit p: Parameters)
     } else {
       val core = Module(new GenericConvert(EvuConvertProvider.params(family)))
       require(core.latency == depth)
-      core.io.fire := io.iss.valid
-      core.io.src := value
-      core.io.format := EvuLowPrecision.format(input.funct6, input.rs1)
-      core.io.decode := EvuLowPrecision.decode(input.funct6, input.rs1)
+      core.io.fire := io.iss.valid || packing
+      core.io.src := packInput.map(port => Mux(port.valid,
+        port.bits(32 * lane + 31, 32 * lane), value)).getOrElse(value)
+      core.io.format := Mux(packing, ConvertFormat.E2M1.id.U,
+        EvuLowPrecision.format(input.funct6, input.rs1))
+      core.io.decode := !packing && EvuLowPrecision.decode(input.funct6, input.rs1)
       core.io.scaled := (family == "mx").B
-      core.io.factor := input.rvs1_data(7, 0)
+      // UE8M0 127 is exactly scale 1, so PACK encodes the FMA product raw.
+      core.io.factor := Mux(packing, 127.U, input.rvs1_data(7, 0))
       core.io.rm := 0.U
       results(lane) := core.io.result
       flags(lane) := core.io.fflags
@@ -105,7 +115,8 @@ class FPLowPrecisionFU(family: String)(implicit p: Parameters)
   io.set_fflags.valid := output.valid
   io.set_fflags.bits := flags.zip(active).map { case (flag, enabled) => Mux(enabled, flag, 0.U) }.reduce(_ | _)
   io.set_vxsat := false.B
-  io.stall := false.B
+  io.stall := packing
+  packResult.foreach(_ := Cat(flags.reduce(_ | _), VecInit(results.map(_(3,0))).asUInt))
   io.scalar_write.valid := false.B
   io.scalar_write.bits := DontCare
 }

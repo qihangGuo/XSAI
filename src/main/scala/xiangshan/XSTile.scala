@@ -568,6 +568,7 @@ class XSTile()(implicit p: Parameters) extends LazyModule
           XSPerfReference(s"evu_dispatch_${name}_queue_blocked", perf.execution.dispatchQueueWait(index), XSPerfLevel.NORMAL)
         }
         XSPerfReference("evu_fma_issue_cycles", perf.execution.fmaIssue, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_load_forward_operands", perf.execution.loadForwardOperands, XSPerfLevel.NORMAL)
         XSPerfReference("evu_fma_no_work_cycles", perf.execution.fmaNoWork, XSPerfLevel.NORMAL)
         XSPerfReference("evu_fma_operand_wait_cycles", perf.execution.fmaOperandWait, XSPerfLevel.NORMAL)
         XSPerfReference("evu_fma_feedback_wait_cycles", perf.execution.fmaFeedbackWait, XSPerfLevel.NORMAL)
@@ -593,6 +594,8 @@ class XSTile()(implicit p: Parameters) extends LazyModule
         XSPerfReference("evu_execute_writeback_wait_cycles", perf.execution.writebackWait, XSPerfLevel.NORMAL)
         XSPerfReference("evu_execute_fu_wait_cycles", perf.execution.executionWait, XSPerfLevel.NORMAL)
         XSPerfReference("evu_early_operand_reads", perf.execution.earlyOperandReads, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_pack_slot_candidate_cycles", perf.execution.packSlotCandidates, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_pack_slot_issues", perf.execution.packSlotIssues, XSPerfLevel.NORMAL)
         XSPerfReference("evu_reduction_prefetch_hints", perf.execution.reductionPrefetches, XSPerfLevel.NORMAL)
         XSPerfReference("evu_vrf_demand_prefetch_wait", perf.vrfDemandPrefetchWait, XSPerfLevel.NORMAL)
         XSPerfReference("evu_vrf_prefetch_deferred", perf.vrfPrefetchDeferred, XSPerfLevel.NORMAL)
