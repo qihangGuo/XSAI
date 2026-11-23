@@ -17,7 +17,7 @@ SOURCE = fused.SOFTWARE / 'rmsnorm_nvfp4_tile128x64_evu_test.c'
 def traces(banked=1, source_path=SOURCE, functions=None):
     names = ('xv_setvli', 'XV_LOAD', 'XV_LOAD_E0', 'XV_STORE', 'XV_BROADCAST',
              'XV_SLIDEDOWN', 'XV_SLIDEUP', 'XV_FABS', 'XV_FREDUCE_MAX', 'XV_FREDUCE_SUM',
-             'XV_GATHER_IMM', 'XV_FMUL', 'XV_FMUL_SCALAR', 'XV_FMUL_E0', 'XV_FADD_E0',
+             'XV_BLOCK_PACK', 'XV_BLOCK_AMAX', 'XV_FSGNJX', 'XV_GATHER_IMM', 'XV_FMUL', 'XV_FMUL_SCALAR', 'XV_FMUL_E0', 'XV_FADD_E0',
              'XV_FDIV_E0', 'XV_FSQRT_E0', 'XV_FSQRT', 'XV_FADD_SCALAR', 'XV_FDIV', 'XV_FMAX', 'XV_BINARY',
              'XV_CVT_E4M3_F32', 'XV_CVT_F32_E4M3', 'XV_CVT_MXFP4_F32')
     source = '#define XSAI_EVU_CSR_H\n'

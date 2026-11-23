@@ -132,7 +132,9 @@ class EvuRvvMathDifftestSpec extends AnyFlatSpec with ChiselScalatestTester with
           val vl = fields(2).toInt
           val flags = fields(3).toInt
           val saturated = fields(4).toInt != 0
-          val bytes = fields.drop(5).map(Integer.parseInt(_, 16)).toSeq
+          val base = fields(5).startsWith("base=")
+          val scalar = if (base) Integer.parseInt(fields(5).stripPrefix("base="), 16) else 0
+          val bytes = fields.drop(if (base) 6 else 5).map(Integer.parseInt(_, 16)).toSeq
           bytes.size shouldBe 10 * ep.vlenBytes
           val input = bytes.take(4 * ep.vlenBytes)
           val other = bytes.slice(4 * ep.vlenBytes, 6 * ep.vlenBytes)
@@ -149,7 +151,7 @@ class EvuRvvMathDifftestSpec extends AnyFlatSpec with ChiselScalatestTester with
             val raw = (instruction >>> 25).toInt
             val canonical = Map(0x62 -> 0x60, 0x63 -> 0x61, 0x65 -> 0x64).getOrElse(raw, raw)
             send(canonical, vtype >> 3, vl, 8, source1 = ((instruction >>> 15) & 31).toInt,
-              aux = if (raw != canonical) 64 else 0, flags = flags, saturated = saturated,
+              base = scalar, aux = if (raw != canonical) 64 else 0, flags = flags, saturated = saturated,
               backpressure = caseIndex % 7 == 0)
             for (chunk <- 0 until 4 * ep.vlenBits / ep.dlenBits) {
               dut.io.vrf(8 * ep.vlenBits / ep.dlenBits + chunk).expect(

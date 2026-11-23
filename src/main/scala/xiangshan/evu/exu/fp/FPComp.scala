@@ -17,7 +17,8 @@ case object FPCmpFactory extends FunctionalUnitFactory {
     MFLT.VV, MFLT.VF, MFLE.VV, MFLE.VF,
     MFGT.VF, MFGE.VF,
     FREDMIN.VV, FREDMAX.VV
-  ).map(_.restrictSEW(1, 2)).flatten.map(_.pipelined(2))
+  ).map(_.restrictSEW(1, 2)).flatten.map(_.pipelined(2)) :+
+    xiangshan.evu.EvuBlock.instruction(false).pipelined(4)
   def generate(implicit p: Parameters) = new FPCompPipe()(p)
 }
 
@@ -148,7 +149,8 @@ class FPCompPipe(implicit p: Parameters)
   val s1_sign_injection = RegEnable(ctrl.bool(FPSgnj), io.pipe(0).valid)
 
 
-  io.write.valid := io.pipe(1).valid && !io.pipe(1).bits.acc_tree && !io.pipe(1).bits.acc_direct
+  io.write.valid := io.pipe(1).valid && !io.pipe(1).bits.acc_tree && !io.pipe(1).bits.acc_direct &&
+    !xiangshan.evu.EvuBlock.amax(io.pipe(1).bits.funct3, io.pipe(1).bits.funct6)
   io.write.bits.eg := io.pipe(1).bits.wvd_eg
   io.write.bits.mask := Mux(s1_writes_as_mask, mask_write_mask, FillInterleaved(8, io.pipe(1).bits.wmask))
   io.write.bits.data := RegEnable(out, io.pipe(0).valid)
@@ -167,10 +169,28 @@ class FPCompPipe(implicit p: Parameters)
   if (vParams.fp32MinMaxTree) {
     val treeDepth = VectorFastPaths.minMaxTreeDepth(dLen)
     val tree = Module(new FPMinMaxTree(dLen))
-    tree.io.valid := io.iss.valid && (io.iss.op.acc_tree || io.iss.op.acc_direct)
-    tree.io.source := io.iss.op.rvs2_data
+    val block = xiangshan.evu.EvuBlock.amax(io.iss.op.funct3, io.iss.op.funct6)
+    tree.io.valid := io.iss.valid && (io.iss.op.acc_tree || io.iss.op.acc_direct || block)
+    tree.io.source := Mux(block, io.iss.op.rvs2_data & Fill(dLen / 32, "h7fffffff".U(32.W)), io.iss.op.rvs2_data)
     tree.io.minimum := io.iss.op.opff6 === OPFFunct6.fredmin
     val treeOutput = io.pipe(treeDepth - 1)
+    if (dLen == 512) {
+      val op = treeOutput.bits
+      val collecting = treeOutput.valid && xiangshan.evu.EvuBlock.amax(op.funct3, op.funct6)
+      val words = Reg(Vec(3, UInt(32.W)))
+      val nan = tree.io.result(30,23).andR && tree.io.result(22,0).orR
+      val value = Mux(nan, 0.U, tree.io.result) // MAX(+0, all-NaN block)
+      when(collecting) {
+        when(!op.tail) { words(op.eidx(5,4)) := value }
+        val shift = op.rs1(1,0) << 7
+        io.write.valid := op.tail
+        io.write.bits.eg := op.wvd_eg
+        io.write.bits.data := (Cat(value, words.asUInt) << shift)(511,0)
+        io.write.bits.mask := (Fill(128, true.B) << shift).pad(512)(511,0)
+        io.set_fflags.valid := true.B
+        io.set_fflags.bits := tree.io.flags
+      }
+    }
     when(treeOutput.valid && treeOutput.bits.acc_tree) {
       io.write.valid := true.B
       io.write.bits.eg := treeOutput.bits.wvd_eg

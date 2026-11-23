@@ -145,7 +145,7 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
     EvuOpcode.WMul, EvuOpcode.SatAdd, EvuOpcode.SatSub, EvuOpcode.SlideUp,
     EvuOpcode.SlideDown, EvuOpcode.ReduceAnd, EvuOpcode.ReduceOr, EvuOpcode.ReduceXor,
     EvuOpcode.Load, EvuOpcode.Store, EvuOpcode.Gather, EvuOpcode.GatherImm, EvuOpcode.Exp2
-  ).map(opcode === _).reduce(_ || _) || EvuRvvMath.contains(opcode) || EvuLowPrecision.contains(opcode)
+  ).map(opcode === _).reduce(_ || _) || EvuRvvMath.contains(opcode) || EvuLowPrecision.contains(opcode) || EvuBlock.contains(opcode)
 
   val isMemory = cmd.opcode === EvuOpcode.Load || cmd.opcode === EvuOpcode.Store
   val nextVat = if (unifiedCommands) cmd.jobId else RegInit(0.U(saturnParams.vatSz.W))
@@ -203,7 +203,8 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
     EvuOpcode.FReduceMax -> OPFFunct6.fredmax.asUInt,
     EvuOpcode.Exp2 -> OPFFunct6.funary1.asUInt
   ))
-  val arithmeticBits = Mux(EvuLowPrecision.contains(cmd.opcode), EvuLowPrecision.encode(cmd),
+  val arithmeticBits = Mux(EvuBlock.contains(cmd.opcode), EvuBlock.encode(cmd),
+    Mux(EvuLowPrecision.contains(cmd.opcode), EvuLowPrecision.encode(cmd),
     Mux(EvuRvvMath.contains(cmd.opcode), EvuRvvMath.encode(cmd),
     Mux(isSlide, EvuSaturnSlide.encode(cmd),
     Mux(isGatherImm, EvuSaturnGather.encodeImmediate(cmd), Cat(
@@ -217,12 +218,17 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
     Mux(isOpf, VectorConsts.OPFVV, Mux(isOpm, VectorConsts.OPMVV, VectorConsts.OPIVV)),
     cmd.vd,
     VectorConsts.opcVector
-  )))))
+  ))))))
   val memoryBits = EvuSaturnMemory.encode(cmd)
 
   // Invalid, retired and unsupported commands must complete with an error,
   // even at VL=0. They must not wait for a removed special execution path.
-  val unsupportedOpcode = !isSaturnOpcode(cmd.opcode)
+  val block = EvuBlock.contains(cmd.opcode)
+  val badBlock = block && (!(p.dlenBits == 512 && p.splitFpIssue && p.fp32MinMaxTree).B ||
+    cmd.sew =/= 2.U || cmd.aux =/= 0.U || io.vstart =/= 0.U || io.vlmulSign || io.vlmulMag =/= 0.U ||
+    Mux(cmd.opcode === EvuBlock.Amax, cmd.vl =/= 64.U || cmd.vs1 >= 4.U || cmd.vs2 === cmd.vd,
+      cmd.vl =/= 16.U || cmd.base(63,14).orR))
+  val unsupportedOpcode = !isSaturnOpcode(cmd.opcode) || badBlock
   // RVV permits VL=0 as a completed no-op. Do not send it into Saturn's
   // sequencer (which quite correctly expects at least one element); emit a
   // normal ordered completion instead.
@@ -282,6 +288,10 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
       commandReadMask := registerGroup(cmd.vd, groupRegisters)
     }.otherwise {
       commandWriteMask := registerGroup(cmd.vd, destinationRegisters)
+    }
+    when(block) {
+      commandReadMask := UIntToOH(cmd.vs2, p.vectorRegs) |
+        Mux(cmd.opcode === EvuBlock.Pack, UIntToOH(cmd.base(4,0), p.vectorRegs), 0.U)
     }
   }
   // Bound memory commands independently of arithmetic and retain EG hazards.

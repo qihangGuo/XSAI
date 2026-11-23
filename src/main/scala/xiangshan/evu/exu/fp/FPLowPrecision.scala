@@ -42,6 +42,8 @@ class E4M3ToF32 extends Module {
 }
 
 class FPLowPrecisionFU(mxfp: Boolean)(implicit parameters: Parameters) extends PipelinedFunctionalUnit(2) {
+  val packInput = Option.when(mxfp)(IO(Input(Valid(UInt(dLen.W)))))
+  val packResult = Option.when(mxfp)(IO(Output(UInt((dLen / 8 + 5).W))))
   require(dLen % 32 == 0)
   val input = io.iss.op
   val output = io.pipe(1)
@@ -53,11 +55,11 @@ class FPLowPrecisionFU(mxfp: Boolean)(implicit parameters: Parameters) extends P
   for (lane <- 0 until count) {
     if (mxfp) {
       val converter = Module(new CVT_mxfp)
-      converter.io.fire := io.iss.valid
-      converter.io.src := input.rvs2_data(32 * lane + 31, 32 * lane)
-      converter.io.factor := input.rvs1_data(7, 0)
+      converter.io.fire := io.iss.valid || packInput.get.valid
+      converter.io.src := Mux(packInput.get.valid, packInput.get.bits, input.rvs2_data)(32 * lane + 31, 32 * lane)
+      converter.io.factor := Mux(packInput.get.valid, 127.U, input.rvs1_data(7, 0))
       converter.io.rm := 0.U
-      converter.io.isFp4 := EvuLowPrecision.packed(input.funct6)
+      converter.io.isFp4 := packInput.get.valid || EvuLowPrecision.packed(input.funct6)
       results(lane) := converter.io.result
       flags(lane) := converter.io.fflags
     } else {
@@ -93,7 +95,8 @@ class FPLowPrecisionFU(mxfp: Boolean)(implicit parameters: Parameters) extends P
   io.set_fflags.valid := output.valid
   io.set_fflags.bits := flags.zip(active).map { case (flag, enabled) => Mux(enabled, flag, 0.U) }.reduce(_ | _)
   io.set_vxsat := false.B
-  io.stall := false.B
+  io.stall := packInput.map(_.valid).getOrElse(false.B)
+  packResult.foreach(_ := Cat(flags.reduce(_ | _), VecInit(results.map(_(3,0))).asUInt))
   io.scalar_write.valid := false.B
   io.scalar_write.bits := DontCare
 }

@@ -180,6 +180,7 @@ class RegisterFileIO(
   val ll_writes = Vec(llWrites, Flipped(Decoupled(new VectorWrite(dLen))))
   val llOwners = Option.when(trackWrites)(Input(Vec(llWrites, Valid(UInt(vParams.vatSz.W)))))
   val pendingWrites = Option.when(trackWrites)(Output(Vec(vParams.vrfBanking, Valid(new VectorWriteHazard))))
+  val pendingLoads = Option.when(trackWrites)(Output(Vec(vParams.vrfBanking, Valid(new VectorForwardResult))))
   val writeCommits = Option.when(trackWrites)(Output(Vec(vParams.vrfBanking, Valid(new VectorWriteHazard))))
   val debug = Option.when(vParams.debugVrf)(Output(Vec(egsTotal, UInt(dLen.W))))
   val prefetch = Input(Vec(prefetchPorts, Valid(new VectorReadReq)))
@@ -220,6 +221,7 @@ class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrit
   io.ll_writes <> vrf.io.ll_writes
   io.llOwners.foreach(vrf.io.llOwners.get := _)
   io.pendingWrites.foreach(_ := vrf.io.pendingWrites.get)
+  io.pendingLoads.foreach(_ := vrf.io.pendingLoads.get)
   io.writeCommits.foreach(_ := vrf.io.writeCommits.get)
   io.writeInvalidations := vrf.io.writeInvalidations
   io.debug.foreach(_ := vrf.io.debug.get)
@@ -348,6 +350,7 @@ class SramRegisterFileIO(
   val ll_writes = Vec(llWrites, Flipped(Decoupled(new VectorWrite(dLen))))
   val llOwners = Option.when(trackWrites)(Input(Vec(llWrites, Valid(UInt(vParams.vatSz.W)))))
   val pendingWrites = Option.when(trackWrites)(Output(Vec(vParams.vrfBanking, Valid(new VectorWriteHazard))))
+  val pendingLoads = Option.when(trackWrites)(Output(Vec(vParams.vrfBanking, Valid(new VectorForwardResult))))
   val writeCommits = Option.when(trackWrites)(Output(Vec(vParams.vrfBanking, Valid(new VectorWriteHazard))))
   val debug = Option.when(vParams.debugVrf)(Output(Vec(egsTotal, UInt(dLen.W))))
   val perf = Output(new VrfPerf)
@@ -436,6 +439,7 @@ class AraRegisterFile(
   // Stage LL writes to break the load-mask-read/write-ready combinational loop.
   private val llPending = Reg(Vec(banksPerLane, new ByteMaskedVectorWrite(dLen)))
   private val llPendingValid = RegInit(VecInit.fill(banksPerLane)(false.B))
+  private val llIsLoad = Option.when(trackWrites)(Reg(Vec(banksPerLane, Bool())))
   private val llOwners = Option.when(trackWrites) {
     RegInit(VecInit.fill(banksPerLane)(0.U.asTypeOf(Valid(UInt(vParams.vatSz.W)))))
   }
@@ -459,6 +463,7 @@ class AraRegisterFile(
         "Buffered VRF write requires whole-byte enables")
       llPendingValid(bank) := true.B
       llOwners.foreach(_(bank) := io.llOwners.get(llArbiters(bank).io.chosen))
+      llIsLoad.foreach(_(bank) := llArbiters(bank).io.chosen === 1.U)
     } .elsewhen (llPendingValid(bank) && !pipeValid(bank)) {
       llPendingValid(bank) := false.B
     }
@@ -527,6 +532,14 @@ class AraRegisterFile(
     io.writeCommits.foreach { committed =>
       committed(bank) := io.pendingWrites.get(bank)
       committed(bank).valid := hasLlWrite && llOwners.get(bank).valid && !reset.asBool
+    }
+    io.pendingLoads.foreach { loads =>
+      val pending = io.pendingWrites.get(bank)
+      loads(bank).valid := pending.valid && llIsLoad.get(bank) && llPending(bank).byteMask.andR
+      loads(bank).bits.eg := pending.bits.eg
+      loads(bank).bits.vat := pending.bits.vat
+      loads(bank).bits.data := llPending(bank).data
+      loads(bank).bits.mask := Fill(dLen, true.B)
     }
     val logicalReads = io.read.flatMap(_.toSeq) ++ io.mask_read.flatMap(_.toSeq)
     val contenders = logicalReads.map(r => r.req.valid && bankOf(r.req.bits.eg) === bank.U)

@@ -156,11 +156,12 @@
 #define RN_BATCH_STORE_SCALES_1(batch) XV_STORE(24, &scales.data[16 * ((batch) - 3)], 2)
 #define RN_BATCH_STORE_SCALES(ready, batch) RN_BATCH_STORE_SCALES_##ready(batch)
 
-#define RN_BATCH_SCALE_BEGIN(inverse, mask) do { \
-  XV_BINARY(0x25, mask, RN_QUANT_INT_ONE, RN_QUANT_MAXIMA, 2); \
+#define RN_BATCH_SCALE_BEGIN_FROM(inverse, mask, maxima) do { \
+  XV_BINARY(0x25, mask, RN_QUANT_INT_ONE, maxima, 2); \
   XV_BINARY(0x02, mask, mask, RN_QUANT_ZERO, 2); \
-  XV_FDIV(inverse, RN_QUANT_SIX, RN_QUANT_MAXIMA, 2); \
+  XV_FDIV(inverse, RN_QUANT_SIX, maxima, 2); \
 } while (0)
+#define RN_BATCH_SCALE_BEGIN(inverse, mask) RN_BATCH_SCALE_BEGIN_FROM(inverse, mask, RN_QUANT_MAXIMA)
 
 #define RN_BATCH_SCALE_ALPHA(inverse) XV_FDIV(inverse, 25, inverse, 2)
 

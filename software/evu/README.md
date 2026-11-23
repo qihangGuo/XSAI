@@ -241,16 +241,29 @@ make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM NAME=rmsnorm_nvfp4_tile128x6
 ```
 
 This independent image leaves the checked test unchanged but uses an optimized
-sixteen-row schedule. Four-row loads are interleaved with square/reduction work;
+sixteen-row schedule. Each group starts with four row loads, then issues two
+squares and their two sums before issuing the next two squares and sums;
 sixteen row sums are collected into one EG so RMSNorm square root and reciprocal
 use all sixteen FP32 lanes instead of issuing one E0 operation per row. Gamma
 is reloaded once per sixteen rows because quantization reuses its register.
 The four quantization batches overlap amax, scale and packing, recycling input
 registers only after their values have been consumed. FP32 arithmetic order
 within each row, scale formulas, output layout and 72 aligned stores are
-unchanged. Static schedule checks count 6,855 timed commands including the final
-FENCE, 3,504 FMA-path issues and 112 DIV/SQRT issues; these are work counts,
-not measured cycles or a speedup claim.
+unchanged. The first twelve rows of each sixteen-row group use BLOCK_AMAX
+at normalization's final VL=64. The three scale batches read their maxima
+directly from v23, v19 and v22. Quantization switches to VL=16 once and
+keeps it for the remaining four rows' discrete amax, scaling and packing.
+Across the tile this gives 96 BLOCK_AMAXs, 128 ordinary maximum reductions,
+512 BLOCK_PACKs and 97 timed VL settings. Normalization gathers reciprocals
+for eight rows at VL=16 before scaling those rows at VL=64. The first square in each
+sixteen-row group reuses the gamma load's VL=64; the kernel still sets
+VL=16 explicitly for its initial constants.
+The two output lines still receive slots in A0,B0,...,A7,B7 order.
+No schedule flag is needed. Use the same block-capable EMU and matching NEMU
+reference (EVCAP bit 30); only the guest image needs rebuilding. Compare
+`[RN-PERF] ... schedule=pack_interleaved_amax12_frontload_sum2_norm8_vl97`
+against the four-row normalization run (`pack_interleaved_amax12_frontload_sum2_vl129`)
+on the same EMU.
 
 The image initializes identical inputs/gamma but does not calculate reference
 RMSNorm, scale or FP4 results, allocate reference arrays, or compare output

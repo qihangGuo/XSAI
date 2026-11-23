@@ -96,7 +96,7 @@ object EvuIsa {
       EvuOpcode.FDiv, EvuOpcode.FMin, EvuOpcode.FMax, EvuOpcode.FReduceSum,
       EvuOpcode.FReduceMin, EvuOpcode.FReduceMax, EvuOpcode.Exp2).map(opcode === _).reduce(_ || _)
     val exp2Width = !fp || sew === 1.U || sew === 2.U
-    Mux(EvuLowPrecision.contains(opcode), sew === 2.U,
+    Mux(EvuLowPrecision.contains(opcode) || EvuBlock.contains(opcode), sew === 2.U,
       Mux(EvuRvvMath.contains(opcode), EvuRvvMath.validWidth(opcode, sew),
       (!isScalarForm(opcode) || sew === 2.U) &&
         sew <= maxSupportedSew.U && (!widening || sew < maxSupportedSew.U) && exp2Width))
@@ -118,12 +118,13 @@ object EvuIsa {
     val dest = instr(11, 7)
     val src1 = instr(19, 15)
     val src2 = instr(24, 20)
+    Mux(EvuBlock.contains(op), lmul === 0.U && (op === EvuBlock.Pack || (dest =/= src2 && src1 < 4.U)),
     Mux(isSlide(op), EvuSaturnSlide.validGroups(op, dest, src2, lmul),
     Mux(EvuLowPrecision.contains(op), EvuLowPrecision.validGroups(op, dest, src1, src2, lmul),
     (!isScalarForm(rawOp) || lmul === 0.U) && Mux(EvuRvvMath.contains(op),
       EvuRvvMath.validGroups(op, dest, src1, src2, lmul), (control || Mux(memory, aligned(dest, count),
       aligned(dest, destCount) && aligned(src2, count) &&
-        (op === exp2 || op === gatherImm || aligned(src1, Mux(reduction, 1.U, count))))))))
+        (op === exp2 || op === gatherImm || aligned(src1, Mux(reduction, 1.U, count)))))))))
   }
 
   val custom0 = "b0001011".U(7.W)
@@ -270,7 +271,7 @@ class EvuDispatchAdapter(p: EvuParams) extends Module {
     EvuIsa.gather -> EvuOpcode.Gather,
     EvuIsa.scatter -> EvuOpcode.Scatter,
     EvuIsa.gatherImm -> EvuOpcode.GatherImm
-  ) ++ (EvuRvvMath.operations ++ EvuLowPrecision.operations).map(op => op(6, 0) -> op))
+  ) ++ (EvuRvvMath.operations ++ EvuLowPrecision.operations ++ Seq(EvuBlock.Amax, EvuBlock.Pack)).map(op => op(6, 0) -> op))
   val supportedSew = EvuIsa.supportsElementWidth(opcode, EvuIsa.sew(instr))
   val controlOp = opcode === EvuOpcode.Fence ||
     opcode === EvuOpcode.SetVli || opcode === EvuOpcode.SetVl

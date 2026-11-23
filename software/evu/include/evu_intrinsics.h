@@ -121,6 +121,16 @@ static inline uint32_t xv_setvl(uint64_t avl, uint64_t vtype) {
 #define XV_CVT_F32_E4M3(vd, vs) XV_BINARY(0x73, vd, 0, vs, 2)
 #define XV_CVT_MXFP8_F32(vd, scale, vs) XV_BINARY(0x74, vd, scale, vs, 2)
 #define XV_CVT_MXFP4_F32(vd, scale, vs) XV_BINARY(0x75, vd, scale, vs, 2)
+
+/* FP32/m1: four 16-lane maxima written to quarter 0..3 of vd[0:15].
+ * PACK consumes a descriptor with positive inverse in [30:0], keep in [31].
+ * Output is exactly eight bytes within the first 64 bytes of vd. */
+#define XV_BLOCK_AMAX(vd, quarter, src) XV_BINARY(0x76, vd, quarter, src, 2)
+#define XV_BLOCK_PACK(vd, src, desc, group, index) do { \
+  uintptr_t control = (desc) | ((group) << 5) | ((index) << 7) | (((index) & 7) << 11); \
+  __asm__ volatile (".insn r 0x0b, 2, 0x77, " XV_XREG(vd) ", %0, " XV_XREG(src) \
+                    :: "r"(control) : "memory"); \
+} while (0)
 #define XV_NSRL_IMM(vd, vs, shift, sew) do { \
   _Static_assert((shift) >= 0 && (shift) < 32, "shift must fit uimm5"); \
   XV_BINARY(0x6e, vd, shift, vs, sew); \

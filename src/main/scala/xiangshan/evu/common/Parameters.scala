@@ -182,7 +182,7 @@ object VectorIssueStructure {
         Seq(VXSequencerParams("int", integerFUs(params.useIterativeIMul) ++
           (if (params.useIterativeIMul) Nil else integerMAC(params.imaPipeDepth, params.useSegmentedIMul))))),
       VXIssuePathParams("fp_fma", params.vxissqEntries,
-        Seq(VXSequencerParams("fp_fma", fpFMA(params.fmaPipeDepth, params.useSegmentedFPFMA)))),
+        Seq(VXSequencerParams("fp_fma", Seq(SplitFMAFactory(params.fmaPipeDepth, params.useSegmentedFPFMA))))),
       VXIssuePathParams("fp_cmp", params.vxissqEntries, Seq(VXSequencerParams("fp_cmp", Seq(FPCmpFactory)))),
       VXIssuePathParams("fp_exp", params.vxissqEntries, Seq(VXSequencerParams("fp_exp", Seq(VFExp2Factory)))),
       VXIssuePathParams("fp_div", params.vxissqEntries, Seq(VXSequencerParams("fp_div",
