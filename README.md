@@ -6,6 +6,8 @@ XSAI is developed by extending XiangShan (XS): **XSAI = XS + AI**. It is based o
 
 Chinese README is [readme.zh-cn.md](readme.zh-cn.md).
 
+EVU conversion integration: [ISA and RTL specification](software/evu/docs/cvt-extension/README.md) · [run tests / emit RTL](software/evu/docs/cvt-extension/REPRODUCE.md).
+
 ## Documentation
 
 - [XSAI design documentation (Chinese)](https://docs.xiangshan.cc/projects/design/zh-cn/kunminghu-v2r2a/)

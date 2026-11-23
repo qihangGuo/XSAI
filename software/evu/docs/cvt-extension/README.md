@@ -1,6 +1,6 @@
-# EVU low-precision CVT extension — review draft
+# EVU low-precision CVT extension — RTL integration
 
-Status: proposed encoding and integration contract, not an implemented EVU capability. Baseline: qihangGuo/XSAI `feat/evu-optimization` at c1d87b2ed6e97fd068c0751b40366f760b7e3735. Library candidate: YunSuan standalone CVT PR based on v2r2a f7cced2. Exact selector allocation belongs to the ISA owner; this draft checks the current public decoder and retired opcodes.
+Status: candidate RTL integration. Baseline: qihangGuo/XSAI `feat/evu-optimization` at `6272d34b5`. The candidate implements all 18 operations through the real EVU backend and imports the YunSuan CVT library. Selector allocation is pending upstream review. Dynamic acceptance and reproducible commands are recorded in `REPRODUCE.md`.
 
 ## Decision
 
@@ -24,7 +24,7 @@ Destinations preserve every byte after `ceil(VL*dstBits/8)`, regardless of tail 
 
 See `evu-cvt-isa.json` for machine-readable rows. Mnemonics use destination before source, so `XV_CVT_U8_F32` converts FP32 to U8. Existing `MXFP8` remains the E4M3FN payload spelling; new MXE5M2 uses an explicit name to avoid ambiguity. Optional source-code aliases for MXE4M3 can use the same old opcode, not a new instruction.
 
-| Status | Macro | Conversion | Scale | proposed/public f7 | Internal F6 / RS1 | Capability |
+| Status | Macro | Conversion | Scale | external f7 | Internal F6 / RS1 | Capability |
 |---|---|---|---|---|---|---|
 | existing | `XV_CVT_I8_F32` | FP32 → I8 | raw | `0x70` | `0x38` / 0 | bit29 |
 | existing | `XV_CVT_E4M3_F32` | FP32 → E4M3FN | raw | `0x71` | `0x39` / 0 | bit29 |
@@ -32,20 +32,20 @@ See `evu-cvt-isa.json` for machine-readable rows. Mnemonics use destination befo
 | existing | `XV_CVT_F32_E4M3` | E4M3FN → FP32 | raw | `0x73` | `0x3b` / 0 | bit29 |
 | existing | `XV_CVT_MXFP8_F32` | FP32 → E4M3FN | UE8M0 | `0x74` | `0x3c` / scaleReg | bit29 |
 | existing | `XV_CVT_MXFP4_F32` | FP32 → E2M1 | UE8M0 | `0x75` | `0x3d` / scaleReg | bit29 |
-| proposed | `XV_CVT_U8_F32` | FP32 → U8 | raw | `0x27` | `0x38` / 1 | bit30 |
-| proposed | `XV_CVT_F32_I8` | I8 → FP32 | raw | `0x28` | `0x38` / 2 | bit30 |
-| proposed | `XV_CVT_F32_U8` | U8 → FP32 | raw | `0x29` | `0x38` / 3 | bit30 |
-| proposed | `XV_CVT_E2M1_F32` | FP32 → E2M1 | raw | `0x2a` | `0x39` / 1 | bit30 |
-| proposed | `XV_CVT_F32_E5M2` | E5M2 → FP32 | raw | `0x2b` | `0x3a` / 1 | bit30 |
-| proposed | `XV_CVT_F32_E2M1` | E2M1 → FP32 | raw | `0x2c` | `0x3b` / 1 | bit30 |
-| proposed | `XV_CVT_BF16_F32` | FP32 → BF16 | raw | `0x2d` | `0x3b` / 2 | bit32 |
-| proposed | `XV_CVT_F32_BF16` | BF16 → FP32 | raw | `0x2e` | `0x3b` / 3 | bit32 |
-| proposed | `XV_CVT_MXE5M2_F32` | FP32 → E5M2 | UE8M0 | `0x76` | `0x3e` / scaleReg | bit31 |
-| proposed | `XV_CVT_F32_MXE4M3` | E4M3FN → FP32 | UE8M0 | `0x77` | `0x32` / scaleReg | bit31 |
-| proposed | `XV_CVT_F32_MXE5M2` | E5M2 → FP32 | UE8M0 | `0x78` | `0x33` / scaleReg | bit31 |
-| proposed | `XV_CVT_F32_MXFP4` | E2M1 → FP32 | UE8M0 | `0x79` | `0x34` / scaleReg | bit31 |
+| added | `XV_CVT_U8_F32` | FP32 → U8 | raw | `0x27` | `0x38` / 1 | bit30 |
+| added | `XV_CVT_F32_I8` | I8 → FP32 | raw | `0x28` | `0x38` / 2 | bit30 |
+| added | `XV_CVT_F32_U8` | U8 → FP32 | raw | `0x29` | `0x38` / 3 | bit30 |
+| added | `XV_CVT_E2M1_F32` | FP32 → E2M1 | raw | `0x2a` | `0x39` / 1 | bit30 |
+| added | `XV_CVT_F32_E5M2` | E5M2 → FP32 | raw | `0x2b` | `0x3a` / 1 | bit30 |
+| added | `XV_CVT_F32_E2M1` | E2M1 → FP32 | raw | `0x2c` | `0x3b` / 1 | bit30 |
+| added | `XV_CVT_BF16_F32` | FP32 → BF16 | raw | `0x2d` | `0x3b` / 2 | bit32 |
+| added | `XV_CVT_F32_BF16` | BF16 → FP32 | raw | `0x2e` | `0x3b` / 3 | bit32 |
+| added | `XV_CVT_MXE5M2_F32` | FP32 → E5M2 | UE8M0 | `0x76` | `0x3e` / scaleReg | bit31 |
+| added | `XV_CVT_F32_MXE4M3` | E4M3FN → FP32 | UE8M0 | `0x77` | `0x32` / scaleReg | bit31 |
+| added | `XV_CVT_F32_MXE5M2` | E5M2 → FP32 | UE8M0 | `0x78` | `0x33` / scaleReg | bit31 |
+| added | `XV_CVT_F32_MXFP4` | E2M1 → FP32 | UE8M0 | `0x79` | `0x34` / scaleReg | bit31 |
 
-EVCAP proposal: bit29 remains exactly the original six; bit30 announces all six additional raw generic directions; bit31 announces the four additional MX directions; bit32 announces both BF16 directions. Each capability group is all-or-nothing: set a bit only when all members have working decode/model/RTL and pass their acceptance; if a deploy-time profile removes a member, disable the entire group and reject every opcode in that group. Existing deployments retain bit29. Use RV64-safe `UINT64_C(1)<<32`. EVCAP[31:30] and [32] currently unused in the checked capability generator; ISA owner must confirm external reservations. ABI2 and the 13-word snapshot stay unchanged because this adds no architectural state.
+EVCAP: bit29 remains exactly the original six; bit30 announces all six additional raw generic directions; bit31 announces the four additional MX directions; bit32 announces both BF16 directions. Each capability group is all-or-nothing: set a bit only when all members have working decoder/RTL and pass their numerical/backend acceptance; if a deploy-time profile removes a member, disable the entire group and reject every opcode in that group. Existing deployments retain bit29. Use RV64-safe `UINT64_C(1)<<32`. EVCAP[31:30] and [32] were unused in the baseline capability generator; ISA owner must confirm external reservations. ABI2 and the 13-word snapshot stay unchanged because this adds no architectural state.
 
 ## Numerical contract
 
@@ -62,7 +62,7 @@ Internal OPIVV uses opcode0x57, F3=0, vm=1; table above provides exact F6/RS1. P
 
 Use one descriptor table to derive external decode, internal tag, source/destination bits, scaled-source role, capability group and FU routing. Remove arithmetic lowering `(opcode-0x70+0x38)` and numeric range predicates, which fail for the additions. Existing six mappings remain bit-identical.
 
-Deployment recommendation:
+Implemented provider mapping:
 
 | Host path | Numeric module | Input boundary | Output/core latency | Library vs EVU responsibility |
 |---|---|---|---|---|
@@ -82,11 +82,11 @@ Current source assumes all narrow lowp outputs use byte width and only F6=0x3d i
 - Input EG uses byte offset floor(i*srcBits/8); output EG uses floor(i*dstBits/8).
 - For FP4 decode the source index is floor(i/2) bytes; read nibble offset `(i*4)%DLEN`. Fix source reads as well as destination packing.
 - Increment one beat by DLEN/32 logical values for every bridge operation (16 at DLEN512). BF16 uses halfword-packed offsets without falsely claiming m2 register groups.
-- Scale source always element0 byte0; keep read intent until command tail. Younger overwrites must wait. When using the latest byte-mask forwarding, request/check exactly the needed byte; no direct unchecked shortcut. Replace `funct6>=0x3c` tests because new scaled decode tags0x32..34 are lower.
-- Producer forwarding masks and consumer masks must represent packed bytes; full FP32 forwarding cannot be reused blindly. Start conservatively by excluding new packed-source decoding from fast forwarding unless its exact mask/index is verified. Current upstream changes to forwarding require re-audit; don't copy the previous blanket policy.
+- Scale source is element0 byte0. The current sequencer captures it once, retains that value across beats, and clears its read intent after capture. An older producer must become visible before capture; a younger overwrite may proceed after capture because the current command uses the retained value. Forwarding requests the exact low byte. Scaled operations are descriptor-selected, including tags0x32..34.
+- Producer forwarding masks and consumer masks must represent packed bytes; full FP32 forwarding cannot be reused blindly. The adapter uses the exact packed byte range, including ceil division for an odd FP4 tail; regression runs with forwarding enabled and disabled.
 - Completion means all groups and flags have been accounted for; flush/reset must not publish delayed results for a cancelled job. Preserve younger RAW/WAR/WAW and old values in unwritten bytes.
 
-Touchpoints: `EvuDecoder.scala`, `EvuControlSequencer.scala:EvuOpcode`, `EvuLowPrecision.scala`, `EvuIsa.scala`, `EvuVectorBackend.scala`, `backend/ExecuteSequencer.scala`, `backend/Backend.scala`, `common/Diagnostics.scala`, `common/Parameters.scala`, `exu/fp/FPLowPrecision.scala`, capability helper and software intrinsics. NEMU opcode legality/data/flags, guest tests and difftest are companion changes; identify/pin a current NEMU branch before RTL acceptance.
+Touchpoints: `EvuDecoder.scala`, `EvuControlSequencer.scala:EvuOpcode`, `EvuLowPrecision.scala`, `EvuIsa.scala`, `EvuVectorBackend.scala`, `backend/ExecuteSequencer.scala`, `backend/Backend.scala`, `common/Diagnostics.scala`, `common/Parameters.scala`, `exu/fp/FPLowPrecision.scala`, capability helper and software intrinsics. The independent numerical backend test does not require NEMU. Full-SoC guest difftest additionally needs matching NEMU opcode/flags support; that is a separate validation gate.
 
 ## Composition boundaries
 
@@ -109,12 +109,12 @@ Touchpoints: `EvuDecoder.scala`, `EvuControlSequencer.scala:EvuOpcode`, `EvuLowP
 5. Backend dependency/layout: VL0/1/15/16/17/127/128; odd FP4; source read crossing byte/nibble/EG; packed destination overlap preservation; scale producer RAW and younger overwrite WAR; forwarding enabled/disabled; tails and flush.
 6. Reference/guest: matching NEMU, old88-case lowp smoke plus new directions, conversion→compute→conversion sequences; full SoC smoke after core/backend gates. Do not equate library PASS with production EVU PASS.
 
-## PR sequence
+## Coordinated PRs
 
-A. YunSuan standalone library and regression; preserve legacy two-cycle interfaces and specify short bypass latency.
-B. EVU ISA/spec/header/model contract; proposed selectors reviewed before enabling capabilities.
-C. EVU provider wiring, descriptor-based sequencing, backend tests and submodule pin to public library commit; old6 regression and new directional coverage.
-D. Optional provider replacement of current FPConvBlock using YunSuan native kernels, only after per-form numeric/lane/control equivalence; independent from packed-lowp completion.
+1. YunSuan: standalone numeric library, authoritative latency/II and regression. Legacy consumer compatibility remains explicit.
+2. XSAI: ISA/spec/header, public scalar decode, descriptor-based sequencing, providers, backend tests and YunSuan submodule pin in one integration PR.
+3. The XSAI gitlink must reference a publicly fetchable YunSuan commit before publication. Until then both branches are local review candidates.
+4. Replacing FPConvBlock/HardFloat with YunSuan native IEEE kernels is a separate per-form equivalence task. It is not required to enable these 18 packed conversions.
 
 ## Review tools
 
@@ -125,8 +125,4 @@ python3 software/evu/docs/cvt-extension/check_isa.py
 python3 software/evu/docs/cvt-extension/check_asm.py
 ```
 
-The first script checks the baseline decoder, enum holes and270 operand cases.
-The second assembles all18 macros using Clang/RV64 and verifies actual ELF words.
-`evu_cvt_proposal.h` is an opt-in review artifact in this directory, not a
-production include; it requires `XV_ENABLE_CVT_EXTENSION_PROPOSAL`. No new
-decoder capability is enabled. All allocation numbers remain proposals.
+The first script checks all 18 descriptor rows, software macros, selector collisions and 270 operand mappings. The second assembles all 18 macros and verifies actual ELF instruction words. `evu_cvt_proposal.h` remains a compatibility include; the macros now live in the normal `evu_intrinsics.h`. Software must query EVCAP before use on other revisions. See `REPRODUCE.md` for RTL execution and export.

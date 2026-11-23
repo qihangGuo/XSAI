@@ -165,4 +165,9 @@ static inline int xv_context_restore(const xv_context *ctx) {
   return 0;
 }
 
+/* Packed CVT groups: each bit promises the complete group. */
+#define XV_CAP_CVT_RAW_EXTENSION (UINT64_C(1) << 30)
+#define XV_CAP_CVT_MX_EXTENSION (UINT64_C(1) << 31)
+#define XV_CAP_CVT_BF16 (UINT64_C(1) << 32)
+
 #endif

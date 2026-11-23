@@ -69,5 +69,6 @@ class EvuConfigRulesSpec extends AnyFlatSpec with ChiselScalatestTester with Mat
     ((cap >> 27) & 1) shouldBe BigInt(1)
     ((cap >> 28) & 1) shouldBe BigInt(1)
     ((cap >> 29) & 1) shouldBe BigInt(1)
+    for (bit <- 30 to 32) ((cap >> bit) & 1) shouldBe BigInt(1)
   }
 }

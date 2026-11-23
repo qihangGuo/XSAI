@@ -1,6 +1,6 @@
 {
-  "status": "design proposal; not allocated ISA or implemented decoder",
-  "baseline": "c1d87b2ed6e97fd068c0751b40366f760b7e3735",
+  "status": "implemented in candidate EVU RTL; allocation pending upstream review",
+  "baseline": "6272d34b5",
   "external_opcode": 11,
   "external_funct3": 2,
   "configuration": "e32,m1,VL0..128,vstart0,unmasked",
@@ -107,7 +107,7 @@
       "internal_rs1": 1,
       "provider": "GenericConvert",
       "capability_bit": 30,
-      "status": "proposed",
+      "status": "added",
       "source_bits": 32,
       "destination_bits": 8,
       "rounding": "RNE"
@@ -122,7 +122,7 @@
       "internal_rs1": 2,
       "provider": "GenericConvert",
       "capability_bit": 30,
-      "status": "proposed",
+      "status": "added",
       "source_bits": 8,
       "destination_bits": 32,
       "rounding": "RNE"
@@ -137,7 +137,7 @@
       "internal_rs1": 3,
       "provider": "GenericConvert",
       "capability_bit": 30,
-      "status": "proposed",
+      "status": "added",
       "source_bits": 8,
       "destination_bits": 32,
       "rounding": "RNE"
@@ -152,7 +152,7 @@
       "internal_rs1": 1,
       "provider": "GenericConvert",
       "capability_bit": 30,
-      "status": "proposed",
+      "status": "added",
       "source_bits": 32,
       "destination_bits": 4,
       "rounding": "RNE"
@@ -167,7 +167,7 @@
       "internal_rs1": 1,
       "provider": "GenericConvert",
       "capability_bit": 30,
-      "status": "proposed",
+      "status": "added",
       "source_bits": 8,
       "destination_bits": 32,
       "rounding": "RNE"
@@ -182,7 +182,7 @@
       "internal_rs1": 1,
       "provider": "GenericConvert",
       "capability_bit": 30,
-      "status": "proposed",
+      "status": "added",
       "source_bits": 4,
       "destination_bits": 32,
       "rounding": "RNE"
@@ -197,7 +197,7 @@
       "internal_rs1": 2,
       "provider": "NativeBF16Convert",
       "capability_bit": 32,
-      "status": "proposed",
+      "status": "added",
       "source_bits": 32,
       "destination_bits": 16,
       "rounding": "RNE"
@@ -212,7 +212,7 @@
       "internal_rs1": 3,
       "provider": "NativeBF16Convert",
       "capability_bit": 32,
-      "status": "proposed",
+      "status": "added",
       "source_bits": 16,
       "destination_bits": 32,
       "rounding": "RNE"
@@ -227,7 +227,7 @@
       "internal_rs1": null,
       "provider": "GenericConvert",
       "capability_bit": 31,
-      "status": "proposed",
+      "status": "added",
       "source_bits": 32,
       "destination_bits": 8,
       "rounding": "RNE"
@@ -242,7 +242,7 @@
       "internal_rs1": null,
       "provider": "GenericConvert",
       "capability_bit": 31,
-      "status": "proposed",
+      "status": "added",
       "source_bits": 8,
       "destination_bits": 32,
       "rounding": "RNE"
@@ -257,7 +257,7 @@
       "internal_rs1": null,
       "provider": "GenericConvert",
       "capability_bit": 31,
-      "status": "proposed",
+      "status": "added",
       "source_bits": 8,
       "destination_bits": 32,
       "rounding": "RNE"
@@ -272,10 +272,11 @@
       "internal_rs1": null,
       "provider": "GenericConvert",
       "capability_bit": 31,
-      "status": "proposed",
+      "status": "added",
       "source_bits": 4,
       "destination_bits": 32,
       "rounding": "RNE"
     }
-  ]
+  ],
+  "allocation": "new selectors and capability bits pending upstream review"
 }

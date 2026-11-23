@@ -6,8 +6,16 @@ used={int(x,0) for x in re.findall(r'\bop\((0x[0-9a-f]+|[0-9]+)',s)}|{0x45,0x46}
 reserved={0,8,9,10,11,0x18,0x19,0x38,0x49,0x4a,0x4b,0x4c,0x4d,0x4e,0x4f,0x50,0x5e}
 assert len({o['funct7'] for o in ops})==18
 for o in ops:
- assert (o['funct7'] in used)==(o['status']=='existing'),o
+ assert o['funct7'] not in used, ('collision with non-CVT decoder',o)
  assert o['funct7'] not in reserved,o
+# Candidate decoder uses the authoritative CVT descriptor in addition to non-CVT rows.
+assert 'EvuLowPrecision.entries.map(e => op(e.opcode))' in s
+scala=(X/'src/main/scala/xiangshan/evu/EvuLowPrecision.scala').read_text()
+rows=re.findall(r'Entry\(0x([0-9a-f]+), 0x([0-9a-f]+), (None|Some\(\d+\)), (\d+), (true|false), (true|false), (\d+), (\d+), (\d+)\)',scala)
+assert len(rows)==len(ops)
+for row,o in zip(rows,ops):
+ opcode,f6,sub,fmt,dec,scaled,sb,db,cap=row
+ assert (int(opcode,16),int(f6,16),None if sub=='None' else int(sub[5:-1]),dec=='true',scaled=='true',int(sb),int(db),int(cap)) == (o['funct7'],o['internal_f6'],o['internal_rs1'],o['destination']=='FP32',o['scale']=='UE8M0',o['source_bits'],o['destination_bits'],o['capability_bit'])
 # Validate internal OPIVV funct6 candidates are holes in the enum; F6/RS1 distinct per route.
 s=(X/'src/main/scala/xiangshan/evu/common/Consts.scala').read_text().split('object OPIFunct6')[1].split('object OPMFunct6')[0];enum={};index=0
 for line in s.splitlines():
@@ -26,7 +34,7 @@ for i,o in enumerate(ops):
   assert o['internal_f6']!=p['internal_f6'] or (o['internal_rs1'] is not None and p['internal_rs1'] is not None and o['internal_rs1']!=p['internal_rs1']), (o,p)
 # Existing source macros and external selectors remain identical.
 macros=(X/'software/evu/include/evu_intrinsics.h').read_text()
-for o in ops[:6]:assert re.search(r'#define '+o['name']+r'\([^\n]*XV_BINARY\(0x'+format(o['funct7'],'x')+',',macros),o
+for o in ops:assert re.search(r'#define '+o['name']+r'\([^\n]*XV_BINARY\(0x'+format(o['funct7'],'x')+',',macros),o
 # Pure encoding contract tests, no claim of decoder RTL.
 checks=0
 for o in ops:
@@ -41,5 +49,5 @@ for o in ops:
     internal=(o['internal_f6']<<26)|(1<<25)|(src<<20)|(sub<<15)|(rd<<7)|0x57
     matches=[p for p in ops if p['internal_f6']==internal>>26 and (p['internal_rs1'] is None or p['internal_rs1']==((internal>>15)&31))]
     assert matches==[o];checks+=1
-r={'status':'PASS','scope':'static proposal collision/mapping check, no EVU RTL implementation','operations':18,'existing':6,'new':12,'encoding_cases':checks,'new_external_selectors':[hex(o['funct7']) for o in ops if o['status']=='proposed'],'internal_reserved_enum_verified':True,'capability_allocation':'proposed 30/raw,31/MX,32/BF16; owner review required'}
+r={'status':'PASS','scope':'static descriptor, macro and collision check; dynamic RTL checked separately','operations':18,'existing':6,'new':12,'encoding_cases':checks,'new_external_selectors':[hex(o['funct7']) for o in ops if o['status']!='existing'],'internal_reserved_enum_verified':True,'capability_allocation':'implemented 30/raw,31/MX,32/BF16; allocation pending review'}
 print(json.dumps(r,indent=2))
