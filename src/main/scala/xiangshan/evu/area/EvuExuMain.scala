@@ -1,62 +1,47 @@
 package xiangshan.evu.area
 
+import chisel3._
 import circt.stage.ChiselStage
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths}
 import org.chipsalliance.cde.config.Parameters
 import xiangshan.evu.EvuParams
 import xiangshan.evu.adapter.EvuVectorParameters
-import xiangshan.evu.common.{VectorIssueStructure, VectorParams, VXSequencerParams}
+import xiangshan.evu.common.{VectorParams, VXSequencerParams}
 import xiangshan.evu.exu._
 
-/** Export the production ExecutionUnit boundary, including its existing pipeline and writeback logic. */
-object EvuExuMain {
-  // Keep aligned with EvuVectorBackend, including effective widths set by EvuVectorParameters.
-  def vectorParams(ep: EvuParams): VectorParams = VectorParams.lgvParams.copy(
-    dLen = ep.dlenBits,
-    mLen = ep.mlenBits,
-    vdqEntries = ep.dispatchDepth,
-    vlifqEntries = ep.loadResponseDepth max ep.maxMemOutstanding,
-    vsifqEntries = ep.maxMemOutstanding,
-    vlrobEntries = ep.loadResponseDepth,
-    vlissqEntries = ep.loadIssueDepth,
-    vsissqEntries = ep.storeIssueDepth,
-    vxissqEntries = ep.executeIssueDepth,
-    vpissqEntries = ep.specialIssueDepth,
-    vrfBanking = ep.vrfBanks,
-    debugVrf = false,
-    diagnosticCounters = false,
-    enableChaining = true,
-    enableOOO = true,
-    pipelinedVatClear = true,
-    issStructure = if (ep.splitFpIssue) VectorIssueStructure.SplitFP else VectorParams.lgvParams.issStructure,
-    reductionContexts = ep.reductionContexts,
-    fmaOrdinaryContexts = ep.fmaOrdinaryContexts,
-    parallelFp32Div = ep.parallelFp32Div,
-    interleaveReductions = ep.interleaveReductions,
-    fp32MinMaxTree = ep.fp32MinMaxTree,
-    singleGroupMinMax = ep.singleGroupMinMax,
-    alignedSlide = ep.alignedSlide,
-    singleGroupSlide = ep.singleGroupSlide,
-    crossInstructionPrefetch = ep.crossInstructionPrefetch,
-    extendedResultForwarding = ep.extendedResultForwarding,
-    shortResultForwarding = ep.shortResultForwarding
-  )
+/** Two real EXUs with the same PACK data connection as VectorBackend. No added state. */
+class ExecutionUnitPackPair(fmaParams: VXSequencerParams, mxParams: VXSequencerParams)
+    (implicit p: Parameters) extends Module {
+  val fma = Module(new ExecutionUnit(fmaParams.fus, fmaParams.name))
+  val mx = Module(new ExecutionUnit(mxParams.fus, mxParams.name))
+  val io = IO(new Bundle {
+    val fma = chiselTypeOf(ExecutionUnitPackPair.this.fma.io)
+    val mx = chiselTypeOf(ExecutionUnitPackPair.this.mx.io)
+    val pipePackSlots = Output(chiselTypeOf(ExecutionUnitPackPair.this.fma.pipePackSlots.get))
+  })
+  io.fma <> fma.io
+  io.mx <> mx.io
+  mx.packIn.get := fma.packOut.get
+  fma.packBack.get := mx.packedOut.get
+  io.pipePackSlots := fma.pipePackSlots.get
+}
 
-  private val includedGroups = Seq("int", "fp_fma", "fp_cmp", "fp_div", "fp_conv")
+/** Export production EXU boundaries and an optional connected FMA/MX measurement. */
+object EvuExuMain {
+  def vectorParams(ep: EvuParams): VectorParams = EvuSynthesisConfig.vectorParams(ep)
+  private val includedGroups = Seq("int", "fp_fma", "fp_cmp", "fp_div", "fp_conv", "fp_xx8", "fp_mxfp", "fp_bf16")
+  private val pairName = "ExecutionUnitPackPair"
 
   def targets(vp: VectorParams): Seq[VXSequencerParams] = {
     val production = vp.issStructure.generate(vp).flatMap(_.seqs)
-    val selected = production.filter(s => includedGroups.contains(s.name))
-    require(selected.map(_.name).toSet == includedGroups.toSet && selected.size == includedGroups.size,
+    require(production.map(_.name).toSet == (includedGroups :+ "fp_exp").toSet,
       "Review changed production ExecutionUnit configuration")
-    includedGroups.map(name => selected.find(_.name == name).get)
+    includedGroups.map(name => production.find(_.name == name).get)
   }
 
   private def write(path: Path, text: String): Unit =
     Files.write(path, text.getBytes(StandardCharsets.UTF_8))
-
-  private def strings(values: Seq[String]): String = values.map(s => s"\"$s\"").mkString("[", ", ", "]")
 
   def main(args: Array[String]): Unit = {
     var target = "build/evu-exu/rtl"
@@ -74,60 +59,72 @@ object EvuExuMain {
     val ep = EvuParams(enable = true, enableDifftest = false)
     val vp = vectorParams(ep)
     val all = targets(vp)
-    if (listOnly) {
-      all.foreach(s => println(s"ExecutionUnit${s.name}"))
-      return
-    }
+    if (listOnly) { all.foreach(s => println(s"ExecutionUnit${s.name}")); return }
+    val pairOnly = selection == pairName
     val chosen = if (selection == "all") all else all.filter(s => s"ExecutionUnit${s.name}" == selection)
-    require(chosen.nonEmpty, s"Unknown or excluded ExecutionUnit: $selection")
+    require(chosen.nonEmpty || pairOnly, s"Unknown or excluded ExecutionUnit: $selection")
     val output = Paths.get(target).toAbsolutePath.normalize
-    chosen.foreach { s =>
-      require(!Files.exists(output.resolve(s"ExecutionUnit${s.name}")), "Refusing to overwrite an RTL export")
-    }
+    val names = if (pairOnly) Seq(pairName) else chosen.map(s => s"ExecutionUnit${s.name}")
+    names.foreach(name => require(!Files.exists(output.resolve(name)), s"Refusing to overwrite $name"))
     implicit val p: Parameters = EvuVectorParameters(
       EvuAreaMain.parameters, ep.vlenBits, ep.dlenBits, ep.mlenBits, vp)
-    chosen.foreach { s =>
+    val opts = Array("-O=release", "--disable-all-randomization", "--strip-debug-info",
+      "--lowering-options=disallowLocalVariables,disallowPortDeclSharing,locationInfoStyle=none")
+    def config(name: String): ujson.Obj = {
+      val cfg = EvuSynthesisConfig.manifest(ep, vp)
+      cfg("top") = name
+      cfg("rtl_top") = name
+      cfg("execution_unit_included") = true
+      cfg("control_predecode") = "issue_and_writeback_v1"
+      cfg("mask_reduction_before_selection") = true
+      cfg
+    }
+    for (s <- chosen) {
       val name = s"ExecutionUnit${s.name}"
       val directory = output.resolve(name)
       Files.createDirectories(directory)
-      var depth = 0
-      var fuNames = Seq.empty[String]
-      var fuDepths = Seq.empty[Int]
-      var iterative = Seq.empty[String]
+      val cfg = config(name)
+      cfg("scope") = "EXECUTION_UNIT_NATIVE_IO"
+      cfg("group") = s.name
       ChiselStage.emitSystemVerilogFile({
         val unit = new ExecutionUnit(s.fus, s.name)
-        require(unit.desiredName == name)
-        depth = unit.maxPipeDepth
-        fuNames = unit.fus.map(_.desiredName)
-        fuDepths = unit.fus.map {
+        cfg("pipeline_depth") = unit.maxPipeDepth
+        cfg("fu_names") = ujson.Arr.from(unit.fus.map(_.desiredName))
+        cfg("fu_pipeline_depths") = ujson.Arr.from(unit.fus.map {
           case fu: PipelinedFunctionalUnit => fu.depth
           case _: IterativeFunctionalUnit => 0
-        }
-        iterative = unit.iter_fus.map(_._1.desiredName)
+        })
+        cfg("iterative_fu_names") = ujson.Arr.from(unit.iter_fus.map(_._1.desiredName))
+        cfg("pack_sideband_ports") = ujson.Arr.from(
+          (if (unit.packOut.nonEmpty) Seq("packOut_valid", "packOut_bits", "packBack") ++
+            (0 until unit.maxPipeDepth).flatMap(i => Seq(s"pipePackSlots_${i}_valid", s"pipePackSlots_${i}_bits")) else Nil) ++
+          (if (unit.packIn.nonEmpty) Seq("packIn_valid", "packIn_bits", "packedOut") else Nil))
         unit
-      }, args = Array("--target-dir", directory.toString, "--split-verilog"),
-        firtoolOpts = Array("-O=release", "--disable-all-randomization", "--strip-debug-info",
-          "--lowering-options=disallowLocalVariables,disallowPortDeclSharing,locationInfoStyle=none"))
-      val manifest = s"""{
-        |  "top": "$name", "scope": "EXECUTION_UNIT_NATIVE_IO", "execution_unit_included": true,
-        |  "group": "${s.name}", "fu_names": ${strings(fuNames)},
-        |  "fu_pipeline_depths": ${fuDepths.mkString("[", ", ", "]")}, "iterative_fu_names": ${strings(iterative)},
-        |  "vlen_bits": ${ep.vlenBits}, "dlen_bits": ${ep.dlenBits}, "mlen_bits": ${ep.mlenBits},
-        |  "lanes": ${ep.lanes}, "elen_bits": 32, "vat_bits": ${vp.vatSz},
-        |  "pipeline_depth": $depth, "split_fp_issue": ${ep.splitFpIssue},
-        |  "segmented_imul": ${vp.useSegmentedIMul}, "segmented_fma": ${vp.useSegmentedFPFMA},
-        |  "parallel_fp32_div": ${vp.parallelFp32Div}, "fp32_minmax_tree": ${vp.fp32MinMaxTree},
-        |  "single_group_minmax": ${vp.singleGroupMinMax},
-        |  "extended_result_forwarding": ${vp.extendedResultForwarding},
-        |  "short_result_forwarding": ${vp.shortResultForwarding},
-        |  "difftest": false, "debug_vrf": false, "diagnostic_counters": false,
-        |  "added_wrapper_registers": false, "vrf_included": false,
-        |  "control_predecode": "issue_and_writeback_v1", "mask_reduction_before_selection": true
-        |}
-        |""".stripMargin
-      write(directory.resolve("fu_config.json"), manifest)
+      }, args = Array("--target-dir", directory.toString, "--split-verilog"), firtoolOpts = opts)
+      write(directory.resolve("fu_config.json"), ujson.write(cfg, indent = 2) + "\n")
       write(directory.resolve("parameters.txt"), s"$ep\n$vp\nProduction group: ${s.name}\nFactories: ${s.fus.mkString(", ")}\n")
-      println(s"Exported $name: DLEN=${ep.dlenBits}, FUs=${fuNames.mkString(",")}, maxPipeDepth=$depth -> $directory")
+      println(s"Exported $name: maxPipeDepth=${cfg("pipeline_depth")} -> $directory")
+    }
+    if (pairOnly) {
+      val dir = output.resolve(pairName)
+      Files.createDirectories(dir)
+      val cfg = config(pairName)
+      cfg("scope") = "EXECUTION_UNIT_PACK_PAIR_NATIVE_IO"
+      cfg("group") = "fp_fma+fp_mxfp"
+      cfg("pipeline_depth") = 6
+      cfg("fu_names") = ujson.Arr("FPFMAPipe", "FPLowPrecisionFU")
+      cfg("fu_pipeline_depths") = ujson.Arr(6, 2)
+      cfg("iterative_fu_names") = ujson.Arr()
+      cfg("execution_units") = ujson.Arr("ExecutionUnitfp_fma", "ExecutionUnitfp_mxfp")
+      cfg("pack_connection") = "fma.packOut -> mx.packIn; mx.packedOut -> fma.packBack"
+      cfg("pack_sideband_ports") = ujson.Arr.from((0 until 6).flatMap(i =>
+        Seq(s"io_pipePackSlots_${i}_valid", s"io_pipePackSlots_${i}_bits")))
+      ChiselStage.emitSystemVerilogFile(new ExecutionUnitPackPair(
+        all.find(_.name == "fp_fma").get, all.find(_.name == "fp_mxfp").get),
+        args = Array("--target-dir", dir.toString, "--split-verilog"), firtoolOpts = opts)
+      write(dir.resolve("fu_config.json"), ujson.write(cfg, indent = 2) + "\n")
+      write(dir.resolve("parameters.txt"), s"$ep\n$vp\nPACK connected pair; overlaps individual FMA/MX area.\n")
+      println(s"Exported connected $pairName -> $dir")
     }
   }
 }
