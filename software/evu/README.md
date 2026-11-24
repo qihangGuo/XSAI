@@ -277,3 +277,9 @@ element and output byte against the same reference; the checked image remains
 available as the unoptimized baseline. The minimal perf output is intentionally
 not accepted by the checked-log summary scripts. The schedules and preparation
 histories differ, so their cycle counts need not match.
+
+## CVT extension integration
+
+The [CVT extension specification](docs/cvt-extension/README.md) describes the
+YunSuan conversion provider and twelve additional directions alongside the six
+legacy commands. See its implementation and validation status before use.

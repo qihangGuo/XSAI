@@ -121,6 +121,18 @@ static inline uint32_t xv_setvl(uint64_t avl, uint64_t vtype) {
 #define XV_CVT_F32_E4M3(vd, vs) XV_BINARY(0x73, vd, 0, vs, 2)
 #define XV_CVT_MXFP8_F32(vd, scale, vs) XV_BINARY(0x74, vd, scale, vs, 2)
 #define XV_CVT_MXFP4_F32(vd, scale, vs) XV_BINARY(0x75, vd, scale, vs, 2)
+#define XV_CVT_U8_F32(vd, vs) XV_BINARY(0x27, vd, 0, vs, 2)
+#define XV_CVT_F32_I8(vd, vs) XV_BINARY(0x28, vd, 0, vs, 2)
+#define XV_CVT_F32_U8(vd, vs) XV_BINARY(0x29, vd, 0, vs, 2)
+#define XV_CVT_E2M1_F32(vd, vs) XV_BINARY(0x2a, vd, 0, vs, 2)
+#define XV_CVT_F32_E5M2(vd, vs) XV_BINARY(0x2b, vd, 0, vs, 2)
+#define XV_CVT_F32_E2M1(vd, vs) XV_BINARY(0x2c, vd, 0, vs, 2)
+#define XV_CVT_BF16_F32(vd, vs) XV_BINARY(0x2d, vd, 0, vs, 2)
+#define XV_CVT_F32_BF16(vd, vs) XV_BINARY(0x2e, vd, 0, vs, 2)
+#define XV_CVT_MXE5M2_F32(vd, scale, vs) XV_BINARY(0x78, vd, scale, vs, 2)
+#define XV_CVT_F32_MXE4M3(vd, scale, vs) XV_BINARY(0x79, vd, scale, vs, 2)
+#define XV_CVT_F32_MXE5M2(vd, scale, vs) XV_BINARY(0x7a, vd, scale, vs, 2)
+#define XV_CVT_F32_MXFP4(vd, scale, vs) XV_BINARY(0x7b, vd, scale, vs, 2)
 
 /* FP32/m1: four 16-lane maxima written to quarter 0..3 of vd[0:15].
  * PACK consumes a descriptor with positive inverse in [30:0], keep in [31].

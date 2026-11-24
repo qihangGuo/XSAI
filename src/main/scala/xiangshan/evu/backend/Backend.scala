@@ -80,7 +80,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     fma.packBack.get := cvt.packedOut.get
   }
   val forwardingNames = Set("fp_fma", "fp_cmp", "fp_exp") ++
-    (if (vParams.extendedResultForwarding) Set("int", "fp_div", "fp_conv", "fp_xx8", "fp_mxfp") else Set.empty[String])
+    (if (vParams.extendedResultForwarding) Set("int", "fp_div", "fp_conv", "fp_xx8", "fp_mxfp", "fp_bf16") else Set.empty[String])
   val maxPipeDepth = flat_vxus.map(_.maxPipeDepth).max
 
   val vls = Module(new LoadSequencer)
@@ -1089,7 +1089,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   flat_vxus.foreach(_ => clearVat(false.B, 0.U))
 
   // Op classes decode FP funct6 values; integer/divider FU counters are separate.
-  val opClassPaths = Set("fp_fma", "fp_cmp", "fp_exp", "fp_xx8", "fp_mxfp")
+  val opClassPaths = Set("fp_fma", "fp_cmp", "fp_exp", "fp_xx8", "fp_mxfp", "fp_bf16")
   if (vParams.diagnosticCounters && xissParams.flatMap(_.seqs).exists(s => opClassPaths.contains(s.name))) {
     val fpSeqs = contextsByFu.zip(xissParams.flatMap(_.seqs)).collect {
       case (seqs, factory) if opClassPaths.contains(factory.name) => seqs
@@ -1130,7 +1130,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
         fpUnits.zip(fires).map { case (u, fire) => fire && u.io.iss.bits.head })))
       stat.issues := diagnosticCount(s"diag_${name}_issues", PopCount(VecInit(fires)))
       def elements(sew: Int): UInt = fpUnits.zip(fires).zip(laneCounts(sew - 1)).map { case ((u, fire), lanes) =>
-        val lowp = xiangshan.evu.EvuLowPrecision.backend(u.io.iss.bits.funct3, u.io.iss.bits.funct6)
+        val lowp = xiangshan.evu.EvuLowPrecision.backend(u.io.iss.bits.funct3, u.io.iss.bits.funct6, u.io.iss.bits.rs1)
         Mux(fire && Mux(lowp, (sew == 2).B, u.io.iss.bits.vd_eew === sew.U), lanes, 0.U)
       }.reduce(_ +& _)
       stat.elements16 := diagnosticCount(s"diag_${name}_elements16", elements(1))

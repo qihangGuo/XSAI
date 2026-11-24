@@ -6,96 +6,116 @@ import org.chipsalliance.cde.config.Parameters
 import xiangshan.evu.EvuLowPrecision
 import xiangshan.evu.common.VectorConsts
 import xiangshan.evu.insns._
-import yunsuan.VfcvtType
-import yunsuan.vector.VectorConvert.{CVT_mxfp, CVT_xx8}
+import yunsuan.vector.cvt.{ConvertFormat, ConvertParams, ConvertScale, GenericConvert, NativeBF16Convert}
 
-class LowPrecisionInstruction(function: Int, scaled: Boolean) extends VectorInstruction {
-  val props = Seq(F6(function.U(6.W)), F3(VectorConsts.OPIVV), SEW(2.U), SetsWMask.N) ++
-    (if (scaled) Seq(ReadsVS1.Y) else Seq(RS1(0.U(5.W))))
+class LowPrecisionInstruction(entry: EvuLowPrecision.Entry) extends VectorInstruction {
+  val props = Seq(F6(entry.funct6.U(6.W)), F3(VectorConsts.OPIVV), SEW(2.U), SetsWMask.N) ++
+    (if (entry.scaled) Seq(ReadsVS1.Y) else Seq(RS1(entry.subop.get.U(5.W))))
+}
+
+/** One layout adapter, three independent physical resources. Numeric latency is
+  * imported from the library, including the capture of io.iss. No result padding.
+  */
+object EvuConvertProvider {
+  val raw = ConvertParams(scales = Set(ConvertScale.Raw))
+  val mx = ConvertParams(formats = ConvertFormat.floats, scales = Set(ConvertScale.UE8M0))
+  def params(family: String): ConvertParams = if (family == "mx") mx else raw
+  def latency(family: String): Int =
+    if (family == "bf16") NativeBF16Convert.latency else GenericConvert.latency(params(family))
+  def instructions(family: String): Seq[VectorInstruction] =
+    EvuLowPrecision.entries.filter(_.family == family)
+      .map(e => new LowPrecisionInstruction(e).pipelined(latency(family)))
 }
 
 case object FPXX8Factory extends FunctionalUnitFactory {
-  def insns = (0x38 to 0x3b).map(function => new LowPrecisionInstruction(function, false).pipelined(2))
-  def generate(implicit parameters: Parameters) = new FPLowPrecisionFU(false)
+  def insns = EvuConvertProvider.instructions("raw")
+  def generate(implicit p: Parameters) = new FPLowPrecisionFU("raw")
 }
-
 case object FPMXFPFactory extends FunctionalUnitFactory {
-  def insns = (0x3c to 0x3d).map(function => new LowPrecisionInstruction(function, true).pipelined(2))
-  def generate(implicit parameters: Parameters) = new FPLowPrecisionFU(true)
+  def insns = EvuConvertProvider.instructions("mx")
+  def generate(implicit p: Parameters) = new FPLowPrecisionFU("mx")
+}
+case object FPBF16ConvertFactory extends FunctionalUnitFactory {
+  def insns = EvuConvertProvider.instructions("bf16")
+  def generate(implicit p: Parameters) = new FPLowPrecisionFU("bf16")
 }
 
-class E4M3ToF32 extends Module {
-  val io = IO(new Bundle {
-    val source = Input(UInt(8.W))
-    val result = Output(UInt(32.W))
-    val flags = Output(UInt(5.W))
-  })
-  val exponent = io.source(6, 3)
-  val fraction = io.source(2, 0)
-  val subnormal = MuxLookup(fraction, 0.U(31.W))((1 to 7).map { value =>
-    value.U -> (java.lang.Float.floatToRawIntBits(value.toFloat / 512.0f).toLong & 0x7fffffffL).U(31.W)
-  })
-  val normal = Cat((exponent +& 120.U)(7, 0), fraction, 0.U(20.W))
-  val nan = exponent.andR && fraction.andR
-  io.result := Mux(nan, "h7fc00000".U, Cat(io.source(7), Mux(exponent === 0.U, subnormal, normal)))
-  io.flags := 0.U
-}
-
-class FPLowPrecisionFU(mxfp: Boolean)(implicit parameters: Parameters) extends PipelinedFunctionalUnit(2) {
-  val packInput = Option.when(mxfp)(IO(Input(Valid(UInt(dLen.W)))))
-  val packResult = Option.when(mxfp)(IO(Output(UInt((dLen / 8 + 5).W))))
-  require(dLen % 32 == 0)
+class FPLowPrecisionFU(family: String)(implicit p: Parameters)
+    extends PipelinedFunctionalUnit(EvuConvertProvider.latency(family)) {
+  require(Set("raw", "mx", "bf16").contains(family))
+  require(dLen % 64 == 0)
+  val packInput = Option.when(family == "mx")(IO(Input(Valid(UInt(dLen.W)))))
+  val packResult = Option.when(family == "mx")(IO(Output(UInt((dLen / 8 + 5).W))))
+  val packing = packInput.map(_.valid).getOrElse(false.B)
+  // PACK follows the FMA result by exactly two edges and owns the input lane
+  // on that cycle. ExecutionUnit gates an ordinary issue with io.stall.
+  if (family == "mx") require(depth == 2, "PACK return must match the FMA reservation")
+  when(packing) { assert(!io.iss.valid, "PACK and ordinary MX conversion share one input") }
   val input = io.iss.op
-  val output = io.pipe(1)
+  val output = io.pipe(depth - 1)
   val count = dLen / 32
-  val inputOffset = (input.eidx << 3)(log2Ceil(dLen) - 1, 0)
-  val byteInput = input.rvs2_data >> inputOffset
+  val sourceBits = EvuLowPrecision.sourceBits(input.funct6, input.rs1)
+  // All instructions process DLEN/32 logical values. Packed inputs retain their
+  // actual bit offsets; FP4's eidx is a logical nibble index, never a byte index.
+  val sourceOffset = MuxLookup(sourceBits, input.eidx << 5)(Seq(
+    4.U -> (input.eidx << 2), 8.U -> (input.eidx << 3), 16.U -> (input.eidx << 4)))
+  val source = input.rvs2_data >> sourceOffset(log2Ceil(dLen) - 1, 0)
   val results = Wire(Vec(count, UInt(32.W)))
   val flags = Wire(Vec(count, UInt(5.W)))
   for (lane <- 0 until count) {
-    if (mxfp) {
-      val converter = Module(new CVT_mxfp)
-      converter.io.fire := io.iss.valid || packInput.get.valid
-      converter.io.src := Mux(packInput.get.valid, packInput.get.bits, input.rvs2_data)(32 * lane + 31, 32 * lane)
-      converter.io.factor := Mux(packInput.get.valid, 127.U, input.rvs1_data(7, 0))
-      converter.io.rm := 0.U
-      converter.io.isFp4 := packInput.get.valid || EvuLowPrecision.packed(input.funct6)
-      results(lane) := converter.io.result
-      flags(lane) := converter.io.fflags
+    val value = MuxLookup(sourceBits, source(32 * lane + 31, 32 * lane))(Seq(
+      4.U -> source(4 * lane + 3, 4 * lane),
+      8.U -> source(8 * lane + 7, 8 * lane),
+      16.U -> source(16 * lane + 15, 16 * lane)))
+    if (family == "bf16") {
+      val core = Module(new NativeBF16Convert)
+      require(core.latency == depth)
+      core.io.fire := io.iss.valid
+      core.io.src := value
+      core.io.narrow := !EvuLowPrecision.decode(input.funct6, input.rs1)
+      core.io.rm := 0.U
+      results(lane) := core.io.result
+      flags(lane) := core.io.fflags
     } else {
-      val converter = Module(new CVT_xx8)
-      val decoder = Module(new E4M3ToF32)
-      converter.io.fire := io.iss.valid
-      converter.io.src := input.rvs2_data(32 * lane + 31, 32 * lane)
-      converter.io.opType := MuxLookup(input.funct6, VfcvtType.vfncvtxx8_int8)(Seq(
-        0x39.U -> VfcvtType.vfncvtxx8_e4m3, 0x3a.U -> VfcvtType.vfncvtxx8_e5m2))
-      converter.io.rm := 0.U
-      decoder.io.source := byteInput(8 * lane + 7, 8 * lane)
-      val decodeResult = RegEnable(RegEnable(decoder.io.result, io.iss.valid), io.pipe(0).valid)
-      results(lane) := Mux(EvuLowPrecision.decode(output.bits.funct6), decodeResult, converter.io.result)
-      flags(lane) := Mux(EvuLowPrecision.decode(output.bits.funct6), 0.U, converter.io.fflags)
+      val core = Module(new GenericConvert(EvuConvertProvider.params(family)))
+      require(core.latency == depth)
+      core.io.fire := io.iss.valid || packing
+      core.io.src := packInput.map(port => Mux(port.valid,
+        port.bits(32 * lane + 31, 32 * lane), value)).getOrElse(value)
+      core.io.format := Mux(packing, ConvertFormat.E2M1.id.U,
+        EvuLowPrecision.format(input.funct6, input.rs1))
+      core.io.decode := !packing && EvuLowPrecision.decode(input.funct6, input.rs1)
+      core.io.scaled := (family == "mx").B
+      // UE8M0 127 is exactly scale 1, so PACK encodes the FMA product raw.
+      core.io.factor := Mux(packing, 127.U, input.rvs1_data(7, 0))
+      core.io.rm := 0.U
+      results(lane) := core.io.result
+      flags(lane) := core.io.fflags
     }
   }
   val active = VecInit((0 until count).map(lane => output.bits.eidx +& lane.U < output.bits.vl))
-  val decodeOutput = !mxfp.B && EvuLowPrecision.decode(output.bits.funct6)
-  val packOutput = mxfp.B && EvuLowPrecision.packed(output.bits.funct6)
-  val bytes = VecInit((0 until count).map(lane => Mux(active(lane), results(lane)(7, 0), 0.U(8.W)))).asUInt
-  val nibbles = VecInit((0 until count).map(lane => Mux(active(lane), results(lane)(3, 0), 0.U(4.W)))).asUInt
-  val byteMask = FillInterleaved(8, active.asUInt)
-  val pairMask = VecInit((0 until count / 2).map(pair => active(2 * pair) || active(2 * pair + 1)))
-  val destByte = Mux(packOutput, output.bits.eidx >> 1, output.bits.eidx)
-  val destShift = (destByte << 3)(log2Ceil(dLen) - 1, 0)
-  val narrowData = Mux(packOutput, nibbles.pad(dLen), bytes.pad(dLen))
-  val narrowMask = Mux(packOutput, FillInterleaved(8, pairMask.asUInt).pad(dLen), byteMask.pad(dLen))
+  val destinationBits = EvuLowPrecision.destinationBits(output.bits.funct6, output.bits.rs1)
+  def packedData(width: Int): UInt = VecInit((0 until count).map { lane =>
+    Mux(active(lane), results(lane)(width - 1, 0), 0.U(width.W))
+  }).asUInt.pad(dLen)
+  val data = MuxLookup(destinationBits, results.asUInt)(Seq(
+    4.U -> packedData(4), 8.U -> packedData(8), 16.U -> packedData(16)))
+  val pairs = VecInit((0 until count / 2).map(i => active(2 * i) || active(2 * i + 1)))
+  val mask = MuxLookup(destinationBits, FillInterleaved(32, active.asUInt))(Seq(
+    4.U -> FillInterleaved(8, pairs.asUInt).pad(dLen),
+    8.U -> FillInterleaved(8, active.asUInt).pad(dLen),
+    16.U -> FillInterleaved(16, active.asUInt).pad(dLen)))
+  val destOffset = MuxLookup(destinationBits, output.bits.eidx << 5)(Seq(
+    4.U -> (output.bits.eidx << 2), 8.U -> (output.bits.eidx << 3), 16.U -> (output.bits.eidx << 4)))
+  val shift = destOffset(log2Ceil(dLen) - 1, 0)
   io.write.valid := output.valid
   io.write.bits.eg := output.bits.wvd_eg
-  io.write.bits.data := Mux(decodeOutput, results.asUInt, (narrowData << destShift)(dLen - 1, 0))
-  io.write.bits.mask := Mux(decodeOutput, FillInterleaved(32, active.asUInt),
-    (narrowMask << destShift)(dLen - 1, 0))
+  io.write.bits.data := (data << shift)(dLen - 1, 0)
+  io.write.bits.mask := (mask << shift)(dLen - 1, 0)
   io.set_fflags.valid := output.valid
   io.set_fflags.bits := flags.zip(active).map { case (flag, enabled) => Mux(enabled, flag, 0.U) }.reduce(_ | _)
   io.set_vxsat := false.B
-  io.stall := packInput.map(_.valid).getOrElse(false.B)
+  io.stall := packing
   packResult.foreach(_ := Cat(flags.reduce(_ | _), VecInit(results.map(_(3,0))).asUInt))
   io.scalar_write.valid := false.B
   io.scalar_write.bits := DontCare

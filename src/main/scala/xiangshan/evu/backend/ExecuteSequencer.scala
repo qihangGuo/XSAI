@@ -84,7 +84,7 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   val rvdData = Option.when(!restrictedInteger)(Reg(UInt(dLen.W)))
   val rvmData = Option.when(!restrictedInteger)(Reg(UInt(dLen.W)))
   val inst  = Reg(new BackendIssueInst)
-  val lowPrecision = EvuLowPrecision.backend(inst.funct3, inst.funct6)
+  val lowPrecision = EvuLowPrecision.backend(inst.funct3, inst.funct6, inst.rs1)
   val blockMax = xiangshan.evu.EvuBlock.amax(inst.funct3, inst.funct6)
   val blockPack = xiangshan.evu.EvuBlock.pack(inst.funct3, inst.funct6)
   private val packCapable = !reductionOnly && dLen == 512 && supported_insns.exists(i =>
@@ -245,9 +245,9 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
     val dis_vs2_eew = WireInit((dis_inst.vconfig.vtype.vsew + dis_inst.wide_vs2)(1,0))
     val dis_vs3_eew = WireInit((dis_inst.vconfig.vtype.vsew + dis_inst.wide_vd)(1,0))
     val dis_vd_eew  = WireInit((dis_inst.vconfig.vtype.vsew + dis_inst.wide_vd)(1,0))
-    when(EvuLowPrecision.backend(dis_inst.funct3, dis_inst.funct6)) {
-      dis_vs2_eew := Mux(EvuLowPrecision.decode(dis_inst.funct6), 0.U, 2.U)
-      dis_vd_eew := Mux(EvuLowPrecision.decode(dis_inst.funct6), 2.U, 0.U)
+    when(EvuLowPrecision.backend(dis_inst.funct3, dis_inst.funct6, dis_inst.rs1)) {
+      dis_vs2_eew := EvuLowPrecision.sourceEew(dis_inst.funct6, dis_inst.rs1)
+      dis_vd_eew := EvuLowPrecision.destinationEew(dis_inst.funct6, dis_inst.rs1)
     }
     val dis_incr_eew = Seq(
       Mux(dis_inst.renv1, dis_vs1_eew, 0.U),
@@ -345,6 +345,9 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   io.seq_hazard.bits.wintent := hazardMultiply(wvd_mask)
   io.seq_hazard.bits.vat := inst.vat
 
+  val sourceIndex = Mux(lowPrecision && EvuLowPrecision.sourcePacked(inst.funct6, inst.rs1), eidx >> 1, eidx)
+  val nextSourceIndex = Mux(lowPrecision && EvuLowPrecision.sourcePacked(inst.funct6, inst.rs1), next_eidx >> 1, next_eidx)
+
   // Check the addressed EG directly instead of expanding four full-width masks.
   val sourceRaw = Seq((renv1, io.rvs1.req.bits.eg), (renv2, io.rvs2.req.bits.eg),
     (renvd, io.rvd.req.bits.eg), (renvm, io.rvm.req.bits.eg))
@@ -368,13 +371,16 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
       VecInit((0 until dLenB).map(b => b.U >= start && b.U < start +& count)).asUInt)
     def ordinaryMask(eew: UInt): UInt = byteRange((eidx << eew)(dLenOffBits - 1, 0),
       (next_eidx - eidx) << eew)
-    val source1 = Mux(lowPrecision && inst.funct6 >= 0x3c.U, byteRange(0.U, 1.U),
+    val source1 = Mux(lowPrecision && EvuLowPrecision.scaledBackend(inst.funct6, inst.rs1), byteRange(0.U, 1.U),
       Mux(inst.scalarVrfSource || acc_direct, byteRange(0.U, 4.U), ordinaryMask(vs1_eew)))
     val groupSlideSource = byteRange(Mux(slide_up, 0.U, slide_offset << vs2_eew),
       Mux(slide_up, inst.vconfig.vl - slide_offset, inst.vconfig.vl) << vs2_eew)
     val gatherSource = byteRange((rgather_eidx << vs2_eew)(dLenOffBits - 1, 0), 1.U << vs2_eew)
-    val source2 = Mux(group_slide, groupSlideSource,
-      Mux(rgather_ix, Mux(rgather_zero, 0.U, gatherSource), ordinaryMask(vs2_eew)))
+    val packedSourceMask = byteRange(sourceIndex(dLenOffBits - 1, 0),
+      ((next_eidx +& 1.U) >> 1) - (eidx >> 1))
+    val source2 = Mux(lowPrecision && EvuLowPrecision.sourcePacked(inst.funct6, inst.rs1), packedSourceMask,
+      Mux(group_slide, groupSlideSource,
+      Mux(rgather_ix, Mux(rgather_zero, 0.U, gatherSource), ordinaryMask(vs2_eew))))
     val masks = Seq(source1, source2, ordinaryMask(vs3_eew))
     for (i <- 0 until 3) {
       ports(i).eligible := eligible && enabled(i) && !captured(i)
@@ -396,7 +402,7 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   io.rvs2.req.bits.eg := Mux(rgather || rgatherei16,
     getEgId(inst.rs2, rgather_eidx, vs2_eew, false.B),
     getEgId(inst.rs2, Mux(blockPack, inst.rs1_data(6,5) << 4,
-      Mux(aligned_slide, slide_source_index, eidx)), vs2_eew, inst.reads_vs2_mask)
+      Mux(aligned_slide, slide_source_index, sourceIndex)), vs2_eew, inst.reads_vs2_mask)
   )
   io.rvd.req.bits.eg  := getEgId(inst.rd , eidx     , vs3_eew, false.B)
   io.rvm.req.bits.eg  := getEgId(0.U     , eidx     , 0.U    , true.B)
@@ -434,7 +440,7 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   // last input, accumulator merge, fold, masked or elementwise steps.
   val nextReads = Seq(
     getEgId(inst.rs1, next_eidx, vs1_eew, inst.reads_vs1_mask),
-    getEgId(inst.rs2, next_eidx, vs2_eew, inst.reads_vs2_mask),
+    getEgId(inst.rs2, nextSourceIndex, vs2_eew, inst.reads_vs2_mask),
     getEgId(inst.rd, next_eidx, vs3_eew, false.B))
   val enabledReads = Seq(renv1 && !inst.scalarVrfSource, renv2, renvd)
   val prefetchAllowed = io.iss.fire && !tail && !inst.reduction && !uses_perm && !elementwise &&
@@ -481,7 +487,7 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   exu_scheduler.io.reqs(0).fire := io.iss.fire
   exu_scheduler.io.reqs(0).depth := effective_pipe_stages
 
-  val destIndex = Mux(lowPrecision && EvuLowPrecision.packed(inst.funct6), eidx >> 1, eidx)
+  val destIndex = Mux(lowPrecision && EvuLowPrecision.packed(inst.funct6, inst.rs1), eidx >> 1, eidx)
   val wvd_eg = getEgId(inst.rd, Mux(inst.reduction || blockMax, 0.U, destIndex), vd_eew, inst.writes_mask)
   val read_slide_buffer = slide && !aligned_slide && !group_slide && Mux(slide_up,
     next_eidx > slide_offset,
@@ -642,7 +648,7 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
           val wvd_clr_mask = UIntToOH(io.iss.bits.wvd_eg)
           wvd_mask  := wvd_mask  & ~wvd_clr_mask
         }
-        when (next_is_new_eg(eidx, next_eidx, vs2_eew, inst.reads_vs2_mask) && !(inst.reduction && head) && !rgather_v && !rgatherei16 && !aligned_slide) {
+        when (next_is_new_eg(sourceIndex, nextSourceIndex, vs2_eew, inst.reads_vs2_mask) && !(inst.reduction && head) && !rgather_v && !rgatherei16 && !aligned_slide) {
           rvs2_mask := rvs2_mask & ~UIntToOH(io.rvs2.req.bits.eg)
         }
         when (rgather_ix) {

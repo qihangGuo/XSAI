@@ -27,7 +27,8 @@ object EvuCSRs {
   def capabilityValue(p: EvuParams): BigInt =
     BigInt(abiVersion) | (BigInt(7) << 16) |
       (BigInt(1) << 24) | // bit 25 is reserved after retirement of direct quantization
-      (BigInt(1) << 26) | (BigInt(1) << 27) | (BigInt(1) << 28) | (BigInt(1) << 29) |
+      (BigInt(1) << 26) | (BigInt(1) << 27) | (BigInt(1) << 28) |
+      EvuLowPrecision.entries.map(_.capabilityBit).distinct.map(bit => BigInt(1) << bit).reduce(_ | _) |
       (if (p.dlenBits == 512 && p.splitFpIssue && p.fp32MinMaxTree) BigInt(1) << 30 else BigInt(0))
 }
 

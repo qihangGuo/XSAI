@@ -72,6 +72,18 @@ object EvuOpcode {
   val CvtF32E4M3 = 0x73.U(8.W)
   val CvtMXFP8F32 = 0x74.U(8.W)
   val CvtMXFP4F32 = 0x75.U(8.W)
+  val CvtU8F32 = 0x27.U(8.W)
+  val CvtF32I8 = 0x28.U(8.W)
+  val CvtF32U8 = 0x29.U(8.W)
+  val CvtE2M1F32 = 0x2a.U(8.W)
+  val CvtF32E5M2 = 0x2b.U(8.W)
+  val CvtF32E2M1 = 0x2c.U(8.W)
+  val CvtBF16F32 = 0x2d.U(8.W)
+  val CvtF32BF16 = 0x2e.U(8.W)
+  val CvtMXE5M2F32 = 0x78.U(8.W)
+  val CvtF32MXE4M3 = 0x79.U(8.W)
+  val CvtF32MXE5M2 = 0x7a.U(8.W)
+  val CvtF32MXFP4 = 0x7b.U(8.W)
   // Retired fixed-point QuantToCute (0x4c) and SETCFG (0x4e) are reserved.
   // Retired VRF quantization opcode 0x4f remains reserved.
 }

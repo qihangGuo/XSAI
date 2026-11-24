@@ -28,8 +28,8 @@ object EvuOpClass {
       id := Mux(f6.isOneOf(OPFFunct6.fredusum, OPFFunct6.fredosum, OPFFunct6.fwredusum, OPFFunct6.fwredosum),
         11.U, Mux(f6 === OPFFunct6.fredmax, 12.U, 13.U))
     }
-    when(EvuLowPrecision.backend(op.funct3, op.funct6)) {
-      id := Mux(op.funct6 >= 0x3c.U, 15.U, 14.U)
+    when(EvuLowPrecision.backend(op.funct3, op.funct6, op.rs1)) {
+      id := Mux(EvuLowPrecision.scaledBackend(op.funct6, op.rs1), 15.U, 14.U)
     }
     id
   }
@@ -43,7 +43,7 @@ object EvuOpClass {
     val lowp = if (sew == 2) PopCount(VecInit((0 until op.wmask.getWidth / 4).map { lane =>
       op.eidx +& lane.U < op.vl
     })) else 0.U
-    Mux(EvuLowPrecision.backend(op.funct3, op.funct6), lowp, ordinary)
+    Mux(EvuLowPrecision.backend(op.funct3, op.funct6, op.rs1), lowp, ordinary)
   }
 }
 

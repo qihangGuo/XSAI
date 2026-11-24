@@ -159,7 +159,8 @@ object VXFunctionalUnitGroups {
     FPConvFactory,
     VFExp2Factory,
     FPXX8Factory,
-    FPMXFPFactory
+    FPMXFPFactory,
+    FPBF16ConvertFactory
   )
 
   def allFPFUs(fmaPipeDepth: Int, useScalarFPFMA: Boolean, segmentedFPFMA: Boolean,
@@ -189,7 +190,8 @@ object VectorIssueStructure {
         Seq(if (params.parallelFp32Div) SIMDFPDivSqrtFactory else FPDivSqrtFactory)))),
       VXIssuePathParams("fp_conv", params.vxissqEntries, Seq(VXSequencerParams("fp_conv", Seq(FPConvFactory)))),
       VXIssuePathParams("fp_xx8", params.vxissqEntries, Seq(VXSequencerParams("fp_xx8", Seq(FPXX8Factory)))),
-      VXIssuePathParams("fp_mxfp", params.vxissqEntries, Seq(VXSequencerParams("fp_mxfp", Seq(FPMXFPFactory))))
+      VXIssuePathParams("fp_mxfp", params.vxissqEntries, Seq(VXSequencerParams("fp_mxfp", Seq(FPMXFPFactory)))),
+      VXIssuePathParams("fp_bf16", params.vxissqEntries, Seq(VXSequencerParams("fp_bf16", Seq(FPBF16ConvertFactory))))
     )
   }
 

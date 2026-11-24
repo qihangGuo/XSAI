@@ -32,7 +32,8 @@ class EvuOwnerlessReductionSpec extends AnyFlatSpec with ChiselScalatestTester w
       interleaveReductions = true, fp32MinMaxTree = true, singleGroupMinMax = true,
       issStructure = VectorIssueStructure.SplitFP, vlissqEntries = 4, vpissqEntries = 4, vdqEntries = 4))
     test(LazyModule(new EvuInterleavedBackendShell(allowMinMax = true)).module)
-      .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      .withAnnotations(Seq(if (sys.env.get("EVU_TEST_VERILATOR").contains("1"))
+        VerilatorBackendAnnotation else TreadleBackendAnnotation)) { dut =>
         clear(dut.io.instruction.bits)
         dut.io.instruction.valid.poke(false.B)
         dut.io.load.valid.poke(false.B)
