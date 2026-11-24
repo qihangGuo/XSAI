@@ -80,12 +80,19 @@ class EvuDrainIO extends Bundle {
   val response = Flipped(Decoupled(new EvuDrainResult))
 }
 
+/** CPU-only identity; the ROB tag is not part of a command sent to the EVU. */
+class EvuRetiredCommand(p: EvuParams, tagWidth: Int) extends Bundle {
+  val command = new EvuCoreCommand(p)
+  val robTag = UInt(tagWidth.W)
+}
+
 /** CSR functional unit view. All completion/config events are non-speculative. */
-class EvuCSRCoreIO(p: EvuParams) extends Bundle {
+class EvuCSRCoreIO(p: EvuParams, tagWidth: Int) extends Bundle {
   val busy = Input(Bool())
   val drained = Input(Bool())
   val wantDrain = Output(Bool())
-  val accepted = Input(Valid(new EvuCoreCommand(p)))
+  val accepted = Input(Valid(new EvuRetiredCommand(p, tagWidth)))
+  val configPublished = Output(Valid(UInt(tagWidth.W)))
   val completed = Input(Valid(new EvuCompletion(p)))
   val drainResult = Input(Valid(new EvuDrainResult))
   val config = Output(new EvuExecutionConfig(p))

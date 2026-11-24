@@ -69,7 +69,7 @@ class EvuPackSlotSpec extends AnyFlatSpec with ChiselScalatestTester {
           dut.clock.step()
           if (consumed) responses.dequeue()
         }
-        def send(op: UInt, reg: Int, base: Int): Int = {
+        def send(op: UInt, reg: Int, base: Int, vl: Int = 16): Int = {
           val id = serial
           serial += 1
           val c = io.command.bits
@@ -78,7 +78,7 @@ class EvuPackSlotSpec extends AnyFlatSpec with ChiselScalatestTester {
           c.vs2.poke(4.U)
           c.vs1.poke(0.U)
           c.sew.poke(2.U)
-          c.vl.poke(16.U)
+          c.vl.poke(vl.U)
           c.base.poke(base.U)
           c.length.poke(64.U)
           c.stride.poke(0.S)
@@ -101,6 +101,8 @@ class EvuPackSlotSpec extends AnyFlatSpec with ChiselScalatestTester {
         send(EvuOpcode.Load, 4, input)
         send(EvuOpcode.Load, 12, desc)
         drain()
+        io.packDesc.issues.expect(0.U)
+        io.packDesc.sramReads.expect(0.U)
 
         // Each input becomes FP4 code 2 (1.0) or 4 (2.0), selected per slot.
         for (slot <- 0 until 8) pack(slot, slot)
@@ -109,6 +111,18 @@ class EvuPackSlotSpec extends AnyFlatSpec with ChiselScalatestTester {
         val line = (0 until 8).map(slot =>
           repeat(if (slot % 2 == 0) 0x22 else 0x44, 8, 8) << (64 * slot)).sum
         assert(memory(output) == line)
+        def checkDescriptors(expected: Int): Unit = {
+          val d = io.packDesc
+          d.issues.expect(expected.U)
+          d.captures.expect(expected.U)
+          val demand = d.demandReads.peek().litValue
+          val hints = d.prefetchReads.peek().litValue
+          val reads = d.sramReads.peek().litValue
+          assert(reads > 0 && reads >= demand.max(hints) && reads <= demand + hints)
+          val capturesFromDemand = BigInt(expected) - d.bypass.peek().litValue - d.prefetchUsed.peek().litValue
+          assert(capturesFromDemand >= 0 && capturesFromDemand <= demand * 2) // two ordinary FMA contexts can coalesce
+        }
+        checkDescriptors(8)
         val overlaps = io.packSlotIssues.peek().litValue
         assert(overlaps > 0 && io.packSlotCandidates.peek().litValue >= overlaps)
 
@@ -125,6 +139,17 @@ class EvuPackSlotSpec extends AnyFlatSpec with ChiselScalatestTester {
         val slotMask = ((BigInt(1) << 64) - 1) << 192
         assert(memory(output + 64) == ((initial & ~slotMask) | (repeat(0x22, 8, 8) << 192)))
         assert(memory(output + 128) == ((initial & ~slotMask) | (repeat(0x44, 8, 8) << 192)))
+        checkDescriptors(11)
+        send(EvuOpcode.FReduceSum, 16, 0, vl = 64)
+        drain()
+        io.sumStages(1).issues.expect(3.U)
+        io.sumStages(2).issues.expect(4.U)
+        assert(io.sumStages(2).feedback.peek().litValue > 0)
+        for (stage <- io.sumStages.drop(1)) {
+          stage.arbitrationLost.expect(0.U) // no competing work after drain
+          stage.ordinaryReadyOnIssue.expect(0.U)
+        }
+        checkDescriptors(11)
       }
   }
 }

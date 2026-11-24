@@ -94,7 +94,7 @@ class EvuConfigCSRSpec extends AnyFlatSpec with ChiselScalatestTester with Match
 
   it should "publish only accepted normalized config and restore complete EVCFG state" in {
     val ep = EvuParams()
-    test(new EvuCSR(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+    test(new EvuCSR(ep, 4)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
       def clear(x: Data): Unit = x match {
         case b: Bool => b.poke(false.B)
         case u: UInt => u.poke(0.U)
@@ -104,7 +104,7 @@ class EvuConfigCSRSpec extends AnyFlatSpec with ChiselScalatestTester with Match
       }
       clear(dut.io.write); clear(dut.io.accepted); clear(dut.io.completed); clear(dut.io.drain)
       dut.io.busy.poke(false.B)
-      val cmd = dut.io.accepted.bits
+      val cmd = dut.io.accepted.bits.command
       cmd.instr.poke(((BigInt(0x46) << 25) | (7 << 12) | 0xb).U)
       cmd.base.poke(13.U)
       cmd.config.valid.poke(true.B)

@@ -160,6 +160,14 @@ class RegisterReadXbar(n: Int, banks: Int)(implicit p: Parameters) extends CoreM
   }
 }
 
+// req.fire at the memory side is a bank grant; client.fire is a later capture.
+class VrfReadObservation(egBits: Int) extends Bundle {
+  val grant = Valid(UInt(egBits.W))
+  val speculative = Bool()
+  val prefetchUsed = Bool()
+  val scalarHit = Bool()
+}
+
 // Logical requests address one dLen-bit element group.
 class RegisterFileIO(
     reads: Seq[Int],
@@ -173,6 +181,7 @@ class RegisterFileIO(
     bypassPorts: Int = 0
 )(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams {
   val read = MixedVec(reads.map(rc => Vec(rc, Flipped(new VectorReadIO))))
+  val rs1Events = Option.when(vParams.diagnosticCounters)(Output(Vec(reads.head, new VrfReadObservation(log2Ceil(egsTotal)))))
   val mask_read = MixedVec(maskReads.map(rc => Vec(rc, Flipped(new VectorReadIO))))
   val pipe_write_reqs = Vec(pipeWrites, Flipped(new VectorPipeWriteReqIO(maxDepth)))
 
@@ -227,9 +236,10 @@ class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrit
   io.debug.foreach(_ := vrf.io.debug.get)
   val collectors = scala.collection.mutable.ArrayBuffer.empty[RegisterReadCollector]
   val scalarHits = scala.collection.mutable.ArrayBuffer.empty[Bool]
+  io.rs1Events.foreach(v => v := 0.U.asTypeOf(v))
 
   private def collect(client: VectorReadIO, memory: SramReadIO, prefetchIndex: Int = -1,
-      scalarIndex: Int = -1, bypassIndex: Int = -1): Unit = {
+      scalarIndex: Int = -1, bypassIndex: Int = -1, rs1Port: Int = -1): Unit = {
     val collector = Module(new RegisterReadCollector(vParams.vrfBanking))
     collectors += collector
     val scalarHit = WireInit(false.B)
@@ -250,6 +260,14 @@ class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrit
     client.req.ready := Mux(scalarHit, true.B, collector.io.client.req.ready)
     client.resp := Mux(scalarHit, scalarData.pad(dLen), collector.io.client.resp)
     collector.io.memory <> memory
+    if (rs1Port >= 0) io.rs1Events.foreach { events =>
+      val event = events(rs1Port)
+      event.grant.valid := collector.io.memory.req.fire
+      event.grant.bits := collector.io.memory.req.bits.eg
+      event.speculative := collector.io.memory.speculative
+      event.prefetchUsed := collector.io.prefetchUsed
+      event.scalarHit := client.req.fire && scalarHit
+    }
     collector.io.prefetch := 0.U.asTypeOf(collector.io.prefetch)
     if (prefetchIndex >= 0) { collector.io.prefetch := io.prefetch(prefetchIndex) }
   }
@@ -262,7 +280,7 @@ class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrit
       vrf.io.read(group)(port).speculative := false.B
     } else collect(io.read(group)(port), vrf.io.read(group)(port),
         prefetchPorts.indexOf((group, port)), scalarPorts.indexOf((group, port)),
-        bypassPorts.indexOf((group, port)))
+        bypassPorts.indexOf((group, port)), if (group == 0) port else -1)
   }
   for (group <- maskReads.indices; index <- 0 until maskReads(group)) {
     val client = io.mask_read(group)(index)

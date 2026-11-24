@@ -45,11 +45,32 @@ class EvuDispatchRequest(p: EvuParams) extends Bundle {
   val instr  = UInt(32.W)
   val base   = UInt(64.W)
   val vl     = UInt(log2Ceil(p.vlenBits + 1).W)
-  val length = UInt(32.W)
   val aux    = UInt(8.W)
-  val stride = SInt(32.W)
-  val chain  = Bool()
-  val pageMap = new EvuPageMap(p)
+  val pageMap = new Bundle {
+    val enabled = Bool()
+    val length = UInt(32.W)
+    val ppn = Vec(p.translationPages, UInt(52.W))
+  }
+}
+
+object EvuDispatchRequest {
+  def fromCore(cmd: EvuCoreCommand, fire: Bool, p: EvuParams): EvuDispatchRequest = {
+    val req = Wire(new EvuDispatchRequest(p))
+    req.pc := cmd.pc
+    req.config := cmd.config
+    req.instr := cmd.instr
+    req.base := cmd.base
+    req.vl := cmd.vl
+    req.aux := cmd.aux
+    req.pageMap.enabled := cmd.pageMap.enabled
+    req.pageMap.length := cmd.pageMap.length
+    req.pageMap.ppn := cmd.pageMap.ppn
+    when(fire) {
+      assert(cmd.length === p.vlenBytes.U, "Unexpected CPU dispatch length")
+      assert(!cmd.pageMap.enabled || cmd.pageMap.base === cmd.base, "Preflight checked a different base")
+    }
+    req
+  }
 }
 
 object EvuIsa {
@@ -289,14 +310,19 @@ class EvuDispatchAdapter(p: EvuParams) extends Module {
   io.out.bits.vs2    := instr(24, 20)(p.regIndexWidth - 1, 0)
   io.out.bits.vl     := buffered.bits.vl
   io.out.bits.base   := buffered.bits.base
-  io.out.bits.stride := buffered.bits.stride
-  io.out.bits.length := buffered.bits.length
+  io.out.bits.stride := 0.S
+  io.out.bits.length := p.vlenBytes.U
   io.out.bits.aux    := buffered.bits.aux |
     Mux(EvuIsa.isElementZero(rawF7), 0x40.U, 0.U) |
     Mux(EvuIsa.isScalarSource(rawF7), 0x20.U, 0.U)
   io.out.bits.write  := legal && opcode === EvuOpcode.Store
-  io.out.bits.chain  := buffered.bits.chain
+  io.out.bits.chain  := true.B
   io.out.bits.jobId  := 0.U
   io.out.bits.epoch  := 0.U
-  io.out.bits.pageMap := buffered.bits.pageMap
+  val pages = buffered.bits.pageMap
+  io.out.bits.pageMap.enabled := pages.enabled
+  // The translator only uses this address for an enabled map.
+  io.out.bits.pageMap.base := buffered.bits.base
+  io.out.bits.pageMap.length := pages.length
+  io.out.bits.pageMap.ppn := pages.ppn
 }

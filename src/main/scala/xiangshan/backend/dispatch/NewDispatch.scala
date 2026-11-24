@@ -103,6 +103,7 @@ class NewDispatch(implicit p: Parameters) extends XSModule with HasPerfEvents wi
     val toRenameAllFire = Output(Bool())
     // enq Rob
     val enqRob = Flipped(new RobEnqIO)
+    val demandWithoutRob = Output(Bool()) // Diagnostic only, before ROB backpressure.
     // IssueQueues
     val IQValidNumVec = Vec(exuNum, Input(UInt(maxIQSize.U.getWidth.W)))
     val toIssueQueues = Vec(IQEnqSum, DecoupledIO(new DynInst))
@@ -875,6 +876,9 @@ class NewDispatch(implicit p: Parameters) extends XSModule with HasPerfEvents wi
   // (1) resources are ready
   // (2) previous instructions are ready
   thisCanActualOut := VecInit((0 until RenameWidth).map(i => !blockedByWaitForward(i) && notBlockedByPrevious(i) && io.enqRob.canAccept))
+  io.demandWithoutRob := lsqCanAccept && fromRename.indices.map(i =>
+    fromRename(i).valid && allowDispatch(i) && !uopBlockByIQ(i) &&
+      !blockedByWaitForward(i) && notBlockedByPrevious(i)).reduce(_ || _)
   val thisActualOut = (0 until RenameWidth).map(i => io.enqRob.req(i).valid && io.enqRob.canAccept)
 
   // input for ROB, LSQ

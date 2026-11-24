@@ -16,9 +16,9 @@ import xiangshan.evu.common._
 import xiangshan.evu.frontend.VectorDispatcher
 import xiangshan.evu.mem.AddrGen
 
-/** Exercise the actual Saturn memory decoder and address generator without FP units. */
+/** Exercise the CPU command link and Saturn address generation without FP units. */
 class EvuSaturnAddressIO(ep: EvuParams) extends Bundle {
-    val command = Flipped(Decoupled(new EvuCommand(ep)))
+    val command = Flipped(Decoupled(new EvuCoreCommand(ep)))
     val request = Decoupled(new Bundle {
       val vaddr = UInt(64.W)
       val paddr = UInt(64.W)
@@ -55,19 +55,25 @@ class EvuSaturnAddressShellImp(outer: EvuSaturnAddressShell)(implicit p: Paramet
 
 class EvuSaturnAddressHarness(ep: EvuParams)(implicit p: Parameters) extends Module {
   val io = IO(new EvuSaturnAddressIO(ep))
+  val adapter = Module(new EvuDispatchAdapter(ep))
+  adapter.io.in.valid := io.command.valid
+  io.command.ready := adapter.io.in.ready
+  adapter.io.in.bits := EvuDispatchRequest.fromCore(io.command.bits, io.command.fire, ep)
+  adapter.io.flush := false.B
+  val cmd = adapter.io.out
   val dispatch = Module(new VectorDispatcher)
   val ops = Module(new Queue(new VectorMemMacroOp, 1))
   val addresses = Module(new AddrGen)
   val translate = Module(new EvuPageTranslate(ep))
   val pageMap = Reg(new EvuPageMap(ep))
-  when(io.command.fire) { pageMap := io.command.bits.pageMap }
-  dispatch.io.issue.valid := io.command.valid
-  io.command.ready := dispatch.io.issue.ready
+  when(cmd.fire) { pageMap := cmd.bits.pageMap }
+  dispatch.io.issue.valid := cmd.valid
+  cmd.ready := dispatch.io.issue.ready
   dispatch.io.issue.bits := 0.U.asTypeOf(dispatch.io.issue.bits)
-  dispatch.io.issue.bits.bits := EvuSaturnMemory.encode(io.command.bits)
-  dispatch.io.issue.bits.rs1_data := io.command.bits.base
-  dispatch.io.issue.bits.vconfig.vl := io.command.bits.vl
-  dispatch.io.issue.bits.vconfig.vtype.vsew := io.command.bits.sew
+  dispatch.io.issue.bits.bits := EvuSaturnMemory.encode(cmd.bits)
+  dispatch.io.issue.bits.rs1_data := cmd.bits.base
+  dispatch.io.issue.bits.vconfig.vl := cmd.bits.vl
+  dispatch.io.issue.bits.vconfig.vtype.vsew := cmd.bits.sew
   dispatch.io.issue.bits.mop := VectorConsts.mopUnit
   dispatch.io.dis.ready := true.B
   dispatch.io.scalar_resp.ready := true.B
@@ -115,18 +121,10 @@ class EvuSaturnAddressSpec extends AnyFlatSpec with ChiselScalatestTester with M
         partial <- (if (sew == 2) Seq(false, true) else Seq(false))) yield (store, sew, partial)
       for ((store, sew, partial) <- cases) {
         val base = BigInt("ffffffc040000fe0", 16) + (if (partial) 28 else 0)
-        dut.io.command.bits.vs1.poke(0.U)
-        dut.io.command.bits.vs2.poke(0.U)
-        dut.io.command.bits.stride.poke(0.S)
-        dut.io.command.bits.length.poke(64.U)
+        val f7 = if (store) 0x11 else 0x10
+        dut.io.command.bits.instr.poke(((BigInt(f7) << 25) | (sew << 12) | (3 << 7) | 0x0b).U)
+        dut.io.command.bits.length.poke(ep.vlenBytes.U)
         dut.io.command.bits.aux.poke(0.U)
-        dut.io.command.bits.write.poke(store.B)
-        dut.io.command.bits.chain.poke(false.B)
-        dut.io.command.bits.jobId.poke(0.U)
-        dut.io.command.bits.epoch.poke(0.U)
-        dut.io.command.bits.opcode.poke(if (store) EvuOpcode.Store else EvuOpcode.Load)
-        dut.io.command.bits.vd.poke(3.U)
-        dut.io.command.bits.sew.poke(sew.U)
         dut.io.command.bits.vl.poke((64 >> sew).U)
         dut.io.command.bits.base.poke(base.U)
         dut.io.command.bits.pageMap.enabled.poke(true.B)

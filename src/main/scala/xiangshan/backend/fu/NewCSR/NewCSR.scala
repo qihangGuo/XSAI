@@ -122,7 +122,7 @@ class NewCSR(implicit val p: Parameters) extends Module
   import CSRConfig._
 
   val io = IO(new Bundle {
-    val evu = new xiangshan.evu.EvuCSRCoreIO(p(ExternalVectorKey))
+    val evu = new xiangshan.evu.EvuCSRCoreIO(p(ExternalVectorKey), (new RobPtr).getWidth)
     val fromTop = Input(new Bundle {
       val hartId = UInt(hartIdLen.W)
       val clintTime = Input(ValidIO(UInt(64.W)))
@@ -337,7 +337,7 @@ class NewCSR(implicit val p: Parameters) extends Module
   dontTouch(gitCommitSHA)
   dontTouch(gitDirty)
 
-  private val evuBank = Option.when(p(ExternalVectorKey).enable)(Module(new EvuCSR(p(ExternalVectorKey))))
+  private val evuBank = Option.when(p(ExternalVectorKey).enable)(Module(new EvuCSR(p(ExternalVectorKey), (new RobPtr).getWidth)))
   private val evuPorts = evuBank.map { bank =>
     // Match the existing ROB -> CSR publication latency and DiffInstrCommit(delay=3).
     bank.io.accepted := RegNext(RegNext(io.evu.accepted, 0.U.asTypeOf(io.evu.accepted)),
@@ -346,6 +346,7 @@ class NewCSR(implicit val p: Parameters) extends Module
     bank.io.drain := io.evu.drainResult
     bank.io.busy := io.evu.busy
     io.evu.config := bank.io.config
+    io.evu.configPublished := bank.io.configPublished
     io.evu.configured := bank.io.configured
     io.evu.state := bank.io.state
     io.evu.permitted := !privState.isVirtual && bank.io.state =/= 0.U &&
@@ -360,6 +361,7 @@ class NewCSR(implicit val p: Parameters) extends Module
   }.getOrElse(SeqMap.empty[Int, (CSRAddrWriteBundle[OneFieldBundle], UInt)])
   if (!p(ExternalVectorKey).enable) {
     io.evu.config := 0.U.asTypeOf(io.evu.config)
+    io.evu.configPublished := 0.U.asTypeOf(io.evu.configPublished)
     io.evu.configured := false.B
     io.evu.state := 0.U
     io.evu.permitted := false.B

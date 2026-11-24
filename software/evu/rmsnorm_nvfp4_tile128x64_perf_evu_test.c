@@ -8,17 +8,16 @@
 #error "The optimized tile schedule requires the bank-aware register layout"
 #endif
 
-/* Keep each pair of squares and sums together at VL=64. The reduction
- * destinations may outlive the square scratch registers for the next pair. */
+/* Start the first two VL=64 reductions before loading the next pair. */
 #define PERF_SUM_FOUR(tile, r0, r1, r2, r3, s0, s1, s2, s3) do { \
   XV_LOAD(r0, &inputs[(16 * (tile) + (r0)) * COLS], 2); \
   XV_LOAD(r1, &inputs[(16 * (tile) + (r1)) * COLS], 2); \
-  XV_LOAD(r2, &inputs[(16 * (tile) + (r2)) * COLS], 2); \
-  XV_LOAD(r3, &inputs[(16 * (tile) + (r3)) * COLS], 2); \
   XV_FMUL(16, r0, r0, 2); \
   XV_FMUL(18, r1, r1, 2); \
   XV_FREDUCE_SUM(RN_BATCH_MAX_DEST(r0, s0), RN_QUANT_ZERO, 16, 2); \
   XV_FREDUCE_SUM(s1, RN_QUANT_ZERO, 18, 2); \
+  XV_LOAD(r2, &inputs[(16 * (tile) + (r2)) * COLS], 2); \
+  XV_LOAD(r3, &inputs[(16 * (tile) + (r3)) * COLS], 2); \
   XV_FMUL(19, r2, r2, 2); \
   XV_FMUL(20, r3, r3, 2); \
   XV_FREDUCE_SUM(s2, RN_QUANT_ZERO, 19, 2); \
@@ -55,7 +54,7 @@
 
 /* Enter at VL=16: gather one EG per reciprocal; row 0 already has v20.E0.
  * v22/v21/v30/v24 are free until quantization and span four first-EG banks. */
-#define PERF_NORMALIZE_EIGHT(r0, r1, r2, r3, r4, r5, r6, r7) do { \
+#define PERF_PREPARE_EIGHT(r0, r1, r2, r3, r4, r5, r6, r7) do { \
   RN_BATCH_ZERO(r0, (void)0, XV_GATHER_IMM(16, r0, 20, 2)); \
   XV_GATHER_IMM(18, r1, 20, 2); \
   XV_GATHER_IMM(19, r2, 20, 2); \
@@ -65,8 +64,6 @@
   XV_GATHER_IMM(30, r6, 20, 2); \
   XV_GATHER_IMM(24, r7, 20, 2); \
   (void)xv_setvli(COLS, 0x10); \
-  PERF_APPLY_FOUR(r0, r1, r2, r3, RN_BATCH_ZERO(r0, 20, 16), 18, 19, 23); \
-  PERF_APPLY_FOUR(r4, r5, r6, r7, 22, 21, 30, 24); \
 } while (0)
 
 /* BLOCK_PACK reads the positive reciprocal from bits 30:0; bit 31 keeps
@@ -160,17 +157,24 @@ static void perf_sum_rows(unsigned tile) {
 }
 
 static void perf_normalize_rows(void) {
-  PERF_NORMALIZE_EIGHT(0, 1, 2, 3, 4, 5, 6, 7);
+  PERF_PREPARE_EIGHT(0, 1, 2, 3, 4, 5, 6, 7);
+  PERF_APPLY_FOUR(0, 1, 2, 3, 20, 18, 19, 23);
+  PERF_APPLY_FOUR(4, 5, 6, 7, 22, 21, 30, 24);
   (void)xv_setvli(16, 0x10);
-  PERF_NORMALIZE_EIGHT(8, 9, 10, 11, 12, 13, 14, 15);
-}
+  PERF_PREPARE_EIGHT(8, 9, 10, 11, 12, 13, 14, 15);
+  PERF_APPLY_FOUR(8, 9, 10, 11, 16, 18, 19, 23);
 
-static void perf_quantize_rows(unsigned tile) {
-  /* Collect three independent batches at normalization's VL=64. */
+  /* Row 11 no longer needs v23's reciprocal. At VL=64 the first batch's
+   * maxima can now share the schedule with the last four rows' multiplies. */
   XV_BLOCK_AMAX(RN_QUANT_MAXIMA, 0, 0);
   XV_BLOCK_AMAX(RN_QUANT_MAXIMA, 1, 1);
   XV_BLOCK_AMAX(RN_QUANT_MAXIMA, 2, 2);
   XV_BLOCK_AMAX(RN_QUANT_MAXIMA, 3, 3);
+  PERF_APPLY_FOUR(12, 13, 14, 15, 22, 21, 30, 24);
+}
+
+static void perf_quantize_rows(unsigned tile) {
+  /* The first batch's maxima are already in v23. */
   XV_BLOCK_AMAX(19, 0, 4);
   XV_BLOCK_AMAX(19, 1, 5);
   XV_BLOCK_AMAX(19, 2, 6);
@@ -256,7 +260,7 @@ __attribute__((used, noinline)) static int rmsnorm_nvfp4_tile_perf_main(void) {
     const uint64_t end = read_cycle();
     if (end <= start || (XV_CSR_READ(XV_EVSTATUS) & 2) ||
         (XV_CSR_READ(XV_EFFLAGS) & 0x18)) return 1;
-    printf("[RN-PERF] rows=128 cols=64 stage=fused_nvfp4 schedule=pack_interleaved_amax12_frontload_sum2_collect8_norm8_vl65 sample=%u cycles=%lu\n",
+    printf("[RN-PERF] rows=128 cols=64 stage=fused_nvfp4 schedule=pack_interleaved_amax12_early4_load2_sum2_collect8_norm8_vl65 sample=%u cycles=%lu\n",
       sample, (unsigned long)(end - start));
   }
   return 0;

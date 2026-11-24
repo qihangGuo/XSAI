@@ -67,6 +67,7 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
     val hartId = Input(UInt(hartIdLen.W))
     val redirect = Input(Valid(new Redirect))
     val enq = new RobEnqIO
+    val dispatchDemandWithoutRob = Input(Bool())
     val flushOut = ValidIO(new Redirect)
     val exception = ValidIO(new ExceptionInfo)
     // exu + brq
@@ -145,7 +146,8 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
     val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuCompletion(p(ExternalVectorKey)))))
     val evuBusy = Output(Bool())
     val evuPreflightBusy = Output(Bool())
-    val evuRetired = Output(Valid(new xiangshan.evu.EvuCoreCommand(p(ExternalVectorKey))))
+    val evuRetired = Output(Valid(new xiangshan.evu.EvuRetiredCommand(p(ExternalVectorKey), (new RobPtr).getWidth)))
+    val evuConfigPublished = Input(Valid(UInt((new RobPtr).getWidth.W)))
     val evuStatus = Output(Valid(new EvuCompletion(p(ExternalVectorKey))))
   })
 
@@ -200,31 +202,26 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
    * Enqueue (from dispatch)
    */
   // special cases
-  private val backwardBarrier = Module(new RobEnqueueBarrier)
+  private val backwardBarrier = Module(new RobEnqueueBarrier((new RobPtr).getWidth))
   val hasBlockBackward = backwardBarrier.io.blocked
   val hasWaitForward = RegInit(false.B)
   val enqPtr = enqPtrVec(0)
   val deqPtr = deqPtrVec(0)
   val walkPtr = walkPtrVec(0)
   val allocatePtrVec = VecInit((0 until RenameWidth).map(i => enqPtrVec(PopCount(io.enq.req.take(i).map(req => req.valid && req.bits.firstUop)))))
+  val dispatchCapacity = allowEnqueueForDispatch && rab.io.canEnqForDispatch &&
+    vtypeBuffer.io.canEnqForDispatch && !io.fromVecExcpMod.busy &&
+    amuBuffer.map(_.io.canEnqueueForDispatch).getOrElse(true.B)
+  io.enq.canAcceptForDispatch := dispatchCapacity && !hasBlockBackward
   if (HasMatrixExtension) {
     io.enq.canAccept := (
         allowEnqueue && !hasBlockBackward && rab.io.canEnq && vtypeBuffer.io.canEnq
       && !io.fromVecExcpMod.busy && amuBuffer.get.io.canEnqueue
     )
-    io.enq.canAcceptForDispatch := (
-        allowEnqueueForDispatch && !hasBlockBackward && rab.io.canEnqForDispatch
-      && vtypeBuffer.io.canEnqForDispatch && !io.fromVecExcpMod.busy
-      && amuBuffer.get.io.canEnqueueForDispatch
-    )
   } else {
     io.enq.canAccept := (
         allowEnqueue && !hasBlockBackward && rab.io.canEnq && vtypeBuffer.io.canEnq
       && !io.fromVecExcpMod.busy
-    )
-    io.enq.canAcceptForDispatch := (
-        allowEnqueueForDispatch && !hasBlockBackward && rab.io.canEnqForDispatch
-      && vtypeBuffer.io.canEnqForDispatch && !io.fromVecExcpMod.busy
     )
   }
   io.enq.resp := allocatePtrVec
@@ -453,9 +450,11 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
 
   // Ordinary EVU memory has already passed non-speculative preflight when it
   // retires. Let the next command enter while its external Ack is outstanding.
-  // FENCE, configuration and other backward barriers still drain EVU.
+  // A SETVLI can also release after its own legal configuration is visible.
   backwardBarrier.io.robEmpty := isEmpty
   backwardBarrier.io.evuBusy := amuBuffer.map(_.io.evuBusy).getOrElse(false.B)
+  backwardBarrier.io.configPublished := io.evuConfigPublished
+  backwardBarrier.io.cancel := io.redirect.valid || io.flushOut.valid
   // When any instruction commits, hasNoSpecExec should be set to false.B
   when(io.commits.hasWalkInstr || io.commits.hasCommitInstr) {
     hasWaitForward := false.B
@@ -516,16 +515,45 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
 
   backwardBarrier.io.enqueue.valid := false.B
   backwardBarrier.io.enqueue.bits := false.B
+  val enqueuingSetvliBarrier = WireInit(false.B)
+  backwardBarrier.io.setvliOwner.valid := enqueuingSetvliBarrier
+  backwardBarrier.io.setvliOwner.bits := 0.U
   for (i <- 0 until RenameWidth) {
     val enqUop = io.enq.req(i)
     when(enqUop.valid && enqUop.bits.blockBackward && io.enq.canAccept) {
       backwardBarrier.io.enqueue.valid := true.B
       val f7 = enqUop.bits.instr(31, 25)
+      enqueuingSetvliBarrier := enqUop.bits.fuType === FuType.evu.U && f7 === xiangshan.evu.EvuIsa.setvli
+      backwardBarrier.io.setvliOwner.bits := allocatePtrVec(i).asUInt
       val ordinaryEvuMemory = p(ExternalVectorKey).enable.B &&
         enqUop.bits.fuType === FuType.evu.U &&
         (xiangshan.evu.EvuIsa.isLoad(f7) || xiangshan.evu.EvuIsa.isStore(f7))
       backwardBarrier.io.enqueue.bits := ordinaryEvuMemory
     }
+  }
+  if (p(ExternalVectorKey).enable) {
+    val demanded = io.dispatchDemandWithoutRob && dispatchCapacity && state === s_idle && !io.redirect.valid && !io.flushOut.valid
+    val event = SetvliBarrierEvents(backwardBarrier.io.enqueue.valid, enqueuingSetvliBarrier,
+      hasBlockBackward, demanded, isEmpty, backwardBarrier.io.evuBusy)
+    XSPerfAccumulate("evu_setvli_barriers", backwardBarrier.io.enqueue.valid && enqueuingSetvliBarrier)
+    XSPerfAccumulate("evu_setvli_rob_nonempty_demand_cycles", event.nonempty)
+    XSPerfAccumulate("evu_setvli_drain_only_cycles", event.drainOnly)
+    // No younger command can enter while the SETVLI owns the barrier.
+    amuBuffer.foreach { buffer =>
+      val work = buffer.io.evuDrainWork.get
+      XSPerfAccumulate("evu_setvli_drain_older_only_cycles", event.drainOnly && !work.setvliOrStatus)
+      XSPerfAccumulate("evu_setvli_drain_overlap_cycles", event.drainOnly && work.nonSetvli && work.setvliOrStatus)
+      XSPerfAccumulate("evu_setvli_drain_config_status_only_cycles", event.drainOnly && !work.nonSetvli)
+    }
+    XSPerfAccumulate("evu_setvli_release_demand_cycles", event.release)
+    val early = backwardBarrier.io.releasedWhileBusy
+    val awaitingEnqueue = RegInit(false.B)
+    val entered = io.enq.canAccept && io.enq.req.map(_.valid).reduce(_ || _) &&
+      !backwardBarrier.io.cancel && state === s_idle
+    when(early) { awaitingEnqueue := true.B }
+    when(entered || backwardBarrier.io.cancel || !backwardBarrier.io.evuBusy) { awaitingEnqueue := false.B }
+    XSPerfAccumulate("evu_setvli_published_early_releases", early)
+    XSPerfAccumulate("evu_setvli_first_younger_enq_while_busy", awaitingEnqueue && entered && backwardBarrier.io.evuBusy)
   }
 
   val dispatchNum = Mux(io.enq.canAccept, PopCount(io.enq.req.map(req => req.valid && req.bits.firstUop)), 0.U)

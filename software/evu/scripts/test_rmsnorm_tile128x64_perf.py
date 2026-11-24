@@ -5,13 +5,12 @@ import ast
 import math
 import random
 import re
-import struct
 import subprocess
 import unittest
 
 import test_rmsnorm_fused_profile as fused
 import test_rmsnorm_tile128x64 as checked
-from test_rmsnorm_batch_schedule import LEVELS4, encode, bits, floating, fp32, integer, scalar_quantize
+from test_rmsnorm_batch_schedule import bits, floating, fp32, integer, scalar_quantize
 
 
 SOURCE = fused.SOFTWARE / 'rmsnorm_nvfp4_tile128x64_perf_evu_test.c'
@@ -20,28 +19,7 @@ CHECKED = fused.SOFTWARE / 'rmsnorm_nvfp4_tile128x64_evu_test.c'
 
 class PerfTileMachine(checked.TileMachine):
     def execute(self, operation, *args):
-        if operation == 'XV_FSGNJX':
-            dest, sign, src, _ = map(integer, args)
-            self.put_words(dest, [a ^ (b & 0x80000000) for a, b in
-                                  zip(self.words(src)[:self.vl], self.words(sign))])
-        elif operation == 'XV_BLOCK_AMAX':
-            dest, quarter, src = map(integer, args)
-            assert self.vl == 64
-            for group in range(4):
-                values = self.words(src)[16 * group:16 * (group + 1)]
-                struct.pack_into('<I', self.registers[dest], quarter * 16 + group * 4,
-                                 bits(max(abs(floating(word)) for word in values)))
-        elif operation == 'XV_BLOCK_PACK':
-            dest, src, desc, group, index = map(integer, args)
-            assert self.vl == 16
-            word = self.words(desc)[index]
-            inv = floating(word & 0x7fffffff)
-            products = [fp32(floating(x) * inv) if word >> 31 else 0.0 for x in
-                        self.words(src)[group * 16:(group + 1) * 16]]
-            codes = [encode(abs(x), LEVELS4) | ((bits(x) >> 31) << 3) for x in products]
-            off = (index & 7) * 8
-            self.registers[dest][off:off + 8] = bytes(codes[i] | codes[i+1] << 4 for i in range(0, 16, 2))
-        elif operation == 'XV_FADD_SCALAR':
+        if operation == 'XV_FADD_SCALAR':
             dest, first, second = map(integer, args)
             scalar = floating(self.words(first)[0])
             self.put_words(dest, [bits(fp32(floating(word) + scalar))
@@ -70,6 +48,7 @@ class Tile128x64PerfTest(unittest.TestCase):
         # -fsyntax-only does not invoke the assembler; check actual stringified operands.
         encoded = list(instructions(result.stdout))
         self.assertGreater(len(encoded), 100)
+        self.assertFalse(any(int(fields[2], 0) in (0x76, 0x77) for fields in encoded))
         for fields in encoded:
             self.assertEqual(len(fields), 6, fields)
             for operand in fields[3:]:
@@ -112,7 +91,8 @@ class Tile128x64PerfTest(unittest.TestCase):
         self.assertEqual(driver.count('execute_perf_tile();'), 1)
         self.assertEqual(source.count('printf('), 1)
         self.assertIn('[RN-PERF] rows=128 cols=64', driver)
-        self.assertIn('schedule=pack_interleaved_amax12_frontload_sum2_collect8_norm8_vl65 ', driver)
+        self.assertIn('schedule=discrete_amax_pack_interleaved_sum2_collect8_norm8_vl65 ', driver)
+        self.assertNotIn('XV_CAP_BLOCK_QUANT', driver)
         self.assertIn('cycles=%lu', driver)
         self.assertNotIn('instructions=', driver)
         self.assertNotIn('PASS', driver)
@@ -145,10 +125,11 @@ class Tile128x64PerfTest(unittest.TestCase):
         normalize = trace['perf_normalize_rows']
         self.assertEqual([op[1] for op in normalize if op[0] == 'xv_setvli'],
                          ['COLS', '16', 'COLS'])
-        apply_eight = (['XV_FMUL_SCALAR'] * 4 + ['XV_FMUL'] * 4) * 2
+        apply_four = ['XV_FMUL_SCALAR'] * 4 + ['XV_FMUL'] * 4
         self.assertEqual([op[0] for op in normalize],
-                         ['XV_GATHER_IMM'] * 7 + ['xv_setvli'] + apply_eight +
-                         ['xv_setvli'] + ['XV_GATHER_IMM'] * 8 + ['xv_setvli'] + apply_eight)
+                         ['XV_GATHER_IMM'] * 7 + ['xv_setvli'] + apply_four * 2 +
+                         ['xv_setvli'] + ['XV_GATHER_IMM'] * 8 + ['xv_setvli'] +
+                         apply_four * 2)
         sums = [(op[0], integer(op[3])) for op in trace['perf_sum_rows']
                 if op[0] in ('XV_FMUL', 'XV_FREDUCE_SUM')]
         self.assertEqual(sums, [
@@ -158,14 +139,20 @@ class Tile128x64PerfTest(unittest.TestCase):
                             ('XV_FMUL', row + 2), ('XV_FMUL', row + 3),
                             ('XV_FREDUCE_SUM', 19), ('XV_FREDUCE_SUM', 20))])
         quant = trace['perf_quantize_rows']
-        self.assertEqual(quant[:12], [('XV_BLOCK_AMAX', dest, str(i), str(base + i))
-                                     for base, dest in ((0, '23'), (4, '19'), (8, '22'))
-                                     for i in range(4)])
-        self.assertEqual(quant[12], ('xv_setvli', '16', '0x10'))
-        self.assertFalse(any(op[0] in ('xv_setvli', 'XV_BLOCK_AMAX') for op in quant[13:]))
-        slots = [(integer(op[1]), integer(op[5])) for op in quant if op[0] == 'XV_BLOCK_PACK']
-        self.assertEqual(slots, [(dest, index) for _ in range(4) for slot in range(8)
-                                 for dest, index in ((30, slot), (27, 8 + slot))])
+        self.assertEqual(quant[:2], [('xv_setvli', '16', '0x10'),
+                                     ('XV_LOAD_E0', '22', '&quant_integers[1]')])
+        self.assertFalse(any(op[0] == 'xv_setvli' for op in quant[2:]))
+        # Checkpoint interleave: each packed line contains eight blocks. The
+        # next batch's maxima advance while the middle pair of lines is packed.
+        maxima = converted = 0
+        at_store = []
+        for op in quant:
+            maxima += op[0] == 'XV_FREDUCE_MAX'
+            converted += op[0] == 'XV_CVT_MXFP4_F32'
+            if op[0] == 'XV_STORE' and '&packed.data' in op[2]:
+                at_store.append((maxima, converted))
+        self.assertEqual(at_store, [(32, 8), (32, 16), (56, 24), (64, 32),
+                                    (64, 40), (64, 48), (64, 56), (64, 64)])
         generator = random.Random(1286402)
         random_values = [fp32(generator.uniform(-3, 3)) for _ in range(8192)]
         for row in (0, 3, 4, 15, 16, 63, 64, 127):
@@ -229,14 +216,13 @@ class Tile128x64PerfTest(unittest.TestCase):
                 self.assertEqual(len(machine.written['packed']), 4096)
                 self.assertEqual(len(machine.written['scales']), 512)
                 counts = Counter(event[0] for event in events)
-                self.assertEqual(counts['XV_BLOCK_PACK'], 512)
-                self.assertEqual(counts['XV_BLOCK_AMAX'], 96)
-                self.assertEqual(counts['XV_FABS'], 128)
-                self.assertEqual(counts['XV_FREDUCE_MAX'], 128)
-                self.assertEqual(len(events) + 1, 2583)  # Include the final EVU FENCE.
-                self.assertEqual(counts['XV_FSGNJX'], 32)
+                self.assertEqual(counts['XV_BLOCK_PACK'], 0)
+                self.assertEqual(counts['XV_BLOCK_AMAX'], 0)
+                self.assertEqual(counts['XV_FABS'], 512)
+                self.assertEqual(counts['XV_FREDUCE_MAX'], 512)
+                self.assertEqual(len(events) + 1, 6791)  # Include the final EVU FENCE.
                 self.assertEqual(counts['xv_setvli'], 65)
-                self.assertEqual(counts['XV_CVT_MXFP4_F32'], 0)
+                self.assertEqual(counts['XV_CVT_MXFP4_F32'], 512)
                 self.assertEqual(counts['XV_LOAD'], 136)
                 self.assertEqual(counts['XV_FSQRT'], 8)
                 self.assertEqual(counts['XV_FDIV'], 104)

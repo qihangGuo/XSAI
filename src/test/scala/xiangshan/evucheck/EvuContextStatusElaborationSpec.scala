@@ -38,7 +38,7 @@ class EvuContextStatusElaborationSpec extends AnyFlatSpec with Matchers {
   it should "elaborate every EVU CSR read and snapshot word" in {
     val p = parameters(enableEvu = true)
     // Covers Bool-valued vxsat and configured as well as the other CSR words.
-    val circuit = ChiselStage.emitCHIRRTL(new EvuCSR(p(ExternalVectorKey)))
+    val circuit = ChiselStage.emitCHIRRTL(new EvuCSR(p(ExternalVectorKey), 4))
     circuit should include ("module EvuCSR")
   }
 }

@@ -688,6 +688,7 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
 
   csrio.evu.busy := ctrlBlock.io.evuBusy
   csrio.evu.accepted := ctrlBlock.io.evuRetired
+  ctrlBlock.io.evuConfigPublished := csrio.evu.configPublished
   csrio.evu.completed := ctrlBlock.io.evuStatus
   csrio.evu.drained := false.B
   csrio.evu.drainResult := 0.U.asTypeOf(csrio.evu.drainResult)

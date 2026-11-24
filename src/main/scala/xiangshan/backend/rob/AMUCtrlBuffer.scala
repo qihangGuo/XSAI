@@ -30,9 +30,13 @@ class AmuCtrlBufferIO()(implicit val p: Parameters, val params: BackendParams) e
   val canEnqueue = Output(Bool())
   val canEnqueueForDispatch = Output(Bool())
   val evuBusy = Output(Bool())
+  val evuDrainWork = Option.when(p(ExternalVectorKey).enable)(Output(new Bundle {
+    val nonSetvli = Bool()
+    val setvliOrStatus = Bool()
+  }))
   val evuCommittedBusy = Output(Bool())
   val evuPreflightBusy = Output(Bool())
-  val evuRetired = Output(Valid(new EvuCoreCommand(p(ExternalVectorKey))))
+  val evuRetired = Output(Valid(new xiangshan.evu.EvuRetiredCommand(p(ExternalVectorKey), (new RobPtr).getWidth)))
 
   // rob wb
   val wb = Flipped(params.genWrite2CtrlBundles)
@@ -312,7 +316,8 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
     deq.valid && entry.needAMU && entry.writebacked && entry.amuCtrl.evu
   }
   io.evuRetired.valid := retiringEvu.reduce(_ || _)
-  io.evuRetired.bits := PriorityMux(retiringEvu.zip(io.deqCommit.zipWithIndex.map { case (deq, i) =>
+  io.evuRetired.bits.robTag := PriorityMux(retiringEvu.zip(io.deqCommit.map(_.ptr.asUInt)))
+  io.evuRetired.bits.command := PriorityMux(retiringEvu.zip(io.deqCommit.zipWithIndex.map { case (deq, i) =>
     val entry = amuCtrlEntries(deq.ptr.value)
     // CSR retirement consumes instruction/config identity, never translations.
     expandControl(entry, 0.U.asTypeOf(new EvuPageMap(p(ExternalVectorKey)))).data
@@ -470,9 +475,16 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
 
   // A retired FENCE must keep dispatch blocked through the ROB ->
   // backend -> CSR status pipeline as well as through the final write Ack.
-  io.evuBusy := amuCtrlEntries.map(e =>
+  val busyEntries = amuCtrlEntries.map(e =>
     e.valid && e.needAMU && e.writebacked && e.amuCtrl.evu && !e.canDeq
-  ).reduce(_ || _) || statusDrain.orR
+  )
+  io.evuBusy := busyEntries.reduce(_ || _) || statusDrain.orR
+  io.evuDrainWork.foreach { work =>
+    val setvli = amuCtrlEntries.map(_.amuCtrl.data.asTypeOf(new EvuCoreCommandData(p(ExternalVectorKey)))
+      .instr(31, 25) === xiangshan.evu.EvuIsa.setvli)
+    work.nonSetvli := busyEntries.zip(setvli).map { case (b, s) => b && !s }.reduce(_ || _)
+    work.setvliOrStatus := statusDrain.orR || busyEntries.zip(setvli).map { case (b, s) => b && s }.reduce(_ || _)
+  }
   // A faulting scalar EVU instruction has not committed and must never wait
   // for its own nonexistent external completion before taking the trap.
   io.evuCommittedBusy := amuCtrlEntries.map(e =>

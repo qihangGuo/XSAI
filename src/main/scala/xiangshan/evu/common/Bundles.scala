@@ -402,6 +402,7 @@ class EvuExecutionPerf extends Bundle {
   val earlyOperandReads = UInt(64.W)
   val packSlotCandidates = UInt(64.W)
   val packSlotIssues = UInt(64.W)
+  val packDesc = new EvuPackDescPerf
   val reductionPrefetches = UInt(64.W)
   val byFu = Vec(EvuFuPerf.names.size, new EvuFuPerf)
   val byOp = Vec(EvuOpClass.names.size, new EvuOpPerf)

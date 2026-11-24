@@ -51,12 +51,8 @@ class EvuDispatchAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with
     dut.io.in.bits.instr.poke(instr.U)
     dut.io.in.bits.base.poke("h123456789abcdef0".U)
     dut.io.in.bits.vl.poke(128.U)
-    dut.io.in.bits.length.poke(512.U)
     dut.io.in.bits.aux.poke(0.U)
-    dut.io.in.bits.stride.poke(-16.S)
-    dut.io.in.bits.chain.poke(true.B)
-    dut.io.in.bits.pageMap.enabled.poke(true.B)
-    dut.io.in.bits.pageMap.base.poke("h40000ffc".U)
+    dut.io.in.bits.pageMap.enabled.poke(Set(0x10, 0x11, 0x52, 0x53).contains(funct7).B)
     dut.io.in.bits.pageMap.length.poke(512.U)
     for (i <- 0 until ep.translationPages) dut.io.in.bits.pageMap.ppn(i).poke((0x80000 + i * 0x10000).U)
     dut.io.in.valid.poke(true.B)
@@ -73,17 +69,13 @@ class EvuDispatchAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with
     dut.io.in.bits.pc.poke((BigInt(0x80000000L) + 4 * tag).U)
     dut.io.in.bits.base.poke((BigInt(0x10000000L) + 64 * tag).U)
     dut.io.in.bits.vl.poke((16 + tag).U)
-    dut.io.in.bits.length.poke((64 + 4 * tag).U)
     dut.io.in.bits.aux.poke((tag & 31).U)
-    dut.io.in.bits.stride.poke((tag - 16).S)
-    dut.io.in.bits.chain.poke((tag % 3 == 0).B)
     dut.io.in.bits.config.valid.poke(true.B)
     dut.io.in.bits.config.configured.poke((tag % 2 == 0).B)
     dut.io.in.bits.config.vl.poke((128 - tag).U)
     dut.io.in.bits.config.vtype.poke((tag & 255).U)
     dut.io.in.bits.config.vill.poke((tag % 5 == 0).B)
     dut.io.in.bits.pageMap.enabled.poke((tag % 2 == 1).B)
-    dut.io.in.bits.pageMap.base.poke((BigInt(0x40000000L) + 4096 * tag).U)
     dut.io.in.bits.pageMap.length.poke((512 + tag).U)
     for (i <- 0 until ep.translationPages) {
       dut.io.in.bits.pageMap.ppn(i).poke((0x80000 + 16 * tag + i).U)
@@ -102,10 +94,10 @@ class EvuDispatchAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with
     dut.io.out.bits.pc.expect((BigInt(0x80000000L) + 4 * tag).U)
     dut.io.out.bits.base.expect((BigInt(0x10000000L) + 64 * tag).U)
     dut.io.out.bits.vl.expect((16 + tag).U)
-    dut.io.out.bits.length.expect((64 + 4 * tag).U)
+    dut.io.out.bits.length.expect(ep.vlenBytes.U)
     dut.io.out.bits.aux.expect((tag & 31).U)
-    dut.io.out.bits.stride.expect((tag - 16).S)
-    dut.io.out.bits.chain.expect((tag % 3 == 0).B)
+    dut.io.out.bits.stride.expect(0.S)
+    dut.io.out.bits.chain.expect(true.B)
     dut.io.out.bits.write.expect(store.B)
     dut.io.out.bits.config.valid.expect(true.B)
     dut.io.out.bits.config.configured.expect((tag % 2 == 0).B)
@@ -113,7 +105,7 @@ class EvuDispatchAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with
     dut.io.out.bits.config.vtype.expect((tag & 255).U)
     dut.io.out.bits.config.vill.expect((tag % 5 == 0).B)
     dut.io.out.bits.pageMap.enabled.expect((tag % 2 == 1).B)
-    dut.io.out.bits.pageMap.base.expect((BigInt(0x40000000L) + 4096 * tag).U)
+    if (store) dut.io.out.bits.pageMap.base.expect((BigInt(0x10000000L) + 64 * tag).U)
     dut.io.out.bits.pageMap.length.expect((512 + tag).U)
     for (i <- 0 until ep.translationPages) {
       dut.io.out.bits.pageMap.ppn(i).expect((0x80000 + 16 * tag + i).U)
@@ -232,9 +224,9 @@ class EvuDispatchAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with
           dut.io.out.bits.base.expect("h123456789abcdef0".U)
           dut.io.out.bits.vl.expect(128.U)
           dut.io.out.bits.length.expect(512.U)
-          dut.io.out.bits.stride.expect(-16.S)
+          dut.io.out.bits.stride.expect(0.S)
           dut.io.out.bits.chain.expect(true.B)
-          dut.io.out.bits.pageMap.enabled.expect(true.B)
+          dut.io.out.bits.pageMap.enabled.expect((funct7 == 0x10 || funct7 == 0x11).B)
           dut.io.out.bits.pageMap.ppn(1).expect("h90000".U)
           dut.io.out.bits.write.expect((funct7 == 0x11).B)
           dut.clock.step()
@@ -243,6 +235,45 @@ class EvuDispatchAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with
         dut.clock.step()
         dut.io.out.ready.poke(false.B)
       }
+    }
+  }
+
+  it should "keep PACK controls, E0 ranges and zero-length loads distinct in the ingress queue" in {
+    test(new EvuDispatchAdapter(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      initialize(dut)
+      def enqueue(f7: Int, base: BigInt, vl: Int, length: Int): Unit = {
+        dut.io.in.bits.instr.poke(((BigInt(f7) << 25) | (2 << 12) | 0x0b).U)
+        dut.io.in.bits.base.poke(base.U)
+        dut.io.in.bits.vl.poke(vl.U)
+        dut.io.in.bits.aux.poke(0.U)
+        dut.io.in.bits.pageMap.enabled.poke((length != 0).B)
+        dut.io.in.bits.pageMap.length.poke(length.U)
+        dut.io.in.valid.poke(true.B)
+        dut.io.in.ready.expect(true.B)
+        dut.clock.step()
+        dut.io.in.valid.poke(false.B)
+      }
+      val addr = BigInt("ffffffc040000ffc", 16)
+      enqueue(0x77, 0x2949, 16, 0)
+      enqueue(0x52, addr, 64, 4)
+      dut.clock.step(3)
+      dut.io.out.valid.expect(true.B)
+      dut.io.out.bits.opcode.expect(EvuBlock.Pack)
+      dut.io.out.bits.base.expect(0x2949.U)
+      dut.io.out.bits.pageMap.enabled.expect(false.B)
+      dut.io.out.ready.poke(true.B)
+      dut.clock.step()
+      dut.io.out.bits.opcode.expect(EvuOpcode.Load)
+      dut.io.out.bits.pageMap.enabled.expect(true.B)
+      dut.io.out.bits.pageMap.base.expect(addr.U)
+      dut.io.out.bits.pageMap.length.expect(4.U)
+      dut.io.out.bits.length.expect(ep.vlenBytes.U)
+      enqueue(0x10, addr + 4, 0, 0)
+      dut.io.out.valid.expect(true.B)
+      dut.io.out.bits.opcode.expect(EvuOpcode.Load)
+      dut.io.out.bits.vl.expect(0.U)
+      dut.io.out.bits.pageMap.enabled.expect(false.B)
+      dut.io.out.bits.pageMap.length.expect(0.U)
     }
   }
 
@@ -294,6 +325,7 @@ class EvuDispatchAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with
 
   it should "fit the scalar AMU payload and keep the architectural register count fixed" in {
     new EvuCoreCommand(ep).getWidth should be <= 512
+    new EvuDispatchRequest(ep).getWidth shouldBe 342
     intercept[IllegalArgumentException](EvuParams(vectorRegs = 64))
   }
 }

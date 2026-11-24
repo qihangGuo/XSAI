@@ -249,23 +249,20 @@ is reloaded once per sixteen rows because quantization reuses its register.
 The four quantization batches overlap amax, scale and packing, recycling input
 registers only after their values have been consumed. FP32 arithmetic order
 within each row, scale formulas, output layout and 72 aligned stores are
-unchanged. The first twelve rows of each sixteen-row group use BLOCK_AMAX
-at normalization's final VL=64. The three scale batches read their maxima
-directly from v23, v19 and v22. Quantization switches to VL=16 once and
-keeps it for the remaining four rows' discrete amax, scaling and packing.
-Across the tile this gives 96 BLOCK_AMAXs, 128 ordinary maximum reductions,
-512 BLOCK_PACKs and 65 timed VL settings. Normalization gathers reciprocals
-for eight rows at VL=16 before scaling those rows at VL=64. The first square in each
-sixteen-row group reuses the gamma load's VL=64; the kernel still sets
-VL=16 explicitly for its initial constants.
-The two output lines still receive slots in A0,B0,...,A7,B7 order.
-No schedule flag is needed. Use the same block-capable EMU and matching NEMU
-reference (EVCAP bit 30); only the guest image needs rebuilding. Compare
-`[RN-PERF] ... schedule=pack_interleaved_amax12_frontload_sum2_collect8_norm8_vl65`
-against the 16,473-cycle four-row sum-collection run
-(`pack_interleaved_amax12_frontload_sum2_norm8_vl97`) on the same EMU.
-Compare total cycles first, then `evu_reduction_full_cycles`,
-`evu_vrf_bank_conflict_cycles` and `evu_vrf_write_blocks_read_cycles`.
+unchanged. Quantization uses the discrete schedule from `6272d34b5`:
+ordinary absolute values and max reductions, immediate gathers of inverse and
+mask, per-block multiply and clear, MXFP4 conversion and insertion. After
+normalization, each sixteen-row group switches to VL=16 once and restores the
+neutral MXFP4 exponent (127) in v22, which the eight-row RMS schedule reused.
+The full tile executes 512 max reductions and 512 MXFP4 conversions, with
+no BLOCK_AMAX or BLOCK_PACK. Both this schedule and the fused control execute
+65 timed VL settings and store the same 4,608 output bytes.
+
+Compare `schedule=discrete_amax_pack_interleaved_sum2_collect8_norm8_vl65`
+against the 14,428-cycle `pack_interleaved_amax12_early4_sum2_collect8_norm8_vl65`
+run on the same EMU and NEMU; only rebuild the guest. Including the final FENCE,
+the discrete guest issues 6,791 commands versus 2,583 for that control. This
+comparison measures both block instructions and their schedules together.
 
 The image initializes identical inputs/gamma but does not calculate reference
 RMSNorm, scale or FP4 results, allocate reference arrays, or compare output

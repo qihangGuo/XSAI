@@ -649,6 +649,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     seqs.foreach(_.io.lookahead := 0.U.asTypeOf(seqs.head.io.lookahead))
     val lookaheadEligible = WireInit(false.B)
     val slideLookaheadEligible = WireInit(false.B)
+    val nextPackVs1Hint = WireInit(false.B)
     if (vParams.crossInstructionPrefetch || factory.name == "fp_exp") {
       val queueIndex = xissParams.indexWhere(_.seqs.exists(_.name == factory.name))
       val next = vxissqs(queueIndex).io.deq
@@ -662,6 +663,10 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       prefetch.io.vatTail := io.vat_tail
       prefetch.io.writers := VecInit(forwardWriters.toSeq)
       seqs.head.io.lookahead := prefetch.io.hints
+      if (vParams.diagnosticCounters && factory.name == "fp_fma") {
+        nextPackVs1Hint := seqs.head.io.atTail && prefetch.io.hints(0).valid && next.valid &&
+          xiangshan.evu.EvuBlock.pack(next.bits.funct3, next.bits.funct6)
+      }
       lookaheadEligible := prefetch.io.hints.map(_.valid).reduce(_ || _)
       slideLookaheadEligible := prefetch.io.slide
     }
@@ -775,6 +780,14 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
           })
           val issued = xu.io.iss.fire && matches(xu.io.iss.bits)
           val stat = counters.stages(j)
+          if (factory.name == "fp_fma" && j != 0) {
+            val ready = arb.io.in.zip(arb.io.available).map { case (in, slot) => in.valid && slot }
+            val losers = seqs.indices.map(c => ready(c) && !arb.io.in(c).fire && matches(seqs(c).io.iss.bits))
+            stat.arbitrationLost := diagnosticCount(s"diag_fma_${stage}_arbitrationLost",
+              Mux(xu.io.iss.fire, PopCount(VecInit(losers)), 0.U))
+            val ordinaryReady = seqs.indices.map(c => ready(c) && !seqs(c).io.iss.bits.acc).reduce(_ || _)
+            stat.ordinaryReadyOnIssue := diagnosticCount(s"diag_fma_${stage}_ordinaryReadyOnIssue", issued && ordinaryReady)
+          }
           stat.issues := diagnosticCount(s"diag_${factory.name}_${stage}_issues", issued)
           stat.elements16 := diagnosticCount(s"diag_${factory.name}_${stage}_elements16",
             Mux(issued && xu.io.iss.bits.vd_eew === 1.U, EvuOpClass.elements(xu.io.iss.bits, 1), 0.U))
@@ -792,6 +805,42 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       }
     }
     if (factory.name == "fp_fma") {
+      if (vParams.diagnosticCounters) {
+        val ordinary = seqs.filterNot(_.reductionOnly)
+        val desc = io.executionPerf.packDesc
+        // A PACK consumes VS1 once. Its single-EG execution has no own next-EG
+        // hint: speculative accesses belong to the queued lookahead instruction.
+        case class Access(issued: Bool, captured: Bool, bypass: Bool, usedHint: Bool,
+            bank: UInt, demandGrant: Bool, hintGrant: Bool)
+        val observations = ordinary.map { s =>
+          val i = flat_vxs.indexOf(s)
+          val op = s.io.iss.bits
+          val pack = s.io.busy && xiangshan.evu.EvuBlock.pack(op.funct3, op.funct6)
+          val event = vrf.io.rs1Events.get(i)
+          val captured = pack && s.io.rvs1.req.fire
+          val bypass = vrf.io.vxs(i).bypass(0) || event.scalarHit
+          val hint = if (s == seqs.head) nextPackVs1Hint else false.B
+          val demandGrant = event.grant.valid && !event.speculative && pack
+          val hintGrant = event.grant.valid && event.speculative && hint
+          Access(pack && s.io.iss.fire, captured, captured && bypass, captured && event.prefetchUsed,
+            vrfBank(event.grant.bits), demandGrant, hintGrant)
+        }
+        def count(name: String, events: Seq[Bool]): UInt =
+          diagnosticCount(s"diag_packDesc_$name", events.map(_.asUInt).foldLeft(0.U)(_ +& _))
+        desc.issues := count("issues", observations.map(_.issued))
+        desc.captures := count("captures", observations.map(_.captured))
+        desc.bypass := count("bypass", observations.map(_.bypass))
+        desc.prefetchUsed := count("prefetchUsed", observations.map(_.usedHint))
+        // Multiple clients can share one physical read of the same bank/row.
+        val banks = (0 until vParams.vrfBanking).map { bank =>
+          val demand = observations.map(e => e.bank === bank.U && e.demandGrant).foldLeft(false.B)(_ || _)
+          val hint = observations.map(e => e.bank === bank.U && e.hintGrant).foldLeft(false.B)(_ || _)
+          (demand, hint)
+        }
+        desc.demandReads := count("demandReads", banks.map(_._1))
+        desc.prefetchReads := count("prefetchReads", banks.map(_._2))
+        desc.sramReads := count("sramReads", banks.map { case (d, h) => d || h })
+      }
       val previousVat = RegEnable(xu.io.iss.bits.vat, xu.io.iss.fire)
       val previousValid = RegNext(xu.io.iss.fire, false.B)
       val previousReduction = RegEnable(xu.io.iss.bits.acc, false.B, xu.io.iss.fire)

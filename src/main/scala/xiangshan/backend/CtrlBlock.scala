@@ -107,6 +107,7 @@ class CtrlBlockImp(
   io.evuBusy := rob.io.evuBusy
   io.evuPreflightBusy := rob.io.evuPreflightBusy
   io.evuRetired := rob.io.evuRetired
+  rob.io.evuConfigPublished := io.evuConfigPublished
   io.evuStatus := rob.io.evuStatus
   private val memCtrl = Module(new MemCtrl(params))
 
@@ -715,6 +716,7 @@ class CtrlBlockImp(
   dispatch.io.enqRob.isEmpty := enqRob.isEmpty && !enqRob.req.map(_.valid).reduce(_ || _)
   dispatch.io.enqRob.resp := enqRob.resp
   rob.io.enq.needAlloc := enqRob.needAlloc
+  rob.io.dispatchDemandWithoutRob := dispatch.io.demandWithoutRob
   rob.io.enq.req := enqRob.req
   dispatch.io.robHead := rob.io.debugRobHead
   dispatch.io.stallReason <> rename.io.stallReason.out
@@ -963,7 +965,8 @@ class CtrlBlockIO()(implicit p: Parameters, params: BackendParams) extends XSBun
   val redirect = ValidIO(new Redirect)
   val evuBusy = Output(Bool())
   val evuPreflightBusy = Output(Bool())
-  val evuRetired = Output(Valid(new xiangshan.evu.EvuCoreCommand(p(ExternalVectorKey))))
+  val evuRetired = Output(Valid(new xiangshan.evu.EvuRetiredCommand(p(ExternalVectorKey), (new RobPtr).getWidth)))
+  val evuConfigPublished = Input(Valid(UInt((new RobPtr).getWidth.W)))
   val evuStatus = Output(Valid(new EvuCompletion(p(ExternalVectorKey))))
   val fromMem = new Bundle {
     val stIn = Vec(params.StaExuCnt, Flipped(ValidIO(new DynInst))) // use storeSetHit, ssid, robIdx

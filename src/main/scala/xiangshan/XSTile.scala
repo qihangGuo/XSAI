@@ -373,16 +373,7 @@ class XSTile()(implicit p: Parameters) extends LazyModule
           val payload = amuCtrl.bits.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey)))
           val dispatch = Wire(Decoupled(new EvuDispatchRequest(p(ExternalVectorKey))))
           dispatch.valid := amuCtrl.valid && amuCtrl.bits.evu
-          dispatch.bits.instr := payload.instr
-          dispatch.bits.base := payload.base
-          dispatch.bits.pageMap := payload.pageMap
-          dispatch.bits.vl := payload.vl
-          dispatch.bits.length := payload.length
-          dispatch.bits.aux := payload.aux
-          dispatch.bits.pc := payload.pc
-          dispatch.bits.config := payload.config
-          dispatch.bits.stride := 0.S
-          dispatch.bits.chain := true.B
+          dispatch.bits := EvuDispatchRequest.fromCore(payload, dispatch.fire, p(ExternalVectorKey))
           if (useAcceleratorCDC) {
             val evuCommandCrossing = Module(new AsyncQueue(
               new EvuDispatchRequest(p(ExternalVectorKey)),
@@ -596,6 +587,14 @@ class XSTile()(implicit p: Parameters) extends LazyModule
         XSPerfReference("evu_early_operand_reads", perf.execution.earlyOperandReads, XSPerfLevel.NORMAL)
         XSPerfReference("evu_pack_slot_candidate_cycles", perf.execution.packSlotCandidates, XSPerfLevel.NORMAL)
         XSPerfReference("evu_pack_slot_issues", perf.execution.packSlotIssues, XSPerfLevel.NORMAL)
+        val desc = perf.execution.packDesc
+        XSPerfReference("evu_pack_desc_issues", desc.issues, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_pack_desc_captures", desc.captures, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_pack_desc_bypass", desc.bypass, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_pack_desc_prefetch_used", desc.prefetchUsed, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_pack_desc_demand_reads", desc.demandReads, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_pack_desc_prefetch_reads", desc.prefetchReads, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_pack_desc_sram_reads", desc.sramReads, XSPerfLevel.NORMAL)
         XSPerfReference("evu_reduction_prefetch_hints", perf.execution.reductionPrefetches, XSPerfLevel.NORMAL)
         XSPerfReference("evu_vrf_demand_prefetch_wait", perf.vrfDemandPrefetchWait, XSPerfLevel.NORMAL)
         XSPerfReference("evu_vrf_prefetch_deferred", perf.vrfPrefetchDeferred, XSPerfLevel.NORMAL)
@@ -619,6 +618,18 @@ class XSTile()(implicit p: Parameters) extends LazyModule
           XSPerfReference(s"evu_${name}_result_slot_wait", fu.resultSlotWait, XSPerfLevel.NORMAL)
           XSPerfReference(s"evu_${name}_priority_issues", fu.priorityIssues, XSPerfLevel.NORMAL)
           XSPerfReference(s"evu_${name}_slide_prefetch_eligible", fu.slideLookaheadEligible, XSPerfLevel.NORMAL)
+          if (name == "fp_fma") {
+            for ((stage, i) <- xiangshan.evu.common.EvuReductionStage.names.zipWithIndex if stage != "stream") {
+              val s = fu.stages(i)
+              val prefix = s"evu_fp_fma_${stage}"
+              XSPerfReference(s"${prefix}_issues", s.issues, XSPerfLevel.NORMAL)
+              XSPerfReference(s"${prefix}_feedback_wait", s.feedback, XSPerfLevel.NORMAL)
+              XSPerfReference(s"${prefix}_operand_wait", s.operands, XSPerfLevel.NORMAL)
+              XSPerfReference(s"${prefix}_arb_lost", s.arbitrationLost, XSPerfLevel.NORMAL)
+              XSPerfReference(s"${prefix}_ordinary_ready_on_issue", s.ordinaryReadyOnIssue, XSPerfLevel.NORMAL)
+              XSPerfReference(s"${prefix}_return_issues", s.returnIssues, XSPerfLevel.NORMAL)
+            }
+          }
         }
       }
       if (env.EnableDifftest) {
@@ -683,18 +694,10 @@ class XSTile()(implicit p: Parameters) extends LazyModule
       if (cuteOpt.isEmpty) {
         core.module.io.amuCtrl.foreach { amuCtrl =>
           val payload = amuCtrl.bits.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey)))
-          evu.module.io.dispatch.valid := amuCtrl.valid && amuCtrl.bits.evu
-          evu.module.io.dispatch.bits.instr := payload.instr
-          evu.module.io.dispatch.bits.base := payload.base
-          evu.module.io.dispatch.bits.pageMap := payload.pageMap
-          evu.module.io.dispatch.bits.vl := payload.vl
-          evu.module.io.dispatch.bits.length := payload.length
-          evu.module.io.dispatch.bits.aux := payload.aux
-          evu.module.io.dispatch.bits.pc := payload.pc
-          evu.module.io.dispatch.bits.config := payload.config
-          evu.module.io.dispatch.bits.stride := 0.S
-          evu.module.io.dispatch.bits.chain := true.B
-          amuCtrl.ready := Mux(amuCtrl.bits.evu, evu.module.io.dispatch.ready, false.B)
+          val dispatch = evu.module.io.dispatch
+          dispatch.valid := amuCtrl.valid && amuCtrl.bits.evu
+          dispatch.bits := EvuDispatchRequest.fromCore(payload, dispatch.fire, p(ExternalVectorKey))
+          amuCtrl.ready := Mux(amuCtrl.bits.evu, dispatch.ready, false.B)
         }
       }
     }

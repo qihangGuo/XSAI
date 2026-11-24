@@ -34,6 +34,8 @@ class EvuSaturnExp2ShellImp(outer: EvuSaturnExp2Shell)(implicit p: Parameters) e
     val scalarForwards = Output(UInt(64.W))
     val packSlotIssues = Output(UInt(64.W))
     val packSlotCandidates = Output(UInt(64.W))
+    val packDesc = Output(new xiangshan.evu.common.EvuPackDescPerf)
+    val sumStages = Output(Vec(3, new xiangshan.evu.common.EvuReductionPerf))
     val lmul = Option.when(outer.configurableLmul)(Input(UInt(3.W)))
   })
   val backend = Module(new EvuVectorBackend(ep)(p.alterPartial {
@@ -46,6 +48,8 @@ class EvuSaturnExp2ShellImp(outer: EvuSaturnExp2Shell)(implicit p: Parameters) e
   io.scalarForwards := backend.io.vrfPerf.scalarForwards
   io.packSlotIssues := backend.io.executionPerf.packSlotIssues
   io.packSlotCandidates := backend.io.executionPerf.packSlotCandidates
+  io.packDesc := backend.io.executionPerf.packDesc
+  io.sumStages := backend.io.executionPerf.byFu(xiangshan.evu.common.EvuFuPerf.names.indexOf("fp_fma")).stages
   backend.io.flush := io.flush
   backend.io.vta := false.B
   backend.io.vma := false.B

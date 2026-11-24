@@ -6,14 +6,15 @@ import utility.ZeroExt
 import xiangshan.evu._
 
 /** Authoritative EVU context. Execution-side copies are immutable command snapshots. */
-class EvuCSR(p: EvuParams) extends Module {
+class EvuCSR(p: EvuParams, tagWidth: Int) extends Module {
   val io = IO(new Bundle {
     val write = Input(Vec(EvuCSRs.addresses.size, new Bundle {
       val valid = Bool()
       val data = UInt(64.W)
     }))
     val read = Output(Vec(EvuCSRs.addresses.size, UInt(64.W)))
-    val accepted = Input(Valid(new EvuCoreCommand(p)))
+    val accepted = Input(Valid(new EvuRetiredCommand(p, tagWidth)))
+    val configPublished = Output(Valid(UInt(tagWidth.W)))
     val completed = Input(Valid(new EvuCompletion(p)))
     val drain = Input(Valid(new EvuDrainResult))
     val busy = Input(Bool())
@@ -40,28 +41,36 @@ class EvuCSR(p: EvuParams) extends Module {
   val errorTvalValid = RegInit(false.B)
 
   def dirty(): Unit = { state := 3.U }
-  def configure(avl: UInt, requestedType: UInt, enable: Bool, forceVill: Bool): Unit = {
+  def configure(avl: UInt, requestedType: UInt, enable: Bool, forceVill: Bool): EvuExecutionConfig = {
     val next = EvuConfigRules.normalize(p, avl, requestedType, enable, forceVill)
     configured := next.configured
     vill := next.vill
     vtype := next.vtype
     vl := next.vl
     dirty()
+    next
   }
 
+  val writesLegalSetvli = WireInit(false.B)
   when(io.accepted.valid) {
-    val cmd = io.accepted.bits
+    val cmd = io.accepted.bits.command
     val f7 = cmd.instr(31, 25)
     val setvl = f7 === EvuIsa.setvli || f7 === EvuIsa.setvl
     when(setvl) {
       // Scalar execution already computed this exact VL for integer writeback.
       assert(cmd.config.valid && cmd.config.configured, "Missing retired EVU configuration")
-      configure(cmd.base, cmd.config.vtype, true.B, cmd.config.vill)
+      val next = configure(cmd.base, cmd.config.vtype, true.B, cmd.config.vill)
+      writesLegalSetvli := f7 === EvuIsa.setvli && !next.vill
     }.elsewhen(f7 =/= EvuIsa.store && f7 =/= EvuIsa.fence) {
       // Conservative dirty tracking also covers operations that later fail.
       dirty()
     }
   }
+  // A direct EVCFG write has priority below. Report publication only after
+  // the retired command's own write is visible on io.config.
+  val publishes = writesLegalSetvli && !io.write(EvuCSRs.addresses.indexOf(EvuCSRs.cfg)).valid
+  io.configPublished.valid := RegNext(publishes, false.B)
+  io.configPublished.bits := RegEnable(io.accepted.bits.robTag, publishes)
   when(io.completed.valid) {
     flags := flags | io.completed.bits.fflags
     sat := sat || io.completed.bits.vxsat

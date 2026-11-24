@@ -67,7 +67,19 @@ class EvuReductionPerf extends Bundle {
   val feedback = UInt(64.W)
   val operands = UInt(64.W)
   val resultReadyWait = UInt(64.W)
+  val arbitrationLost = UInt(64.W)
+  val ordinaryReadyOnIssue = UInt(64.W)
   val returnIssues = UInt(64.W)
+}
+
+class EvuPackDescPerf extends Bundle {
+  val issues = UInt(64.W)
+  val captures = UInt(64.W)
+  val bypass = UInt(64.W)
+  val prefetchUsed = UInt(64.W)
+  val demandReads = UInt(64.W)
+  val prefetchReads = UInt(64.W)
+  val sramReads = UInt(64.W)
 }
 
 class EvuMemoryDiagnostic extends Bundle {
