@@ -23,6 +23,60 @@ static void drain(void) {
   __asm__ volatile ("fence rw, rw" ::: "memory");
 }
 
+// One active element makes the byte footprint, including the odd FP4 nibble, observable.
+static int check_extensions(void) {
+  static const struct { uint32_t src, dst; unsigned bytes, flags; } cases[] = {
+    {0xbf000001, 0, 1, 16}, {0x80, 0xc3000000, 4, 0}, {0xff, 0x437f0000, 4, 0},
+    {0xbfa00000, 0x0a, 1, 1}, {0x7d, 0x7fc00000, 4, 16}, {0xaf, 0xc0c00000, 4, 0},
+    {0x007fbfff, 0x0080, 2, 3}, {0xff81, 0x7fc00000, 4, 16},
+    {0x40000000, 0x3c, 1, 0}, {0x38, 0x40000000, 4, 0},
+    {0xbc, 0xc0000000, 4, 0}, {0xf9, 0xbf800000, 4, 0}
+  };
+  const uint64_t caps = XV_CAP_CVT_RAW_EXTENSION | XV_CAP_CVT_MX_EXTENSION | XV_CAP_CVT_BF16;
+  if ((XV_CSR_READ(XV_EVCAP) & caps) != caps) {
+    printf("[LOWP] FAIL missing CVT extension capabilities\n");
+    return 1;
+  }
+  for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    source[0] = cases[i].src;
+    factor = 128; // UE8M0 = 2
+    memcpy(expected, initial, REG_BYTES);
+    memcpy(expected, &cases[i].dst, cases[i].bytes);
+    __asm__ volatile ("fence rw, rw" ::: "memory");
+    (void)xv_setvli(REG_BYTES, 0);
+    XV_LOAD(8, initial, 0);
+    (void)xv_setvli(1, 0x10);
+    XV_LOAD_E0(4, source);
+    XV_LOAD_E0(12, &factor);
+    drain();
+    XV_CSR_WRITE(XV_EFFLAGS, 0);
+    switch (i) {
+      case 0: XV_CVT_U8_F32(8, 4); break;
+      case 1: XV_CVT_F32_I8(8, 4); break;
+      case 2: XV_CVT_F32_U8(8, 4); break;
+      case 3: XV_CVT_E2M1_F32(8, 4); break;
+      case 4: XV_CVT_F32_E5M2(8, 4); break;
+      case 5: XV_CVT_F32_E2M1(8, 4); break;
+      case 6: XV_CVT_BF16_F32(8, 4); break;
+      case 7: XV_CVT_F32_BF16(8, 4); break;
+      case 8: XV_CVT_MXE5M2_F32(8, 12, 4); break;
+      case 9: XV_CVT_F32_MXE4M3(8, 12, 4); break;
+      case 10: XV_CVT_F32_MXE5M2(8, 12, 4); break;
+      case 11: XV_CVT_F32_MXFP4(8, 12, 4); break;
+    }
+    drain();
+    const unsigned flags = XV_CSR_READ(XV_EFFLAGS);
+    (void)xv_setvli(REG_BYTES, 0);
+    XV_STORE(8, output.data, 0);
+    drain();
+    if (flags != cases[i].flags || memcmp(output.data, expected, REG_BYTES)) {
+      printf("[LOWP] FAIL extension case=%u flags=%u expected_flags=%u\n", i, flags, cases[i].flags);
+      return 1;
+    }
+  }
+  return 0;
+}
+
 __attribute__((used, noinline)) static int low_precision_main(void) {
   if (!(XV_CSR_READ(XV_EVCAP) & XV_CAP_LOW_PRECISION) || XV_CSR_READ(XV_EVLENB) != REG_BYTES) {
     printf("[LOWP] FAIL missing low precision capability\n");
@@ -92,7 +146,8 @@ __attribute__((used, noinline)) static int low_precision_main(void) {
       }
     }
   }
-  printf("[LOWP] PASS cases=%u ops=6\n", cases);
+  if (check_extensions()) return 1;
+  printf("[LOWP] PASS cases=%u ops=18\n", cases + 12);
   return 0;
 }
 
