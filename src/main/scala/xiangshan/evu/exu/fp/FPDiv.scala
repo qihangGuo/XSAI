@@ -300,7 +300,8 @@ class FPDivSqrt(parallelFp32: Boolean = false)(implicit p: Parameters)
     val exceptions = Reg(Vec(laneCount, UInt(5.W)))
     val active = VecInit((0 until laneCount).map(lane => op.wmask(4 * lane)))
     for (lane <- 0 until laneCount) {
-      val divider = Module(new hardfloat.DivSqrtRecFN_small(FType.S.exp, FType.S.sig, 0))
+      val divider = Module(new hardfloat.DivSqrtRecFN_small(FType.S.exp, FType.S.sig,
+        hardfloat.consts.divSqrtOpt_twoBitsPerCycle))
       val source1 = FType.S.recode(op.rvs1_data(32 * lane + 31, 32 * lane))
       val source2 = FType.S.recode(op.rvs2_data(32 * lane + 31, 32 * lane))
       divider.io.inValid := iss_fire_pipe && wideOperation && active(lane)

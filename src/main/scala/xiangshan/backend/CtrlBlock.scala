@@ -106,6 +106,7 @@ class CtrlBlockImp(
   private val rob = wrapper.rob.module
   io.evuBusy := rob.io.evuBusy
   io.evuPreflightBusy := rob.io.evuPreflightBusy
+  io.evuPreflightReasons := rob.io.evuPreflightReasons
   io.evuRetired := rob.io.evuRetired
   rob.io.evuConfigPublished := io.evuConfigPublished
   io.evuStatus := rob.io.evuStatus
@@ -965,6 +966,7 @@ class CtrlBlockIO()(implicit p: Parameters, params: BackendParams) extends XSBun
   val redirect = ValidIO(new Redirect)
   val evuBusy = Output(Bool())
   val evuPreflightBusy = Output(Bool())
+  val evuPreflightReasons = Output(new xiangshan.evu.EvuPreflightReasons)
   val evuRetired = Output(Valid(new xiangshan.evu.EvuRetiredCommand(p(ExternalVectorKey), (new RobPtr).getWidth)))
   val evuConfigPublished = Input(Valid(UInt((new RobPtr).getWidth.W)))
   val evuStatus = Output(Valid(new EvuCompletion(p(ExternalVectorKey))))

@@ -170,9 +170,10 @@ CPU arithmetic is used only outside timing for setup/checking. There are
 11 cases, each measured once without warmup by default, and no
 CPU-performance or rsqrt7/Newton cases. Native BF16 is not
 measured. `EVU_RMS_ONLY=1` selects the eight-case RMSNorm-only regression image.
-Run `bash software/evu/scripts/compare_rmsnorm_software.sh ../NEMU_evu` on the
-server to build and compare both bank-aware software variants on the same EMU,
-including checked per-interval cycle and counter CSVs in `out/rmsnorm-software`.
+To compare the two bank layouts, build the same guest with
+`EVU_RMS_QUANT_BANKED=0` and `=1`, keeping `EVU_RMS_VERBOSE=1` for both.
+Run each on the same EMU and NEMU reference, saving separate logs. Compare
+the logs with `python3 software/evu/scripts/compare_rmsnorm_runs.py bank0.log bank1.log`.
 
 The numerical definition uses shared gamma[512], epsilon=1e-5 and alpha=1/448.
 Each 16-element quantization block computes amax, rounds `(amax/6)/alpha` to an
@@ -234,35 +235,28 @@ hardware FENCE snapshots are available. Do not compare raw cycles against the
 For cycles-only profiling without guest-side CPU reference computation:
 
 ```sh
-make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM NAME=rmsnorm_nvfp4_tile128x64_perf_evu_test
+NAME=rmsnorm_nvfp4_tile128x64_perf_evu_test make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM
 ./build/emu --diff ../NEMU/build/riscv64-nemu-interpreter-so \
   -C 100000000 -i software/evu/build/rmsnorm_nvfp4_tile128x64_perf_evu_test-riscv64-xs.bin \
   2>&1 | tee rmsnorm_nvfp4_tile128x64_perf_evu_test.log
 ```
 
 This independent image leaves the checked test unchanged but uses an optimized
-sixteen-row schedule. Each group starts with four row loads, then issues two
-squares and their two sums before issuing the next two squares and sums;
+sixteen-row schedule. Each group starts with two row loads, then issues two
+squares and their sums before loading the next pair;
 row sums are inserted eight at a time into one sixteen-element EG so square root and reciprocal
 use all sixteen FP32 lanes instead of issuing one E0 operation per row. Gamma
 is reloaded once per sixteen rows because quantization reuses its register.
 The four quantization batches overlap amax, scale and packing, recycling input
 registers only after their values have been consumed. FP32 arithmetic order
 within each row, scale formulas, output layout and 72 aligned stores are
-unchanged. Quantization uses the discrete schedule from `6272d34b5`:
-ordinary absolute values and max reductions, immediate gathers of inverse and
-mask, per-block multiply and clear, MXFP4 conversion and insertion. After
-normalization, each sixteen-row group switches to VL=16 once and restores the
-neutral MXFP4 exponent (127) in v22, which the eight-row RMS schedule reused.
-The full tile executes 512 max reductions and 512 MXFP4 conversions, with
-no BLOCK_AMAX or BLOCK_PACK. Both this schedule and the fused control execute
-65 timed VL settings and store the same 4,608 output bytes.
-
-Compare `schedule=discrete_amax_pack_interleaved_sum2_collect8_norm8_vl65`
-against the 14,428-cycle `pack_interleaved_amax12_early4_sum2_collect8_norm8_vl65`
-run on the same EMU and NEMU; only rebuild the guest. Including the final FENCE,
-the discrete guest issues 6,791 commands versus 2,583 for that control. This
-comparison measures both block instructions and their schedules together.
+unchanged. The perf guest uses the Q schedule without a mode argument:
+one VL=64 BLOCK_AMAX per row produces four independent 16-element absolute
+maxima. For rows 12 through 15 it switches back to VL=64 after the preceding
+descriptor is ready, then restores VL=16 for scale and packing. The full tile
+executes 128 BLOCK_AMAX, 512 BLOCK_PACK and 81 timed VL settings. Row sums,
+scale calculation and encoding remain separate operations. Diagnostic mode B
+retains the previous discrete maxima sequence for the last four rows only.
 
 The image initializes identical inputs/gamma but does not calculate reference
 RMSNorm, scale or FP4 results, allocate reference arrays, or compare output
@@ -278,8 +272,80 @@ available as the unoptimized baseline. The minimal perf output is intentionally
 not accepted by the checked-log summary scripts. The schedules and preparation
 histories differ, so their cycle counts need not match.
 
+### Diagnosing preflight and FP stalls
+
+Use the same guest and NEMU reference when comparing RTL builds. Add
+`-- +evu_cmd_trace=1` after the EMU options for command timestamps.
+The preflight counters measure CPU cycles, not TLB latency. The six
+`evu_preflight_{load,store}_{control_only,status_only,both}` buckets partition
+`evu_preflight_serial_stall`; redirect-killed commands are excluded.
+`evu_preflight_load_arith_only_published` is a conservative subset of LOAD
+status-only stalls: plain LOAD, published legal configuration, no observed
+fault, and no non-arithmetic completion in or entering the drain window.
+It does not authorize early memory access.
+
+`[EVU-PREFLIGHT-CMD]` reports the start of each such opportunity, request
+and response handshakes, cancellation, and CPU send. Match by ROB tag and
+PC within a live command (tags wrap). Match sends to `[EVU-CMD] event=accept`
+by PC and occurrence in send order, not speculative request order. With CDC,
+CPU and EVU timestamps are local; do not subtract one from the other.
+
+`evu_{fp_fma,fp_cmp}_idle_dep_{raw_only,war_only,waw_only,mixed}` count
+cycles with a register dependency and no issue on that FU. The four buckets
+are mutually exclusive per FU; different waiting contexts can make a cycle
+mixed. RAW means the current scoreboard reports a source hazard, not proof
+that every affected byte is needed. `evu_fp_cmp_idle_amax_disjoint_waw_only`
+counts ready first groups of AMAX rows blocked only by older pipelined AMAX
+writes to other 16-byte quarters; operands and writeback reservations must
+be available. This is a diagnostic subset, not an additional saving. None
+of these counters changes issue order or removes a dependency.
+
 ## CVT extension integration
 
 The [CVT extension specification](docs/cvt-extension/README.md) describes the
 YunSuan conversion provider and twelve additional directions alongside the six
 legacy commands. See its implementation and validation status before use.
+
+## RMSNorm row and AMAX diagnostics
+
+All four modes are in `rmsnorm_nvfp4_tile_diag_evu_test.c`. From the XSAI
+root, set the mode and build with your usual guest toolchain. On open06:
+
+```sh
+mode=L
+cc="clang --target=riscv64 -Xclang -target-feature -Xclang +zvamesfexp2 -Xclang -target-feature -Xclang +zvamesfexp2bf16"
+NAME=rmsnorm_nvfp4_tile_diag_evu_test make -C software/evu ARCH=riscv64-xs CROSS_COMPILE= CC="$cc" AS="$cc" \
+  LD=ld.lld AR=llvm-ar OBJCOPY=llvm-objcopy OBJDUMP="llvm-objdump --mattr=+zvamesfexp2" \
+  READELF=llvm-readelf MARCH=rv64gcv \
+  mainargs="$mode" BINARY="$PWD/software/evu/build/rms_diag_$mode"
+./build/emu --diff ../NEMU_evu/build/riscv64-nemu-interpreter-so -C 100000000 \
+  -i "software/evu/build/rms_diag_$mode.bin" 2>&1 | tee "$mode.log"
+```
+
+Change `mode` and repeat the two commands for the next experiment. AM puts
+`mainargs` in the guest image at link time; it is not an EMU argument.
+Separate binary and log names preserve each result. Check `[RN-DIAG] mode=...`
+in the log. No Verilog or emulator build is needed. For accept/complete
+timestamps, append `-- +evu_cmd_trace=1` to the EMU arguments before `2>&1`.
+
+| Mode | Timed workload | Outside the timer |
+|---|---|---|
+| L | Only the first 16 row loads and their original VL transitions | No row readback or scalar reference |
+| R | Original square, reduce and collect sequence for those same 16 rows | Preload the rows and drain before timing; no scalar reference |
+| B | Full earlyscale2 baseline within this diagnostic | Read flags and fingerprint the two output buffers |
+| Q | Same full tile; replace the last quartet's maxima with four BLOCK_AMAX, including both extra VL changes per group | Compare fingerprints and exact EVU flags with B |
+
+With command trace, compare L's first-to-last LOAD **accept** span with B's `load_span`, and
+R's first-square-accept to last-sum-complete span with B's `square_to_sum`.
+The guest's `drained_cycles` also includes the ending fence and is not the
+same interval. Compare L/R to group zero of B; L and R are not additive.
+These guests never recompute RMSNorm or quantization on the CPU. For Q use the current B control,
+not a historical absolute cycle number from a differently linked image.
+`desc_from_row0` and `last_store_from_row0` are relative to the first input
+row's acceptance; the last store is the later completion of both output lines.
+Negative `Q-B` means a faster tile. Reanalyze saved logs without rerunning:
+
+```bash
+python3 software/evu/scripts/summarize_rmsnorm_tile_diag.py . --no-trace
+# For traced logs, omit --no-trace.
+```

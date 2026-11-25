@@ -588,6 +588,8 @@ class XSTile()(implicit p: Parameters) extends LazyModule
         XSPerfReference("evu_pack_slot_candidate_cycles", perf.execution.packSlotCandidates, XSPerfLevel.NORMAL)
         XSPerfReference("evu_pack_slot_issues", perf.execution.packSlotIssues, XSPerfLevel.NORMAL)
         val desc = perf.execution.packDesc
+        XSPerfReference("evu_dispatch_second_issues", perf.execution.dispatchSecondIssues, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_pack_desc_reuse_hits", desc.reuseHits, XSPerfLevel.NORMAL)
         XSPerfReference("evu_pack_desc_issues", desc.issues, XSPerfLevel.NORMAL)
         XSPerfReference("evu_pack_desc_captures", desc.captures, XSPerfLevel.NORMAL)
         XSPerfReference("evu_pack_desc_bypass", desc.bypass, XSPerfLevel.NORMAL)
@@ -600,6 +602,12 @@ class XSTile()(implicit p: Parameters) extends LazyModule
         XSPerfReference("evu_vrf_prefetch_deferred", perf.vrfPrefetchDeferred, XSPerfLevel.NORMAL)
         XSPerfReference("evu_vrf_prefetch_used", perf.vrfPrefetchUsed, XSPerfLevel.NORMAL)
         XSPerfReference("evu_vrf_prefetch_discarded", perf.vrfPrefetchDiscarded, XSPerfLevel.NORMAL)
+        for ((name, u) <- xiangshan.evu.common.EvuIdleHazards.units.zipWithIndex;
+             (kind, k) <- xiangshan.evu.common.EvuIdleHazards.kinds.zipWithIndex) {
+          XSPerfReference(s"evu_${name}_idle_dep_${kind}", perf.execution.idleHazards(u)(k), XSPerfLevel.NORMAL)
+        }
+        XSPerfReference("evu_fp_cmp_idle_amax_disjoint_waw_only", perf.execution.amaxDisjointWawIdle, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_fp_cmp_amax_disjoint_waw_issues", perf.execution.amaxDisjointWawIssues, XSPerfLevel.NORMAL)
         for ((name, index) <- xiangshan.evu.common.EvuFuPerf.names.zipWithIndex) {
           val fu = perf.execution.byFu(index)
           XSPerfReference(s"evu_${name}_issue", fu.issue, XSPerfLevel.NORMAL)

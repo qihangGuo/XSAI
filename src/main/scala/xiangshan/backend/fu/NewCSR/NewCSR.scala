@@ -340,13 +340,24 @@ class NewCSR(implicit val p: Parameters) extends Module
   private val evuBank = Option.when(p(ExternalVectorKey).enable)(Module(new EvuCSR(p(ExternalVectorKey), (new RobPtr).getWidth)))
   private val evuPorts = evuBank.map { bank =>
     // Match the existing ROB -> CSR publication latency and DiffInstrCommit(delay=3).
-    bank.io.accepted := RegNext(RegNext(io.evu.accepted, 0.U.asTypeOf(io.evu.accepted)),
-      0.U.asTypeOf(io.evu.accepted))
+    val acceptedD1 = RegNext(io.evu.accepted, 0.U.asTypeOf(io.evu.accepted))
+    bank.io.accepted := RegNext(acceptedD1, 0.U.asTypeOf(io.evu.accepted))
     bank.io.completed := RegNext(io.evu.completed, 0.U.asTypeOf(io.evu.completed))
     bank.io.drain := io.evu.drainResult
     bank.io.busy := io.evu.busy
     io.evu.config := bank.io.config
     io.evu.configPublished := bank.io.configPublished
+    val cfgInFlight = Seq(io.evu.accepted, acceptedD1, bank.io.accepted).map { event =>
+      val f7 = event.bits.command.instr(31, 25)
+      event.valid && (f7 === xiangshan.evu.EvuIsa.setvl || f7 === xiangshan.evu.EvuIsa.setvli)
+    }.reduce(_ || _)
+    val changing = Seq(xiangshan.evu.EvuCSRs.cfg, xiangshan.evu.EvuCSRs.state)
+      .map(a => bank.io.write(xiangshan.evu.EvuCSRs.addresses.indexOf(a)).valid).reduce(_ || _)
+    val fault = bank.io.read(xiangshan.evu.EvuCSRs.addresses.indexOf(xiangshan.evu.EvuCSRs.status))(1) ||
+      (io.evu.completed.valid && io.evu.completed.bits.exception) ||
+      (bank.io.completed.valid && bank.io.completed.bits.exception) ||
+      (bank.io.drain.valid && bank.io.drain.bits.exception)
+    io.evu.preflightConfigReady := bank.io.configured && !bank.io.config.vill && !cfgInFlight && !changing && !fault
     io.evu.configured := bank.io.configured
     io.evu.state := bank.io.state
     io.evu.permitted := !privState.isVirtual && bank.io.state =/= 0.U &&
@@ -362,6 +373,7 @@ class NewCSR(implicit val p: Parameters) extends Module
   if (!p(ExternalVectorKey).enable) {
     io.evu.config := 0.U.asTypeOf(io.evu.config)
     io.evu.configPublished := 0.U.asTypeOf(io.evu.configPublished)
+    io.evu.preflightConfigReady := false.B
     io.evu.configured := false.B
     io.evu.state := 0.U
     io.evu.permitted := false.B

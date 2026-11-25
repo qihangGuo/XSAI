@@ -22,6 +22,8 @@ class EvuShortReadHarness(factory: FunctionalUnitFactory, operand: Int)(implicit
     val olderWrites = Input(UInt(egsTotal.W))
     val olderReads = Input(UInt(egsTotal.W))
     val issueReady = Input(Bool())
+    val amaxDisjoint = Option.when(factory == FPCmpFactory)(Input(Bool()))
+    val amaxHeadIssued = Option.when(factory == FPCmpFactory)(Output(Bool()))
     val masks = Output(Vec(3, UInt(dLen.W)))
     val forwarded = Output(Vec(3, Bool()))
     val read = Output(Vec(3, Bool()))
@@ -30,6 +32,10 @@ class EvuShortReadHarness(factory: FunctionalUnitFactory, operand: Int)(implicit
   })
   val insns = VXSequencerParams("short-read-test", Seq(factory)).insns
   val seq = Module(new ExecuteSequencer(insns, 4, 1, resultForwarding = true))
+  seq.amaxWaw.foreach { port =>
+    port.onlyDisjoint := io.amaxDisjoint.get
+    io.amaxHeadIssued.get := port.headIssued
+  }
   seq.io.dis <> io.command
   seq.io.dis_stall := false.B
   seq.io.older_writes := io.olderWrites
@@ -133,12 +139,14 @@ class EvuShortStoreShellImp(outer: EvuShortStoreShell)(implicit p: Parameters) e
   io <> harness.io
 }
 
-class EvuShortProducerHarness(reduction: Boolean)(implicit p: Parameters) extends CoreModule with HasVectorParams {
+class EvuShortProducerHarness(reduction: Boolean, blockAmax: Boolean = false)(implicit p: Parameters) extends CoreModule with HasVectorParams {
   val io = IO(new Bundle {
     val issue = Input(Bool())
     val read = Input(Bool())
     val source = Input(UInt(512.W))
     val needed = Input(UInt(512.W))
+    val beat = Option.when(blockAmax)(Input(UInt(2.W)))
+    val quarter = Option.when(blockAmax)(Input(UInt(2.W)))
     val write = Output(Valid(new VectorWrite(512)))
     val forwardable = Output(Bool())
     val bypass = Output(Valid(UInt(512.W)))
@@ -166,6 +174,19 @@ class EvuShortProducerHarness(reduction: Boolean)(implicit p: Parameters) extend
   op.acc := reduction.B
   op.acc_fold := reduction.B
   op.acc_tree := reduction.B
+  if (blockAmax) {
+    require(reduction) // select the CMP unit
+    op.funct3 := VectorConsts.OPIVV
+    op.funct6 := 0x3e.U
+    op.vl := 64.U
+    op.rs1 := io.quarter.get
+    op.eidx := io.beat.get << 4
+    op.head := io.beat.get === 0.U
+    op.tail := io.beat.get === 3.U
+    op.acc := false.B
+    op.acc_fold := false.B
+    op.acc_tree := false.B
+  }
   unit.io.iter_write.ready := true.B
   unit.io.scalar_write.ready := true.B
   unit.io.shared_fp_req.ready := true.B
@@ -207,6 +228,83 @@ class EvuShortForwardingSpec extends AnyFlatSpec with ChiselScalatestTester {
   }
 
   behavior of "Mask-covered recent result forwarding"
+
+  it should "keep consecutive BLOCK_AMAX rows separate in the shared tree" in {
+    test(new EvuShortProducerHarness(reduction = true, blockAmax = true)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      val io = dut.io
+      io.read.poke(false.B)
+      io.needed.poke(0.U)
+      def fp(n: Int): BigInt = BigInt(java.lang.Float.floatToRawIntBits(n.toFloat).toLong & 0xffffffffL)
+      val quarters = Seq(3, 1)
+      for (t <- 0 until 12) {
+        val beat = t % 4
+        io.issue.poke((t < 8).B)
+        io.quarter.get.poke(quarters((t / 4) % 2).U)
+        io.beat.get.poke(beat.U)
+        io.source.poke((fp(-(t + 1)) << (32 * beat)).U)
+        val writing = t == 7 || t == 11 // four stages after each tail
+        io.write.valid.expect(writing.B)
+        if (writing) {
+          val row = (t - 7) / 4
+          val shift = 128 * quarters(row)
+          val words = (0 until 4).map(i => fp(4 * row + i + 1) << (32 * i)).sum
+          io.write.bits.eg.expect(8.U)
+          io.write.bits.mask.expect((bytes(16) << shift).U)
+          io.write.bits.data.expect((words << shift).U)
+        }
+        dut.clock.step()
+      }
+    }
+  }
+
+  it should "waive only a disjoint BLOCK_AMAX WAW and count its first accepted beat" in {
+    test(LazyModule(new EvuShortReadShell(FPCmpFactory, 0)).module)
+      .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+        val io = dut.io
+        clear(io.command.bits)
+        clear(io.result)
+        val src = BigInt(1) << 16 // v2, EG 0
+        val dst = BigInt(1) << 24 // v3, EG 0
+        io.issueReady.poke(false.B)
+        io.olderWrites.poke(dst.U)
+        io.olderReads.poke(0.U)
+        io.amaxDisjoint.get.poke(false.B)
+        def dispatch(f6: Int, f3: Int): Unit = {
+          val c = io.command.bits
+          c.bits.poke(((BigInt(f6) << 26) | (1 << 25) | (2 << 20) | (1 << 15) |
+            (f3 << 12) | (3 << 7) | 0x57).U)
+          c.vat.poke(2.U)
+          c.vconfig.vl.poke(64.U)
+          c.vconfig.vtype.vsew.poke(2.U)
+          c.renv2.poke(true.B)
+          c.wvd.poke(true.B)
+          io.command.valid.poke(true.B)
+          io.command.ready.expect(true.B)
+          dut.clock.step()
+          io.command.valid.poke(false.B)
+        }
+        dispatch(0x3e, 0)
+        io.issue.expect(false.B) // Same quarter, unknown writer, or old row still collecting.
+        io.amaxDisjoint.get.poke(true.B)
+        io.olderWrites.poke((dst | src).U)
+        io.issue.expect(false.B) // Source RAW still wins.
+        io.olderWrites.poke(dst.U)
+        io.olderReads.poke(dst.U)
+        io.issue.expect(false.B) // Destination WAR still wins.
+        io.olderReads.poke(0.U)
+        io.issue.expect(true.B)
+        io.amaxHeadIssued.get.expect(false.B)
+        io.issueReady.poke(true.B)
+        for (beat <- 0 until 4) {
+          io.issue.expect(true.B)
+          io.amaxHeadIssued.get.expect((beat == 0).B)
+          dut.clock.step()
+        }
+        io.issue.expect(false.B)
+        dispatch(OPFFunct6.fsgnjx.litValue.toInt, VectorConsts.OPFVV.litValue.toInt)
+        io.issue.expect(false.B) // Ordinary CMP writes cannot use quarter tags.
+      }
+  }
 
   for (reduction <- Seq(false, true)) {
     it should s"retain actual producer data and masks (reduction=$reduction)" in {

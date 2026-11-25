@@ -182,6 +182,7 @@ class RegisterFileIO(
 )(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams {
   val read = MixedVec(reads.map(rc => Vec(rc, Flipped(new VectorReadIO))))
   val rs1Events = Option.when(vParams.diagnosticCounters)(Output(Vec(reads.head, new VrfReadObservation(log2Ceil(egsTotal)))))
+  val writeProbe = Option.when(vParams.diagnosticCounters)(Output(Vec(pipeWrites, Bool())))
   val mask_read = MixedVec(maskReads.map(rc => Vec(rc, Flipped(new VectorReadIO))))
   val pipe_write_reqs = Vec(pipeWrites, Flipped(new VectorPipeWriteReqIO(maxDepth)))
 
@@ -226,6 +227,7 @@ class RegisterFile(reads: Seq[Int], maskReads: Seq[Int], pipeWrites: Int, llWrit
   val vrf = Module(new AraRegisterFile(reads, maskReads, pipeWrites, llWrites, maxDepth,
     sramSuffix, trackWrites, scalarPorts.nonEmpty))
   io.pipe_write_reqs <> vrf.io.pipe_write_reqs
+  io.writeProbe.foreach(_ := vrf.io.writeProbe.get)
   io.pipe_writes <> vrf.io.pipe_writes
   io.ll_writes <> vrf.io.ll_writes
   io.llOwners.foreach(vrf.io.llOwners.get := _)
@@ -362,6 +364,7 @@ class SramRegisterFileIO(
     scalarForwarding: Boolean = false
 )(implicit p: Parameters) extends CoreBundle()(p) with HasVectorParams {
   val read = MixedVec(reads.map(rc => Vec(rc, Flipped(new SramReadIO))))
+  val writeProbe = Option.when(vParams.diagnosticCounters)(Output(Vec(pipeWrites, Bool())))
   val mask_read = MixedVec(maskReads.map(rc => Vec(rc, Flipped(new SramReadIO))))
   val pipe_write_reqs = Vec(pipeWrites, Flipped(new VectorPipeWriteReqIO(maxDepth)))
   val pipe_writes = Vec(pipeWrites, Input(Valid(new VectorWrite(dLen))))
@@ -492,13 +495,18 @@ class AraRegisterFile(
 
   // Reserve each physical bank's future write cycles before issuing pipe operations.
   val reqStalls = WireInit(VecInit.fill(pipeWrites)(false.B))
+  io.writeProbe.foreach(_.foreach(_ := true.B))
   for (i <- 0 until pipeWrites) {
     io.pipe_write_reqs(i).available := !reqStalls(i)
   }
   for (bank <- 0 until banksPerLane) {
-    val scheduler = Module(new PipeScheduler(pipeWrites * 2, maxDepth))
+    val scheduler = Module(new PipeScheduler(pipeWrites * 2, maxDepth, vParams.diagnosticCounters))
     for (j <- 0 until pipeWrites) {
       val req = io.pipe_write_reqs(j)
+      io.writeProbe.foreach { probe =>
+        val slots = scheduler.wouldGrant.get
+        when(req.bank_sel(bank) && !Mux(req.oldest, slots(j), slots(j + pipeWrites))) { probe(j) := false.B }
+      }
       scheduler.io.reqs(j).request := req.request && req.bank_sel(bank) && req.oldest
       scheduler.io.reqs(j).depth := req.pipe_depth
       scheduler.io.reqs(j).fire := req.fire

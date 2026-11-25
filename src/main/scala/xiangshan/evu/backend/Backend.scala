@@ -54,7 +54,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   // ====================================================================
   // Set up the dispatch queue, issue queues, sequencers, execution units
 
-  val vdq = Module(new DCEQueue(new VectorIssueInst, vParams.vdqEntries))
+  val vdq = Module(new DispatchQueue(new VectorIssueInst, vParams.vdqEntries))
   vdq.io.enq <> io.dis
 
   val xissParams = vParams.issStructure.generate(vParams)
@@ -70,6 +70,12 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   val vxissqs = xissParams.zip(contextLayouts).map { case (q, layouts) =>
     Module(new IssueQueue(q.depth, layouts.map(_.size).sum)).suggestName(s"vxissq_${q.name}")
   }
+  val dispatchChoice = Module(new SecondDispatch(xissParams))
+  dispatchChoice.io.head := vdq.io.deq.bits
+  dispatchChoice.io.second := vdq.second
+  dispatchChoice.io.ready := VecInit(vxissqs.map(_.io.enq.ready))
+  vdq.takeSecond := dispatchChoice.io.take && vParams.enableOOO.B
+  val dispatchInst = Mux(vdq.takeSecond, vdq.second.bits, vdq.io.deq.bits)
 
   val vxus = xissParams.map(_.seqs.map(s => Module(new ExecutionUnit(s.fus, s.name)).suggestName(s"vxu${s.name}")))
   val flat_vxus = vxus.flatten
@@ -184,14 +190,14 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     Reduction, Wide2VD, Wide2VS2, WritesAsMask,
     ReadsVS1AsMask, ReadsVS2AsMask, ReadsVS1, ReadsVS2, ReadsVD,
     VMBitReadsVM, AlwaysReadsVM, WritesVD, WritesScalar, ScalarToVD0
-  ))).decode(vdq.io.deq.bits)
+  ))).decode(dispatchInst)
   // Allocate a shared owner before either half of a reduction enters its
   // queue. VAT parity cannot select contexts: alternating sum/max commands
   // would otherwise pin every sum to the same context.
   val reductionOwners = Module(new ReductionOwnerAllocator(vParams.reductionContexts))
   val reductionChoice = reductionOwners.io.choice
-  val dispatchReduction = !vdq.io.deq.bits.vmu && dis_ctrl.bool(Reduction)
-  val dispatchDirectMinMax = dispatchReduction && VectorFastPaths.singleGroupMinMaxInstruction(vdq.io.deq.bits,
+  val dispatchReduction = !dispatchInst.vmu && dis_ctrl.bool(Reduction)
+  val dispatchDirectMinMax = dispatchReduction && VectorFastPaths.singleGroupMinMaxInstruction(dispatchInst,
     dLen, vParams.fp32MinMaxTree && vParams.singleGroupMinMax)
   val dispatchNeedsAccumulator = dispatchReduction && !dispatchDirectMinMax
   reductionOwners.io.request := interleave.B && vdq.io.deq.valid && dispatchNeedsAccumulator
@@ -203,22 +209,22 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   io.executionPerf.reductionOwnerReuse := diagnosticCount("diag_reductionOwnerReuse", reductionOwners.io.reused)
 
   // Load sequencer
-  vlissq.io.enq.bits.nf_log2 := log2_up(vdq.io.deq.bits.nf, 8)
-  vlissq.io.enq.bits.renvm := !vdq.io.deq.bits.vm
+  vlissq.io.enq.bits.nf_log2 := log2_up(dispatchInst.nf, 8)
+  vlissq.io.enq.bits.renvm := !dispatchInst.vm
   vlissq.io.enq.bits.wvd   := true.B
 
   // Store sequencer
-  vsissq.io.enq.bits.nf_log2 := log2_up(vdq.io.deq.bits.nf, 8)
+  vsissq.io.enq.bits.nf_log2 := log2_up(dispatchInst.nf, 8)
   vsissq.io.enq.bits.renvd := true.B
-  vsissq.io.enq.bits.renvm := !vdq.io.deq.bits.vm && vdq.io.deq.bits.mop === mopUnit
+  vsissq.io.enq.bits.renvm := !dispatchInst.vm && dispatchInst.mop === mopUnit
 
   // Permute source sequencer
-  vpissq.io.enq.bits.renv1 := !vdq.io.deq.bits.vmu && dis_ctrl.bool(Reduction)
-  vpissq.io.enq.bits.renv2 := (vdq.io.deq.bits.mop(0) || (!vdq.io.deq.bits.vmu && !dis_ctrl.bool(Reduction)))
+  vpissq.io.enq.bits.renv1 := !dispatchInst.vmu && dis_ctrl.bool(Reduction)
+  vpissq.io.enq.bits.renv2 := (dispatchInst.mop(0) || (!dispatchInst.vmu && !dis_ctrl.bool(Reduction)))
   vpissq.io.enq.bits.renvd := !dis_ctrl.bool(Reduction)
-  vpissq.io.enq.bits.renvm := !vdq.io.deq.bits.vm && vdq.io.deq.bits.mop =/= mopUnit && vdq.io.deq.bits.vmu
-  vpissq.io.enq.bits.wide_vd := dis_ctrl.bool(Wide2VD) && !vdq.io.deq.bits.vmu
-  vpissq.io.enq.bits.rs1_is_rs2 := !vdq.io.deq.bits.vmu && (vdq.io.deq.bits.opif6 === OPIFunct6.rgather || (vdq.io.deq.bits.funct3 === OPIVV && vdq.io.deq.bits.opif6 === OPIFunct6.rgatherei16))
+  vpissq.io.enq.bits.renvm := !dispatchInst.vm && dispatchInst.mop =/= mopUnit && dispatchInst.vmu
+  vpissq.io.enq.bits.wide_vd := dis_ctrl.bool(Wide2VD) && !dispatchInst.vmu
+  vpissq.io.enq.bits.rs1_is_rs2 := !dispatchInst.vmu && (dispatchInst.opif6 === OPIFunct6.rgather || (dispatchInst.funct3 === OPIVV && dispatchInst.opif6 === OPIFunct6.rgatherei16))
 
   // Execute sequencers
   vxissqs.foreach { vxissq =>
@@ -229,10 +235,10 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     vxissq.io.enq.bits.reads_vs2_mask := dis_ctrl.bool(ReadsVS2AsMask)
     vxissq.io.enq.bits.renv1 := (dis_ctrl.bool(ReadsVS1) && !dis_ctrl.bool(Reduction)) || dispatchDirectMinMax
     vxissq.io.enq.bits.renv2 := dis_ctrl.bool(ReadsVS2) ||
-      VectorFastPaths.alignedSlide(vdq.io.deq.bits, dLen, vParams.alignedSlide) ||
-      VectorFastPaths.singleGroupSlide(vdq.io.deq.bits, dLen, vParams.singleGroupSlide)
+      VectorFastPaths.alignedSlide(dispatchInst, dLen, vParams.alignedSlide) ||
+      VectorFastPaths.singleGroupSlide(dispatchInst, dLen, vParams.singleGroupSlide)
     vxissq.io.enq.bits.renvd := dis_ctrl.bool(ReadsVD)
-    vxissq.io.enq.bits.renvm := (!vdq.io.deq.bits.vm && dis_ctrl.bool(VMBitReadsVM)) || dis_ctrl.bool(AlwaysReadsVM)
+    vxissq.io.enq.bits.renvm := (!dispatchInst.vm && dis_ctrl.bool(VMBitReadsVM)) || dis_ctrl.bool(AlwaysReadsVM)
     vxissq.io.enq.bits.wvd := !dis_ctrl.bool(WritesScalar)
     vxissq.io.enq.bits.scalar_to_vd0 := dis_ctrl.bool(ScalarToVD0)
     vxissq.io.enq.bits.reduction := dis_ctrl.bool(Reduction)
@@ -244,6 +250,12 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
   val issq_stall = Wire(Vec(issGroups.size, Bool()))
   vdq.io.deq.ready := !issq_stall.orR && !reductionBlocked
+  when(vdq.takeSecond) {
+    assert(vdq.io.deq.fire && !dispatchReduction && !dispatchInst.vmu &&
+      !vpissq.io.enq.valid && PopCount(VecInit(vxissqs.map(_.io.enq.fire))) === 1.U)
+  }
+  io.executionPerf.dispatchSecondIssues := diagnosticCount("dispatchSecondIssues",
+    vdq.takeSecond && vdq.io.deq.fire)
   io.executionPerf.dispatchBlocked := diagnosticCount("diag_dispatchBlocked",
     vdq.io.deq.valid && !vdq.io.deq.ready)
   val dispatchNames = Seq("load", "store", "special") ++ xissParams.map(_.name)
@@ -316,6 +328,28 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       seq.io.older_reads := older_rintents
 
       seq match {
+        case x: ExecuteSequencer if x.amaxWaw.nonEmpty =>
+          val unit = same_vxu.get
+          val eg = x.io.iss.bits.wvd_eg
+          val quarter = x.io.iss.bits.rs1(1, 0)
+          val unknown = (older_wintents | older_other_pipe_writes | older_iter_writes | older_buffered_writes)(eg)
+          // A row still collecting groups owns the one shared comparison scratchpad.
+          val collecting = otherSameIssqSeqs.collect { case y: ExecuteSequencer =>
+            y.io.busy && vatOlder(y.io.vat, vat) &&
+              xiangshan.evu.EvuBlock.amax(y.io.iss.bits.funct3, y.io.iss.bits.funct6)
+          }.foldLeft(false.B)(_ || _)
+          val writers = unit.io.pipe_hazards.zip(unit.pipeAmaxQuarters.get).map { case (h, tag) =>
+            val hit = h.valid && h.bits.eg === eg && h.bits.vat =/= vat
+            val disjoint = tag.valid && vatOlder(h.bits.vat, vat) && tag.bits =/= quarter
+            (hit, disjoint)
+          }
+          // The fixed-latency tree sees the old tail before the new head. Only
+          // waive WAW; readers still see every writer through older_writes.
+          x.amaxWaw.get.onlyDisjoint := EvuIdleHazards.onlyDisjoint(collecting || unknown, writers)
+        case _ =>
+      }
+
+      seq match {
         case x: ExecuteSequencer => x.packWaw.foreach { pack =>
           val eg = x.io.iss.bits.wvd_eg
           val slot = pack.writer.bits
@@ -360,12 +394,12 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
           dispatchDirectMinMax || reductionChoice(reductionOwnerBySequencer(s).get)
         case _ => true.B
       }
-      seq.accepts(vdq.io.deq.bits) && contextAllowed
+      seq.accepts(dispatchInst) && contextAllowed
     }
     issq_stall(i) := !group.issq.io.enq.ready && accepts.orR
 
     group.issq.io.enq.valid := vdq.io.deq.valid && !issq_stall.orR && !reductionBlocked && accepts.orR
-    group.issq.io.enq.bits.viewAsSupertype(new VectorIssueInst) := vdq.io.deq.bits
+    group.issq.io.enq.bits.viewAsSupertype(new VectorIssueInst) := dispatchInst
     group.issq.io.enq.bits.seq := VecInit(accepts).asUInt
 
     // In case of multiple available sequencers, select the first ready one
@@ -491,6 +525,12 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
   val executeCandidates = scala.collection.mutable.ArrayBuffer.empty[DecoupledIO[ExecuteMicroOpWithData]]
   val loadForwardHits = scala.collection.mutable.ArrayBuffer.empty[Bool]
+  val packClients = flat_vxs.indices.filter(i => fuBySequencer(i).descName == "fp_fma" &&
+    flat_vxs(i).packWaw.nonEmpty)
+  val packLine = Option.when(packClients.nonEmpty)(Module(new PackDescriptorLine(
+    log2Ceil(egsTotal), dLen, packClients.size, vParams.vrfBanking)))
+  packLine.foreach(_.io.invalidate := vrf.io.writeInvalidations)
+  val packReuseHits = scala.collection.mutable.ArrayBuffer.empty[Bool]
   for (i <- 0 until flat_vxs.size) {
     val vxs = flat_vxs(i)
     val vxu = fuBySequencer(i)
@@ -527,10 +567,27 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
           operand.available := result.valid
           loadForwardHits += (hit && read.req.fire)
         }
-        memory.req.valid := read.req.valid && !result.valid
-        read.req.ready := result.valid || memory.req.ready
-        read.resp := Mux(result.valid, result.bits, memory.resp)
-        vrf.io.vxs(i).bypass(port) := read.req.valid && result.valid
+        val reuse = if (port == 0 && packClients.contains(i)) {
+          val line = packLine.get
+          val eg = read.req.bits.eg
+          val pack = vxs.packWaw.get.writer.valid
+          val safe = pack && !vxs.io.older_writes(eg) && !vxs.io.e0Read(0)
+          val hit = safe && line.io.tag.valid && line.io.tag.bits === eg && !result.valid
+          // Only a consumed, complete VRF response may seed the shared line.
+          val fill = line.io.fill(packClients.indexOf(i))
+          fill.valid := safe && memory.req.fire
+          fill.bits.eg := eg
+          fill.bits.data := memory.resp
+          packReuseHits += (read.req.fire && hit)
+          hit
+        } else false.B
+        val supplied = result.valid || reuse
+        memory.req.valid := read.req.valid && !supplied
+        read.req.ready := supplied || memory.req.ready
+        val vrfOrLine = if (port == 0 && packClients.contains(i))
+          Mux(reuse, packLine.get.io.data, memory.resp) else memory.resp
+        read.resp := Mux(result.valid, result.bits, vrfOrLine)
+        vrf.io.vxs(i).bypass(port) := read.req.valid && supplied
       }
     }
     vxs.io.rvm.resp := vrf.io.vxs(i).rvm.resp
@@ -663,6 +720,13 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       prefetch.io.vatTail := io.vat_tail
       prefetch.io.writers := VecInit(forwardWriters.toSeq)
       seqs.head.io.lookahead := prefetch.io.hints
+      if (factory.name == "fp_fma") packLine.foreach { line =>
+        val hint = prefetch.io.hints(0)
+        val pack = xiangshan.evu.EvuBlock.pack(next.bits.funct3, next.bits.funct6)
+        when(pack && line.io.tag.valid && line.io.tag.bits === hint.bits.eg) {
+          seqs.head.io.lookahead(0).valid := false.B
+        }
+      }
       if (vParams.diagnosticCounters && factory.name == "fp_fma") {
         nextPackVs1Hint := seqs.head.io.atTail && prefetch.io.hints(0).valid && next.valid &&
           xiangshan.evu.EvuBlock.pack(next.bits.funct3, next.bits.funct6)
@@ -692,6 +756,25 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       counters.queueWait := perfCount(queue.io.deq.valid && !queue.io.deq.ready)
       counters.dispatchBlocked := perfCount(vdq.io.deq.valid && issq_stall(3 + queueIndex))
       val pendingWork = queue.io.deq.valid || seqs.map(_.io.busy).reduce(_ || _)
+      if (vParams.diagnosticCounters && EvuIdleHazards.units.contains(factory.name)) {
+        val index = EvuIdleHazards.units.indexOf(factory.name)
+        val idle = !xu.io.iss.fire
+        val buckets = EvuIdleHazards.buckets(seqs.map(_.io.hazardKinds.get), xu.io.iss.fire)
+        for ((bucket, k) <- buckets.zipWithIndex) {
+          io.executionPerf.idleHazards(index)(k) := diagnosticCount(
+            s"diag_${factory.name}_idle_dep_${EvuIdleHazards.kinds(k)}", bucket)
+        }
+        if (factory.name == "fp_cmp") {
+          val otherwiseReady = seqs.zipWithIndex.map { case (s, c) =>
+            s.io.amaxWawReady.get && s.amaxWaw.map(_.onlyDisjoint).getOrElse(false.B) && arb.io.available(c) &&
+              vrf.io.writeProbe.get(flat_vxs.indexOf(s))
+          }.reduce(_ || _)
+          io.executionPerf.amaxDisjointWawIdle := diagnosticCount("diag_cmp_idle_amax_disjoint_waw_only",
+            idle && otherwiseReady)
+          io.executionPerf.amaxDisjointWawIssues := diagnosticCount("diag_cmp_amax_disjoint_waw_issues",
+            seqs.flatMap(_.amaxWaw.map(_.headIssued)).foldLeft(false.B)(_ || _))
+        }
+      }
       if (factory.name == "int" && vParams.diagnosticCounters) {
         val next = queue.io.deq.bits
         val idle = queue.io.deq.valid && !queue.io.deq.ready && !xu.io.iss.fire
@@ -768,7 +851,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
             !vrf.io.vxs(flat_vxs.indexOf(s)).pipe_write_req.available).reduce(_ || _))
         counters.contextCycles := diagnosticCount(s"diag_${factory.name}_contextCycles",
           PopCount(VecInit(seqs.map(_.io.busy))))
-        val target = seqs.map(_.accepts(vdq.io.deq.bits)).reduce(_ || _)
+        val target = seqs.map(_.accepts(dispatchInst)).reduce(_ || _)
         counters.dispatchReduction := diagnosticCount(s"diag_${factory.name}_dispatchReduction",
           vdq.io.deq.valid && target && reductionBlocked)
         for ((stage, j) <- EvuReductionStage.names.zipWithIndex) {
@@ -808,6 +891,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       if (vParams.diagnosticCounters) {
         val ordinary = seqs.filterNot(_.reductionOnly)
         val desc = io.executionPerf.packDesc
+        desc.reuseHits := diagnosticCount("packDescReuseHits", PopCount(VecInit(packReuseHits.toSeq :+ false.B)))
         // A PACK consumes VS1 once. Its single-EG execution has no own next-EG
         // hint: speculative accesses belong to the queued lookahead instruction.
         case class Access(issued: Bool, captured: Bool, bypass: Bool, usedHint: Bool,

@@ -127,4 +127,8 @@ ifneq ($(filter $(NAME),vector_memory_path_evu_test online_softmax_evu_test rmsn
 CFLAGS += -ffp-contract=off
 endif
 
+ifeq ($(NAME),rmsnorm_nvfp4_tile_diag_evu_test)
+CFLAGS += -fno-fast-math -ffp-contract=off -fno-tree-vectorize -fno-tree-slp-vectorize
+endif
+
 include $(AM_HOME)/Makefile.app

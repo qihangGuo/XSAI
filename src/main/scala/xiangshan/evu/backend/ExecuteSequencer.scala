@@ -38,6 +38,8 @@ class ExecuteSequencerIO(maxDepth: Int, nFUs: Int, forwarding: Boolean = false)(
   val lookahead = Input(Vec(3, Valid(new VectorReadReq)))
   val atTail = Output(Bool())
   val rawDependencies = Output(UInt(egsTotal.W))
+  val hazardKinds = Option.when(vParams.diagnosticCounters)(Output(UInt(3.W)))
+  val amaxWawReady = Option.when(vParams.diagnosticCounters)(Output(Bool()))
   val forward = Option.when(forwarding)(Vec(3, new VectorForwardOperand))
   val rvs1_data = Output(UInt(dLen.W))
   val rvs2_data = Output(UInt(dLen.W))
@@ -87,6 +89,12 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   val lowPrecision = EvuLowPrecision.backend(inst.funct3, inst.funct6, inst.rs1)
   val blockMax = xiangshan.evu.EvuBlock.amax(inst.funct3, inst.funct6)
   val blockPack = xiangshan.evu.EvuBlock.pack(inst.funct3, inst.funct6)
+  private val amaxCapable = !reductionOnly && dLen == 512 && vParams.fp32MinMaxTree && supported_insns.exists(i =>
+    i.props.contains(F3(OPIVV)) && i.props.contains(F6(0x3e.U(6.W))))
+  val amaxWaw = Option.when(amaxCapable)(IO(new Bundle {
+    val onlyDisjoint = Input(Bool())
+    val headIssued = Output(Bool())
+  }))
   private val packCapable = !reductionOnly && dLen == 512 && supported_insns.exists(i =>
     i.props.contains(F3(OPIVV)) && i.props.contains(F6(0x3f.U(6.W))))
   val packWaw = Option.when(packCapable)(IO(new Bundle {
@@ -393,9 +401,12 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
     Mux(waiting, UIntToOH(eg, egsTotal), 0.U(egsTotal.W))
   }.reduce(_ | _)
   val groupWaw = inst.wvd && io.older_writes(io.iss.bits.wvd_eg)
-  val waw_hazard = groupWaw && !packWaw.map(p => p.writer.valid && p.noConflict).getOrElse(false.B)
+  val waiveAmaxWaw = amaxWaw.map(p => valid && blockMax && p.onlyDisjoint).getOrElse(false.B)
+  val waw_hazard = groupWaw && !waiveAmaxWaw && !packWaw.map(p => p.writer.valid && p.noConflict).getOrElse(false.B)
+  amaxWaw.foreach(_.headIssued := io.iss.fire && head && groupWaw && waiveAmaxWaw)
   val war_hazard = inst.wvd && io.older_reads(io.iss.bits.wvd_eg)
   val data_hazard = raw_hazard || waw_hazard || war_hazard
+  io.hazardKinds.foreach(_ := Mux(valid, Cat(waw_hazard, war_hazard, raw_hazard), 0.U))
 
   io.rvs1.req.bits.eg := getEgId(inst.rs1, Mux(inst.scalarVrfSource || acc_direct, 0.U, eidx),
     vs1_eew, inst.reads_vs1_mask)
@@ -509,6 +520,8 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   val missingPermutation = (read_slide_buffer && !io.vgu.slide_req.ready) ||
     (read_eidx_buffer && !io.vgu.gather_eidx.valid)
   val missingFeedback = renacc && !io.acc_valid
+  io.amaxWawReady.foreach(_ := valid && head && blockMax && waw_hazard && !raw_hazard && !war_hazard &&
+    !missingOperands && !missingPermutation && !missingFeedback && exu_scheduler.io.reqs(0).available)
   // One primary reason per active sequencer; different sequencers may wait
   // for different reasons in the same cycle.
   io.waitReason := 0.U.asTypeOf(io.waitReason)

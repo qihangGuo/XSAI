@@ -81,3 +81,22 @@ class DCEQueue[T <: Data](
     )
   }
 }
+
+/** On a second-entry dequeue, advance normally and carry the old head into its place. */
+class DispatchQueue[T <: Data](gen: T, depth: Int)(implicit p: Parameters)
+    extends DCEQueue[T](gen, depth) {
+  val second = IO(Output(Valid(chiselTypeOf(io.deq.bits))))
+  val takeSecond = IO(Input(Bool()))
+  if (depth > 1) {
+    val next = Mux(deq_ptr.value === (depth - 1).U, 0.U, deq_ptr.value + 1.U)
+    second.valid := io.count >= 2.U
+    second.bits := ram(next)
+    when(io.deq.fire && takeSecond) {
+      assert(second.valid && (!do_enq || enq_ptr.value =/= next))
+      ram(next) := io.deq.bits
+    }
+  } else {
+    second.valid := false.B
+    second.bits := io.deq.bits
+  }
+}

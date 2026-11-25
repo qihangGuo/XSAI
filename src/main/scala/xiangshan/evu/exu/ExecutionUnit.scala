@@ -24,6 +24,8 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
   val packOut = packProducer.map(f => IO(Output(chiselTypeOf(f.toPack.get))))
   val packBack = packProducer.map(f => IO(Input(chiselTypeOf(f.fromPack.get))))
   val pipePackSlots = packProducer.map(_ => IO(Output(Vec(maxPipeDepth, Valid(UInt(3.W))))))
+  val pipeAmaxQuarters = Option.when(dLen == 512 && vParams.fp32MinMaxTree && genFUs.contains(FPCmpFactory))(
+    IO(Output(Vec(maxPipeDepth, Valid(UInt(2.W))))))
   val packIn = packConsumer.map(f => IO(Input(chiselTypeOf(f.packInput.get))))
   val packedOut = packConsumer.map(f => IO(Output(chiselTypeOf(f.packResult.get))))
   packProducer.foreach { f => packOut.get := f.toPack.get; f.fromPack.get := packBack.get }
@@ -184,6 +186,10 @@ class ExecutionUnit(genFUs: Seq[FunctionalUnitFactory], desc: String)(implicit p
       io.pipe_hazards(i).valid       := pipe_valids(i)
       io.pipe_hazards(i).bits.vat    := pipe_bits(i).vat
       io.pipe_hazards(i).bits.eg     := pipe_bits(i).wvd_eg
+      pipeAmaxQuarters.foreach { quarters =>
+        quarters(i).valid := pipe_valids(i) && xiangshan.evu.EvuBlock.amax(pipe_bits(i).funct3, pipe_bits(i).funct6)
+        quarters(i).bits := pipe_bits(i).rs1(1, 0)
+      }
       pipePackSlots.foreach { slots =>
         slots(i).valid := pipe_valids(i) && xiangshan.evu.EvuBlock.pack(pipe_bits(i).funct3, pipe_bits(i).funct6)
         slots(i).bits := xiangshan.evu.EvuBlock.packSlot(pipe_bits(i).scalar)

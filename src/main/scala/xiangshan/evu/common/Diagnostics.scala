@@ -73,6 +73,7 @@ class EvuReductionPerf extends Bundle {
 }
 
 class EvuPackDescPerf extends Bundle {
+  val reuseHits = UInt(64.W)
   val issues = UInt(64.W)
   val captures = UInt(64.W)
   val bypass = UInt(64.W)

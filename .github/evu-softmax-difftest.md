@@ -171,10 +171,22 @@ VL 之外的 sNaN 虽然不会写回最终结果，却可能在中间折叠产�
 在 XSAI_external_vector 根目录运行：
 
 ```sh
-bash software/evu/scripts/check_softmax_ref.sh ../NEMU
+export NEMU_HOME="$PWD/../NEMU"
+ref="$NEMU_HOME/build/riscv64-nemu-interpreter-so"
+host_test="$NEMU_HOME/tools/evu-ref-test/evu_compute_ref_test"
+mkdir -p out/evu-softmax-difftest
+export EVU_SOFTMAX_REFERENCE_TRACE="$PWD/out/evu-softmax-difftest/reference.trace"
+export EVU_SOFTMAX_DUT_TRACE="$PWD/out/evu-softmax-difftest/rtl.trace"
+make -C "$NEMU_HOME/tools/evu-ref-test" NEMU_HOME="$NEMU_HOME"
+"$host_test" "$ref" "$EVU_SOFTMAX_REFERENCE_TRACE"
+export CCACHE_DISABLE=1
+export PATH="$PWD/src/main/resources:$PATH"
+mill -i evuCheck.test.testOnly evu.EvuSoftmaxDifftestSpec
+mill -i evuCheck.test.testOnly evu.EvuSaturnReductionSpec evu.EvuFpFlagsSpec
+"$host_test" "$ref" --replay "$EVU_SOFTMAX_DUT_TRACE"
 ```
 
-脚本保存 `out/evu-softmax-difftest/reference.trace` 和 `rtl.trace`，运行高精度
+这些命令保存 `out/evu-softmax-difftest/reference.trace` 和 `rtl.trace`，运行高精度
 本机参考、RTL 逐位比较、归约/flags 定向回归及异步 Difftest ABI 检查。
 
 本地已使用 GNU 交叉工具链编译出测试 bin、elf 和反汇编：

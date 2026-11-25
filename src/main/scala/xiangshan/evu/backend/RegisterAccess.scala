@@ -51,6 +51,7 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, reductionContexts: Int = 1,
     val writeInvalidations = Output(Vec(vParams.vrfBanking, Valid(UInt(log2Ceil(egsTotal).W))))
     val debug = Option.when(vParams.debugVrf)(Output(Vec(egsTotal, UInt(dLen.W))))
     val perf = Output(new VrfPerf)
+    val writeProbe = Option.when(vParams.diagnosticCounters)(Output(Vec(exSeqs, Bool())))
     val rs1Events = Option.when(vParams.diagnosticCounters)(Output(Vec(exSeqs, new VrfReadObservation(log2Ceil(egsTotal)))))
   })
 
@@ -85,6 +86,7 @@ class RegisterAccess(exSeqs: Int, maxExuDepth: Int, reductionContexts: Int = 1,
   ))
   val resetting = RegInit(true.B)
   io.perf := vrf.io.perf
+  io.writeProbe.foreach(_.zip(vrf.io.writeProbe.get).foreach { case (out, grant) => out := grant && !resetting })
   io.rs1Events.foreach(_.zip(vrf.io.rs1Events.get.take(exSeqs)).foreach { case (out, event) => out := event })
   io.pendingWrites := vrf.io.pendingWrites.get
   io.pendingLoads := vrf.io.pendingLoads.get

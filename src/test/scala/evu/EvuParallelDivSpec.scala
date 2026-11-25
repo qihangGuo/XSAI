@@ -103,7 +103,9 @@ class EvuParallelDivSpec extends AnyFlatSpec with ChiselScalatestTester with Mat
           cycles += 1
         }
         dut.io.resultValid.expect(true.B)
-        cycles should be < 40
+        // Includes the EVU operand and writeback registers. The old one-bit
+        // implementation cannot finish a normal FP32 operation in this window.
+        cycles should be < 20
         val resultMask = (BigInt(1) << (32 * active)) - 1
         (dut.io.result.peek().litValue & resultMask) shouldBe pack(expected.take(active))
         dut.io.resultMask.expect(resultMask.U)
@@ -138,7 +140,7 @@ class EvuParallelDivSpec extends AnyFlatSpec with ChiselScalatestTester with Mat
         dut.io.valid.poke(true.B)
         dut.clock.step()
         dut.io.valid.poke(false.B)
-        dut.clock.step(40)
+        dut.clock.step(19)
         dut.io.resultValid.expect(true.B)
         val rounded = BigInt(if (rounding == 1 || rounding == 2) "3eaaaaaa" else "3eaaaaab", 16)
         dut.io.result.expect((rounded | (rounded << 480)).U)
@@ -164,10 +166,32 @@ class EvuParallelDivSpec extends AnyFlatSpec with ChiselScalatestTester with Mat
       dut.io.valid.poke(true.B)
       dut.clock.step()
       dut.io.valid.poke(false.B)
-      dut.clock.step(40)
+      dut.clock.step(19)
       dut.io.resultValid.expect(true.B)
       dut.io.result.expect(pack((1 to 16).map(index => word(index.toFloat))).U)
       dut.io.flags.expect(0.U)
+      dut.io.ready.poke(true.B)
+      dut.clock.step()
+      val roots = Seq(word(2), word(-0.0f), word(Float.PositiveInfinity), word(-1),
+        BigInt("7fc00011", 16), BigInt("7f800001", 16), BigInt(2))
+      dut.io.mask.poke(((BigInt(1) << (4 * roots.size)) - 1).U)
+      dut.io.numerator.poke(pack(roots).U)
+      for (rounding <- 0 to 4) {
+        dut.io.ready.poke(false.B)
+        dut.io.rounding.poke(rounding.U)
+        dut.io.valid.poke(true.B)
+        dut.clock.step()
+        dut.io.valid.poke(false.B)
+        dut.clock.step(19)
+        val rootTwo = BigInt(if (rounding == 3) "3fb504f4" else "3fb504f3", 16)
+        val nan = BigInt("7fc00000", 16)
+        dut.io.resultValid.expect(true.B)
+        dut.io.result.expect(pack(Seq(rootTwo, word(-0.0f), word(Float.PositiveInfinity),
+          nan, nan, nan, BigInt(53) << 23)).U) // sqrt(2^-148) = 2^-74
+        dut.io.flags.expect(17.U) // invalid sqrt/sNaN and inexact sqrt(2)
+        dut.io.ready.poke(true.B)
+        dut.clock.step()
+      }
     }
   }
 }

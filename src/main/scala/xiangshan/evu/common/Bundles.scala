@@ -325,6 +325,20 @@ class PipeHazard(pipe_depth: Int)(implicit p: Parameters) extends CoreBundle()(p
   def eg_oh = UIntToOH(eg)
 }
 
+object EvuIdleHazards {
+  val units = Seq("fp_fma", "fp_cmp")
+  val kinds = Seq("raw_only", "war_only", "waw_only", "mixed")
+
+  def buckets(contexts: Seq[UInt], issue: Bool): Seq[Bool] = {
+    val mask = contexts.reduce(_ | _)
+    Seq(mask === 1.U, mask === 2.U, mask === 4.U, PopCount(mask) > 1.U).map(_ && !issue)
+  }
+
+  def onlyDisjoint(unknown: Bool, writers: Seq[(Bool, Bool)]): Bool =
+    !unknown && writers.map(_._1).reduce(_ || _) &&
+      !writers.map { case (hit, disjoint) => hit && !disjoint }.reduce(_ || _)
+}
+
 object EvuFuPerf {
   val names = Seq("fp_fma", "fp_cmp", "fp_exp", "fp_xx8", "fp_mxfp", "int", "fp_div")
 }
@@ -369,6 +383,10 @@ class EvuFuPerf extends Bundle {
 }
 
 class EvuExecutionPerf extends Bundle {
+  // Masks are combined across contexts before classifying a FU idle cycle.
+  val idleHazards = Vec(EvuIdleHazards.units.size, Vec(EvuIdleHazards.kinds.size, UInt(64.W)))
+  val amaxDisjointWawIdle = UInt(64.W)
+  val amaxDisjointWawIssues = UInt(64.W)
   val intCandidateIdle = UInt(64.W)
   val intCandidateRaw = UInt(64.W)
   val intCandidateDestination = UInt(64.W)
@@ -382,6 +400,7 @@ class EvuExecutionPerf extends Bundle {
   val completionHeadTransportWait = UInt(64.W)
   val dispatchBlocked = UInt(64.W)
   val dispatchQueueWait = Vec(EvuDispatchPerf.names.size, UInt(64.W))
+  val dispatchSecondIssues = UInt(64.W)
   val vectorForwards = UInt(64.W)
   val loadForwardOperands = UInt(64.W)
   val vectorForwardNewer = UInt(64.W)

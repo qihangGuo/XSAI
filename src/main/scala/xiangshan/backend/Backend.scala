@@ -879,7 +879,18 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
     val checking = RegInit(false.B)
     val preflightBlocked = ctrlBlock.io.evuPreflightBusy
     check.req.valid := source.valid && memory && !checking && !preflightBlocked && !killed
-    XSPerfAccumulate("evu_preflight_serial_stall", source.valid && memory && !checking && preflightBlocked)
+    val stalled = source.valid && memory && !checking && preflightBlocked && !killed
+    XSPerfAccumulate("evu_preflight_serial_stall", stalled)
+    val barrier = ctrlBlock.io.evuPreflightReasons
+    for ((name, selected) <- Seq("load" -> load, "store" -> store)) {
+      val active = stalled && selected
+      XSPerfAccumulate(s"evu_preflight_${name}_control_only", active && barrier.control && !barrier.status)
+      XSPerfAccumulate(s"evu_preflight_${name}_status_only", active && !barrier.control && barrier.status)
+      XSPerfAccumulate(s"evu_preflight_${name}_both", active && barrier.control && barrier.status)
+    }
+    val arithLoadOpportunity = stalled && f7 === EvuIsa.load && !barrier.control &&
+      barrier.arithmeticOnly && csrio.evu.preflightConfigReady && !ctrlBlock.io.redirect.valid
+    XSPerfAccumulate("evu_preflight_load_arith_only_published", arithLoadOpportunity)
     check.req.bits.base := payload.base
     check.req.bits.length := effectiveLength
     check.req.bits.read := load
@@ -925,6 +936,29 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
       evuCheckedFault := check.resp.bits
     }
     check.perf.foreach { perf =>
+      // Pair with the existing EVU-CMD accept by PC/occurrence. A redirected
+      // preflight has no obligation to reach the EVU.
+      val commandTrace = freechips.rocketchip.util.PlusArg("evu_cmd_trace", width = 1)
+      val ticks = RegInit(0.U(64.W))
+      ticks := ticks + 1.U
+      val tag = source.bits.robIdx.asUInt
+      val reqPc = RegEnable(payload.pc, check.req.fire)
+      val reqTag = RegEnable(tag, check.req.fire)
+      val previousOpportunity = RegNext(arithLoadOpportunity, false.B)
+      val previousTag = RegEnable(tag, arithLoadOpportunity)
+      when(commandTrace.asBool && !reset.asBool) {
+        when(arithLoadOpportunity && (!previousOpportunity || previousTag =/= tag)) {
+          printf(p"[EVU-PREFLIGHT-CMD] event=opportunity rob=${tag} pc=0x${Hexadecimal(payload.pc)} t=${ticks}\n")
+        }
+        when(check.req.fire) {
+          printf(p"[EVU-PREFLIGHT-CMD] event=req rob=${tag} pc=0x${Hexadecimal(payload.pc)} write=${store} bytes=${effectiveLength} t=${ticks}\n")
+        }
+        when(check.cancel && (checking || check.req.fire)) {
+          printf(p"[EVU-PREFLIGHT-CMD] event=cancel rob=${Mux(checking, reqTag, tag)} pc=0x${Hexadecimal(Mux(checking, reqPc, payload.pc))} t=${ticks}\n")
+        }.elsewhen(check.resp.fire) {
+          printf(p"[EVU-PREFLIGHT-CMD] event=resp rob=${reqTag} pc=0x${Hexadecimal(reqPc)} fault=${check.resp.bits.fault} t=${ticks}\n")
+        }
+      }
       val trace = freechips.rocketchip.util.PlusArg("evu_mem_trace", width = 1)
       val fenceIndex = RegInit(0.U(32.W))
       val outputWait = RegInit(0.U(64.W))

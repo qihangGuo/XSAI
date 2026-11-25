@@ -264,6 +264,9 @@ static unsigned check_fused(void) {
   return errors;
 }
 
+#endif
+
+#ifndef EVU_RMS_TILE_KERNELS_ONLY
 static void sort_samples(uint64_t *values) {
   for (unsigned index = 1; index < EVU_RMS_SAMPLES; ++index) {
     const uint64_t value = values[index];

@@ -146,6 +146,7 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
     val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuCompletion(p(ExternalVectorKey)))))
     val evuBusy = Output(Bool())
     val evuPreflightBusy = Output(Bool())
+    val evuPreflightReasons = Output(new xiangshan.evu.EvuPreflightReasons)
     val evuRetired = Output(Valid(new xiangshan.evu.EvuRetiredCommand(p(ExternalVectorKey), (new RobPtr).getWidth)))
     val evuConfigPublished = Input(Valid(UInt((new RobPtr).getWidth.W)))
     val evuStatus = Output(Valid(new EvuCompletion(p(ExternalVectorKey))))
@@ -1336,6 +1337,7 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
   }
   io.evuBusy := amuBuffer.map(_.io.evuBusy).getOrElse(false.B)
   io.evuPreflightBusy := amuBuffer.map(_.io.evuPreflightBusy).getOrElse(false.B)
+  io.evuPreflightReasons := amuBuffer.map(_.io.evuPreflightReasons).getOrElse(0.U.asTypeOf(io.evuPreflightReasons))
 
   val canEnqueueEG = VecInit(io.enq.req.map(req => req.valid && io.enq.canAccept))
   for (i <- 0 until RenameWidth) {

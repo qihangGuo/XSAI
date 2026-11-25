@@ -123,6 +123,7 @@ class EvuPackSlotSpec extends AnyFlatSpec with ChiselScalatestTester {
           assert(capturesFromDemand >= 0 && capturesFromDemand <= demand * 2) // two ordinary FMA contexts can coalesce
         }
         checkDescriptors(8)
+        assert(io.packDesc.reuseHits.peek().litValue > 0)
         val overlaps = io.packSlotIssues.peek().litValue
         assert(overlaps > 0 && io.packSlotCandidates.peek().litValue >= overlaps)
 
@@ -140,6 +141,15 @@ class EvuPackSlotSpec extends AnyFlatSpec with ChiselScalatestTester {
         assert(memory(output + 64) == ((initial & ~slotMask) | (repeat(0x22, 8, 8) << 192)))
         assert(memory(output + 128) == ((initial & ~slotMask) | (repeat(0x44, 8, 8) << 192)))
         checkDescriptors(11)
+        // Rewrite the descriptor EG and consume it immediately, including lanes
+        // other than E0. Subsequent slots must not see the old alternating scale.
+        memory(desc + 64) = repeat(BigInt("c0000000", 16), 32, 16)
+        send(EvuOpcode.Load, 12, desc + 64)
+        for (slot <- 0 until 8) pack(slot, 15 - slot)
+        send(EvuOpcode.Store, 8, output + 192)
+        drain()
+        assert(memory(output + 192) == repeat(0x44, 8, 64))
+        checkDescriptors(19)
         send(EvuOpcode.FReduceSum, 16, 0, vl = 64)
         drain()
         io.sumStages(1).issues.expect(3.U)
@@ -149,7 +159,7 @@ class EvuPackSlotSpec extends AnyFlatSpec with ChiselScalatestTester {
           stage.arbitrationLost.expect(0.U) // no competing work after drain
           stage.ordinaryReadyOnIssue.expect(0.U)
         }
-        checkDescriptors(11)
+        checkDescriptors(19)
       }
   }
 }

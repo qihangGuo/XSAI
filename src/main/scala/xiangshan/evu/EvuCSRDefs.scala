@@ -81,6 +81,23 @@ class EvuDrainIO extends Bundle {
   val response = Flipped(Decoupled(new EvuDrainResult))
 }
 
+/** Passive breakdown of the existing preflight barrier. */
+object EvuPreflightReasons {
+  def arithmeticOnly(status: UInt, completed: Bool, arithmetic: Bool): Bool = {
+    val other = RegInit(0.U(status.getWidth.W))
+    val newOther = completed && !arithmetic
+    other := Cat(other(status.getWidth - 2, 0), newOther)
+    // A fresh non-arithmetic completion must veto even before it enters status.
+    status.orR && !other.orR && !newOther
+  }
+}
+
+class EvuPreflightReasons extends Bundle {
+  val control = Bool()
+  val status = Bool()
+  val arithmeticOnly = Bool()
+}
+
 /** CPU-only identity; the ROB tag is not part of a command sent to the EVU. */
 class EvuRetiredCommand(p: EvuParams, tagWidth: Int) extends Bundle {
   val command = new EvuCoreCommand(p)
@@ -94,6 +111,7 @@ class EvuCSRCoreIO(p: EvuParams, tagWidth: Int) extends Bundle {
   val wantDrain = Output(Bool())
   val accepted = Input(Valid(new EvuRetiredCommand(p, tagWidth)))
   val configPublished = Output(Valid(UInt(tagWidth.W)))
+  val preflightConfigReady = Output(Bool())
   val completed = Input(Valid(new EvuCompletion(p)))
   val drainResult = Input(Valid(new EvuDrainResult))
   val config = Output(new EvuExecutionConfig(p))

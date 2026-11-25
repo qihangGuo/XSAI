@@ -36,6 +36,7 @@ class AmuCtrlBufferIO()(implicit val p: Parameters, val params: BackendParams) e
   }))
   val evuCommittedBusy = Output(Bool())
   val evuPreflightBusy = Output(Bool())
+  val evuPreflightReasons = Output(new xiangshan.evu.EvuPreflightReasons)
   val evuRetired = Output(Valid(new xiangshan.evu.EvuRetiredCommand(p(ExternalVectorKey), (new RobPtr).getWidth)))
 
   // rob wb
@@ -364,6 +365,11 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
     val arith = new AmuArithIO
   }
   val amuCtrl_table = ChiselDB.createTable(s"AMUCtrl_table", new AmuCtrlTableEntry, basicDB = true)
+  val memIssueTrace = Option.when(p(ExternalVectorKey).enable && p(ExternalVectorKey).enableDifftest) {
+    val ticks = RegInit(0.U(64.W))
+    ticks := ticks + 1.U
+    (freechips.rocketchip.util.PlusArg("evu_cmd_trace", width = 1), ticks)
+  }
 
   io.toAMU.zipWithIndex.foreach { case (amuCtrl, i) =>
     val deqEntry = issueEntries(i)
@@ -383,6 +389,12 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
       when (amuCtrl.bits.evu) {
         deqEntry.evuAccepted := true.B
         val f7 = amuCtrl.bits.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey))).instr(31, 25)
+        memIssueTrace.foreach { case (trace, ticks) =>
+          when(trace.asBool && (EvuIsa.isLoad(f7) || EvuIsa.isStore(f7))) {
+            val pc = amuCtrl.bits.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey))).pc
+            printf(p"[EVU-PREFLIGHT-CMD] event=send rob=${(dispatchPtr + i.U).asUInt} pc=0x${Hexadecimal(pc)} t=${ticks}\n")
+          }
+        }
         when(separateIssue.B && f7 === xiangshan.evu.EvuIsa.fence) {
           issueBarrier := true.B
         }
@@ -436,9 +448,13 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
 
   // Skip only the completed prefix being cleared this cycle. The target is
   // still the oldest unfinished entry, never a younger command behind it.
+  val arithmeticCompletion = WireInit(false.B)
   io.evuCompletion.foreach { completion =>
     val completionPtr = if (p(ExternalVectorKey).completionLookahead) nextDeqPtr else deqPtr
     val entry = amuCtrlEntries(completionPtr.value)
+    val f7 = entry.amuCtrl.data.asTypeOf(new EvuCoreCommandData(p(ExternalVectorKey))).instr(31, 25)
+    arithmeticCompletion := !completion.bits.exception && !EvuIsa.isLoad(f7) && !EvuIsa.isStore(f7) &&
+      f7 =/= EvuIsa.fence && f7 =/= EvuIsa.setvli && f7 =/= EvuIsa.setvl
     completion.ready := entry.valid && entry.needAMU && entry.writebacked && entry.committed &&
       entry.amuCtrl.evu && entry.evuAccepted && !entry.canDeq && !io.redirect.valid
     when (completion.fire) {
@@ -493,12 +509,18 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
   // Preflight may walk pages beside older ordinary memory or arithmetic. Keep it behind
   // older control commands and the status pipeline, not ordinary memory.
   // The VMU now owns per-command translations, ordering and asynchronous faults.
-  io.evuPreflightBusy := amuCtrlEntries.map { e =>
+  val preflightControl = amuCtrlEntries.map { e =>
     val f7 = e.amuCtrl.data.asTypeOf(new EvuCoreCommandData(p(ExternalVectorKey))).instr(31, 25)
     val serial = f7 === xiangshan.evu.EvuIsa.fence || f7 === xiangshan.evu.EvuIsa.setvli ||
       f7 === xiangshan.evu.EvuIsa.setvl
     e.valid && e.needAMU && e.writebacked && e.amuCtrl.evu && !e.canDeq && serial
-  }.reduce(_ || _) || statusDrain.orR
+  }.reduce(_ || _)
+  io.evuPreflightBusy := preflightControl || statusDrain.orR
+  io.evuPreflightReasons.control := preflightControl
+  io.evuPreflightReasons.status := statusDrain.orR
+  val completionFire = io.evuCompletion.map(_.fire).getOrElse(false.B)
+  io.evuPreflightReasons.arithmeticOnly :=
+    xiangshan.evu.EvuPreflightReasons.arithmeticOnly(statusDrain, completionFire, arithmeticCompletion)
 
   if (separateIssue) {
     val issueAdvance = issueEntries.zip(io.toAMU).map { case (entry, port) => issuedOrSkipped(entry) || port.fire }
