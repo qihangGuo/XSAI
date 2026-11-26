@@ -1307,6 +1307,9 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
       // Thus, we don't allow load/store instructions to trigger an interrupt.
       // TODO: support non-MMIO load-store instructions to trigger interrupts
       val allow_interrupts = !CommitType.isLoadStore(io.enq.req(i).bits.commitType) &&
+                             !(p(ExternalVectorKey).enable.B && io.enq.req(i).bits.fuType === FuType.evu.U &&
+                               (io.enq.req(i).bits.instr(31, 25) === xiangshan.evu.EvuIsa.load ||
+                                io.enq.req(i).bits.instr(31, 25) === xiangshan.evu.EvuIsa.setvli)) &&
                              !FuType.isFence(io.enq.req(i).bits.fuType) &&
                              !FuType.isCsr(io.enq.req(i).bits.fuType) &&
                              !io.enq.req(i).bits.isVset &&

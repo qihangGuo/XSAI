@@ -29,19 +29,13 @@ class EvuFuncUnit(cfg: FuConfig)(implicit p: Parameters) extends PipedFuncUnit(c
   val instructionPc = in.data.pc.get + (in.ctrl.ftqOffset.get << instOffsetBits)
   payload.pc := utility.SignExt(instructionPc, 64)
   payload.pageMap := 0.U.asTypeOf(payload.pageMap)
-  payload.vl := MuxLookup(imm(17, 15), (ep.vlenBits / 8).U)(Seq(
-    0.U -> (ep.vlenBits / 8).U,
-    1.U -> (ep.vlenBits / 16).U,
-    2.U -> (ep.vlenBits / 32).U,
-    3.U -> (ep.vlenBits / 64).U
-  ))
   val configInstruction = in.ctrl.fuOpType(6, 0) === EvuIsa.setvli || in.ctrl.fuOpType(6, 0) === EvuIsa.setvl
   val requestedType = EvuConfigRules.requestedType(payload.instr, in.data.src(1))
   val normalized = EvuConfigRules.normalize(ep, in.data.src(0), requestedType)
   when(configInstruction) {
     payload.config := normalized
-    payload.vl := normalized.vl
   }
+  payload.vl := EvuIsa.cpuCommandVl(ep, payload.instr, normalized.vl)
   payload.length := ep.vlenBytes.U
   payload.aux := Mux(configInstruction, requestedType(7, 0), 0.U)
 

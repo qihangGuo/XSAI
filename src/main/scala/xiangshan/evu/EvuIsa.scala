@@ -31,6 +31,32 @@ object EvuCoreCommandData {
   }
 }
 
+// Only the CPU's ROB-indexed AMU storage uses this encoding, not the wire protocol.
+class EvuAmuCommandData(p: EvuParams) extends Bundle {
+  val pc = UInt(64.W)
+  val config = new EvuExecutionConfig(p)
+  val instr = UInt(32.W)
+  val base = UInt(64.W)
+  val aux = UInt(8.W)
+
+  def expand(map: EvuPageMap): EvuCoreCommand = {
+    val full = Wire(new EvuCoreCommand(p))
+    elements.foreach { case (name, field) => full.elements(name) := field }
+    full.vl := EvuIsa.cpuCommandVl(p, instr, config.vl)
+    full.length := p.vlenBytes.U
+    full.pageMap := map
+    full
+  }
+}
+
+object EvuAmuCommandData {
+  def pack(full: EvuCoreCommand, p: EvuParams): EvuAmuCommandData = {
+    val stored = Wire(new EvuAmuCommandData(p))
+    stored.elements.foreach { case (name, field) => field := full.elements(name) }
+    stored
+  }
+}
+
 /**
   * The external-vector instruction envelope.
   *
@@ -217,6 +243,15 @@ object EvuIsa {
   // custom1 (0101011) is reserved by the existing MATRIX_INSTS ISA.
   def isCustom(instr: UInt): Bool = instr(6, 0) === custom0
   def sew(instr:      UInt): UInt = instr(14, 12)
+
+  // Ordinary CPU commands carry the SEW-derived default even when the
+  // execution config snapshot has a different VL. Only SETVL[I] uses its VL.
+  def cpuCommandVl(p: EvuParams, instr: UInt, configVl: UInt): UInt = {
+    val f7 = instr(31, 25)
+    val defaultVl = MuxLookup(sew(instr), (p.vlenBits / 8).U)(Seq(
+      1.U -> (p.vlenBits / 16).U, 2.U -> (p.vlenBits / 32).U, 3.U -> (p.vlenBits / 64).U))
+    Mux(f7 === setvli || f7 === setvl, configVl, defaultVl)
+  }
 }
 
 object EvuVtype {

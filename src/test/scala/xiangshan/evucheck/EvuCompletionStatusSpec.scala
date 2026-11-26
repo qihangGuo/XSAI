@@ -12,7 +12,7 @@ import xiangshan.{ExternalVectorKey, XSCoreParamsKey, XSTileKey}
 import xiangshan.backend.BackendParams
 import xiangshan.backend.fu.NewCSR.MstatusModule
 import xiangshan.backend.rob.AmuCtrlBuffer
-import xiangshan.evu.EvuCompletion
+import xiangshan.evu.{EvuCompletion, EvuCoreCommand, EvuIsa}
 
 class EvuCompletionStatusHarness(implicit p: Parameters) extends Module {
   private implicit val backend: BackendParams = p(XSCoreParamsKey).backendParams
@@ -33,6 +33,7 @@ class EvuCompletionStatusHarness(implicit p: Parameters) extends Module {
     val sstatus = Output(UInt(64.W))
   })
   val amu = Module(new AmuCtrlBuffer)
+  amu.io.configPublished := 0.U.asTypeOf(amu.io.configPublished)
   amu.io.enq := 0.U.asTypeOf(amu.io.enq)
   amu.io.enq(0).valid := io.enqueue
   amu.io.enq(0).reqValid := io.enqueue
@@ -41,6 +42,11 @@ class EvuCompletionStatusHarness(implicit p: Parameters) extends Module {
   val wb = amu.io.wb.find(_.bits.amuCtrl.nonEmpty).get
   wb.valid := io.writeback
   wb.bits.amuCtrl.get.evu := true.B
+  val cmd = WireDefault(0.U.asTypeOf(new EvuCoreCommand(ep)))
+  cmd.instr := Cat(EvuIsa.add, 0.U(18.W), EvuIsa.custom0)
+  cmd.length := ep.vlenBytes.U
+  cmd.vl := EvuIsa.cpuCommandVl(ep, cmd.instr, cmd.config.vl)
+  wb.bits.amuCtrl.get.data := cmd.asUInt
   amu.io.deqCommit := 0.U.asTypeOf(amu.io.deqCommit)
   amu.io.deqCommit(0).valid := io.commit
   amu.io.redirect := 0.U.asTypeOf(amu.io.redirect)

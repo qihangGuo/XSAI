@@ -13,11 +13,15 @@ class EvuCommandPackingHarness(p: EvuParams) extends Module {
     val full = Input(new EvuCoreCommand(p))
     val restored = Output(new EvuCoreCommand(p))
     val identical = Output(Bool())
+    val amuIdentical = Output(Bool())
   })
   io.restored := EvuCoreCommandData.expand(EvuCoreCommandData.compact(io.full, p), io.full.pageMap, p)
   val originalPacking = Cat(io.full.pc, io.full.config.asUInt, io.full.instr, io.full.base,
     io.full.vl, io.full.length, io.full.aux, io.full.pageMap.asUInt)
   io.identical := io.full.asUInt === io.restored.asUInt && io.full.asUInt === originalPacking
+  val stored = EvuAmuCommandData.pack(io.full, p)
+  require(stored.getWidth == (new EvuCoreCommandData(p)).getWidth - 32 - io.full.vl.getWidth)
+  io.amuIdentical := stored.expand(io.full.pageMap).asUInt === originalPacking
 }
 
 class EvuAreaStorageSpec extends AnyFlatSpec with ChiselScalatestTester with Matchers {
@@ -47,6 +51,36 @@ class EvuAreaStorageSpec extends AnyFlatSpec with ChiselScalatestTester with Mat
       dut.io.full.pageMap.length.poke(508.U)
       dut.io.full.pageMap.ppn.zipWithIndex.foreach { case (v, i) => v.poke((0x100 + i).U) }
       dut.io.identical.expect(true.B)
+    }
+  }
+
+  it should "restore every CPU command bit from the narrow AMU encoding" in {
+    test(new EvuCommandPackingHarness(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      val c = dut.io.full
+      val random = new scala.util.Random(42)
+      clear(c)
+      c.length.poke(ep.vlenBytes.U)
+      for (op <- Seq(0x10, 0x11, 0x1a, 0x32, 0x45, 0x46); sew <- 0 until 8;
+           vl <- Seq(0, 17, ep.vlenBits)) {
+        val instr = (BigInt(op) << 25) | (BigInt(10, random) << 15) |
+          (BigInt(sew) << 12) | (BigInt(5, random) << 7) | 0x0b
+        c.instr.poke(instr.U)
+        c.pc.poke(BigInt(64, random).U)
+        c.base.poke(BigInt(64, random).U)
+        c.aux.poke(BigInt(8, random).U)
+        c.config.configured.poke(random.nextBoolean().B)
+        c.config.valid.poke(random.nextBoolean().B)
+        c.config.vill.poke(random.nextBoolean().B)
+        c.config.vtype.poke(BigInt(8, random).U)
+        c.config.vl.poke(vl.U)
+        val rawVl = ep.vlenBytes >> (if (sew <= 3) sew else 0)
+        c.vl.poke((if (op == 0x45 || op == 0x46) vl else rawVl).U)
+        c.pageMap.enabled.poke((op == 0x10 || op == 0x11).B)
+        c.pageMap.base.poke(BigInt(64, random).U)
+        c.pageMap.length.poke(BigInt(32, random).U)
+        c.pageMap.ppn.foreach(ppn => ppn.poke(BigInt(ppn.getWidth, random).U))
+        dut.io.amuIdentical.expect(true.B)
+      }
     }
   }
 

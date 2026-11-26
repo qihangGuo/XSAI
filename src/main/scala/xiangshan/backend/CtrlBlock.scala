@@ -702,6 +702,10 @@ class CtrlBlockImp(
   PipeGroupConnect(renameOut, dispatch.io.fromRename, s1_s3_redirect.valid, dispatch.io.toRenameAllFire, "renamePipeDispatch")
 
   dispatch.io.redirect := s1_s3_redirect
+  dispatch.io.evuLoadFull := io.evuLoadFull
+  dispatch.io.evuLoadPending := io.evuLoadPending
+  dispatch.io.evuStableConfig := io.evuStableConfig
+  io.evuLoadReserve := dispatch.io.evuLoadReserve
   val enqRob = Wire(chiselTypeOf(rob.io.enq))
   enqRob.canAccept := rob.io.enq.canAccept
   enqRob.canAcceptForDispatch := rob.io.enq.canAcceptForDispatch
@@ -966,6 +970,10 @@ class CtrlBlockIO()(implicit p: Parameters, params: BackendParams) extends XSBun
   val redirect = ValidIO(new Redirect)
   val evuBusy = Output(Bool())
   val evuPreflightBusy = Output(Bool())
+  val evuLoadFull = Input(Bool())
+  val evuLoadPending = Input(Bool())
+  val evuStableConfig = Input(Bool())
+  val evuLoadReserve = Output(Valid(new RobPtr))
   val evuPreflightReasons = Output(new xiangshan.evu.EvuPreflightReasons)
   val evuRetired = Output(Valid(new xiangshan.evu.EvuRetiredCommand(p(ExternalVectorKey), (new RobPtr).getWidth)))
   val evuConfigPublished = Input(Valid(UInt((new RobPtr).getWidth.W)))

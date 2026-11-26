@@ -99,7 +99,7 @@ class EvuRobOrderingSpec extends AnyFlatSpec with ChiselScalatestTester with Mat
   it should "admit younger commands on matching publication and preserve queued 64/16/64 snapshots" in {
     test(new SetvliPublicationProbe).withAnnotations(Seq(TreadleBackendAnnotation)) { d =>
       val i = d.io
-      i.busy.poke(true.B); i.empty.poke(true.B); i.cancel.poke(false.B)
+      i.busy.poke(true.B); i.empty.poke(false.B); i.cancel.poke(false.B)
       i.issue.poke(false.B); i.pop.poke(false.B); i.illegal.poke(false.B)
       def enqueue(tag: Int, f7: Int = 0x45): Unit = {
         i.f7.poke(f7.U); i.tag.poke(tag.U); i.enqueue.poke(true.B)
@@ -131,7 +131,8 @@ class EvuRobOrderingSpec extends AnyFlatSpec with ChiselScalatestTester with Mat
       i.cancel.poke(true.B); d.clock.step(); i.cancel.poke(false.B)
       retire(11, 16); d.clock.step(); i.blocked.expect(true.B)
       def drain(): Unit = {
-        i.busy.poke(false.B); d.clock.step(); i.blocked.expect(false.B); i.busy.poke(true.B)
+        i.empty.poke(true.B); i.busy.poke(false.B); d.clock.step(); i.blocked.expect(false.B)
+        i.empty.poke(false.B); i.busy.poke(true.B)
       }
       drain()
       for ((op, vill) <- Seq((0x45, true), (0x46, false), (0x1a, false))) {
@@ -168,11 +169,13 @@ class EvuRobOrderingSpec extends AnyFlatSpec with ChiselScalatestTester with Mat
     }
   }
 
-  it should "retain non-speculative decode and backward barriers for memory and control" in {
+  it should "decouple only ordinary LOAD at decode and keep the other memory and control barriers" in {
     val entries = EvuDecoder.decodeArray.map { case (pattern, decode) =>
       (pattern.value >> 25).toInt -> decode.asInstanceOf[XSDecode]
     }.toMap
-    for (f7 <- Seq(0x10, 0x11, 0x52, 0x53, 0x1a, 0x45, 0x46)) {
+    entries(0x10).noSpec shouldBe false
+    entries(0x10).blockBack shouldBe false
+    for (f7 <- Seq(0x11, 0x52, 0x53, 0x1a, 0x45, 0x46)) {
       entries(f7).noSpec shouldBe true
       entries(f7).blockBack shouldBe true
     }

@@ -81,8 +81,12 @@ class EvuDrainIO extends Bundle {
   val response = Flipped(Decoupled(new EvuDrainResult))
 }
 
-/** Passive breakdown of the existing preflight barrier. */
+/** The general barrier stays intact; only a checked load may use the narrower one. */
 object EvuPreflightReasons {
+  def blocksLoad(reasons: EvuPreflightReasons, stable: Bool): Bool =
+    (reasons.control || reasons.status) &&
+      !(stable && !reasons.unpublishedControl && !reasons.otherCompletion &&
+        (!reasons.status || reasons.arithmeticOnly))
   def arithmeticOnly(status: UInt, completed: Bool, arithmetic: Bool): Bool = {
     val other = RegInit(0.U(status.getWidth.W))
     val newOther = completed && !arithmetic
@@ -94,6 +98,8 @@ object EvuPreflightReasons {
 
 class EvuPreflightReasons extends Bundle {
   val control = Bool()
+  val unpublishedControl = Bool()
+  val otherCompletion = Bool()
   val status = Bool()
   val arithmeticOnly = Bool()
 }

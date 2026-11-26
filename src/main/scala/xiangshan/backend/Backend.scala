@@ -43,7 +43,7 @@ import xiangshan.backend.datapath._
 import xiangshan.backend.dispatch.CoreDispatchTopDownIO
 import xiangshan.backend.exu.ExuBlock
 import xiangshan.backend.fu.matrix.Bundles.AmuCtrlIO
-import xiangshan.evu.{EvuAddressFault, EvuCompletion, EvuCoreCommand, EvuIsa, EvuRangeIO, EvuRangeResult}
+import xiangshan.evu.{EvuAddressFault, EvuCompletion, EvuIsa, EvuRangeIO, EvuRangeResult}
 import xiangshan.backend.fu.vector.Bundles.{VConfig, VType}
 import xiangshan.backend.fu.{FenceIO, FenceToSbuffer, FuConfig, FuType, PerfCounterIO}
 import xiangshan.backend.fu.NewCSR.PFEvent
@@ -853,124 +853,21 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
   wbDataPath.io.flush := ctrlBlock.io.redirect
   wbDataPath.io.fromTop.hartId := io.fromTop.hartId
   wbDataPath.io.fromIntExu <> intExuBlock.io.out
+  ctrlBlock.io.evuLoadFull := false.B
+  ctrlBlock.io.evuLoadPending := false.B
+  ctrlBlock.io.evuStableConfig := csrio.evu.preflightConfigReady && csrio.evu.permitted
   io.evuRange.foreach { check =>
     val lanes = wbDataPath.io.fromIntExu.flatten.zip(intExuBlock.io.out.flatten)
       .filter(_._2.bits.params.fuConfigs.contains(FuConfig.EvuCfg))
     require(lanes.size == 1, "EVU preflight requires one scalar command producer")
     val (sink, source) = lanes.head
-    val payload = source.bits.amuCtrl.get.data.asTypeOf(new EvuCoreCommand(p(ExternalVectorKey)))
-    val f7 = payload.instr(31, 25)
-    val load = EvuIsa.isLoad(f7)
-    val store = EvuIsa.isStore(f7)
-    val effectiveSew = Mux(csrio.evu.configured, csrio.evu.config.vtype(5, 3), payload.instr(14, 12))
-    val effectiveLength = Mux(EvuIsa.isElementZero(f7),
-      Mux(csrio.evu.configured && csrio.evu.config.vl === 0.U, 0.U, 4.U),
-      Mux(csrio.evu.configured, csrio.evu.config.vl << effectiveSew, payload.length))
-    val control = f7 === EvuIsa.setvli || f7 === EvuIsa.setvl ||
-      f7 === EvuIsa.fence
-    val decoded = f7.pad(8) // Supported custom funct7 values equal backend opcodes.
-    val illegalConfig = !control && (csrio.evu.config.vill ||
-      !EvuIsa.supportsElementWidth(decoded, effectiveSew))
-    val effectiveLmul = Mux(csrio.evu.configured, csrio.evu.config.vtype(2, 0), 0.U)
-    val invalidGroup = !EvuIsa.supportsRegisterGroups(payload.instr, effectiveLmul)
-    val permissionFault = !csrio.evu.permitted || illegalConfig || invalidGroup
-    val memory = source.bits.amuCtrl.get.evu && (load || store) && !permissionFault
-    val killed = source.bits.robIdx.needFlush(ctrlBlock.io.redirect)
-    val checking = RegInit(false.B)
-    val preflightBlocked = ctrlBlock.io.evuPreflightBusy
-    check.req.valid := source.valid && memory && !checking && !preflightBlocked && !killed
-    val stalled = source.valid && memory && !checking && preflightBlocked && !killed
-    XSPerfAccumulate("evu_preflight_serial_stall", stalled)
-    val barrier = ctrlBlock.io.evuPreflightReasons
-    for ((name, selected) <- Seq("load" -> load, "store" -> store)) {
-      val active = stalled && selected
-      XSPerfAccumulate(s"evu_preflight_${name}_control_only", active && barrier.control && !barrier.status)
-      XSPerfAccumulate(s"evu_preflight_${name}_status_only", active && !barrier.control && barrier.status)
-      XSPerfAccumulate(s"evu_preflight_${name}_both", active && barrier.control && barrier.status)
-    }
-    val arithLoadOpportunity = stalled && f7 === EvuIsa.load && !barrier.control &&
-      barrier.arithmeticOnly && csrio.evu.preflightConfigReady && !ctrlBlock.io.redirect.valid
-    XSPerfAccumulate("evu_preflight_load_arith_only_published", arithLoadOpportunity)
-    check.req.bits.base := payload.base
-    check.req.bits.length := effectiveLength
-    check.req.bits.read := load
-    check.req.bits.write := store
-    // Custom ordinary stores are unmasked and unit-stride. Only a 64-byte
-    // VMU beat with full aligned coverage is guaranteed to avoid external RMW.
-    check.req.bits.fullLineWrite := (p(ExternalVectorKey).mlenBits == 512).B &&
-      f7 === EvuIsa.store && !payload.base(5, 0).orR && !effectiveLength(5, 0).orR
-    check.req.bits.alignment := effectiveSew
-    check.req.bits.illegal := csrio.evu.config.vill ||
-      ((load || store) && effectiveSew > EvuIsa.maxSupportedSew.U)
-    check.cancel := ctrlBlock.io.redirect.valid
-    check.resp.ready := source.valid && memory && sink.ready && !killed
-    when(check.req.fire) { checking := true.B }
-    when(check.resp.fire || check.cancel) { checking := false.B }
-    sink.valid := source.valid && (!memory || check.resp.valid) && !killed
-    source.ready := sink.ready && (!memory || check.resp.valid) && !killed
-    val translated = WireInit(payload)
-    translated.pageMap := check.resp.bits.pageMap
-    translated.config := Mux(f7 === EvuIsa.setvli || f7 === EvuIsa.setvl,
-      payload.config, csrio.evu.config)
-    sink.bits.amuCtrl.get.data := translated.asUInt
-    when(permissionFault) {
-      sink.bits.exceptionVec.get(ExceptionNO.illegalInstr) := true.B
-    }
-    when(memory) {
-      sink.bits.amuCtrl.get.data := translated.asUInt
-      val fault = check.resp.bits.fault
-      val write = check.resp.bits.write
-      val exceptions = sink.bits.exceptionVec.get
-      exceptions := 0.U.asTypeOf(exceptions)
-      exceptions(ExceptionNO.illegalInstr) := fault === EvuAddressFault.Illegal
-      exceptions(ExceptionNO.loadAddrMisaligned) := !write && fault === EvuAddressFault.Misaligned
-      exceptions(ExceptionNO.storeAddrMisaligned) := write && fault === EvuAddressFault.Misaligned
-      exceptions(ExceptionNO.loadAccessFault) := !write && fault === EvuAddressFault.Access
-      exceptions(ExceptionNO.storeAccessFault) := write && fault === EvuAddressFault.Access
-      exceptions(ExceptionNO.loadPageFault) := !write && fault === EvuAddressFault.Page
-      exceptions(ExceptionNO.storePageFault) := write && fault === EvuAddressFault.Page
-      exceptions(ExceptionNO.loadGuestPageFault) := !write && fault === EvuAddressFault.GuestPage
-      exceptions(ExceptionNO.storeGuestPageFault) := write && fault === EvuAddressFault.GuestPage
-    }
+    val (full, pending) = EvuScalarPreflight.connect(source, sink, check, csrio.evu,
+      ctrlBlock.io.evuLoadReserve, ctrlBlock.io.robio.robDeqPtr, ctrlBlock.io.redirect,
+      ctrlBlock.io.evuPreflightReasons, reset.asBool)
+    ctrlBlock.io.evuLoadFull := full
+    ctrlBlock.io.evuLoadPending := pending
     when(check.resp.fire && check.resp.bits.fault =/= EvuAddressFault.None) {
       evuCheckedFault := check.resp.bits
-    }
-    check.perf.foreach { perf =>
-      // Pair with the existing EVU-CMD accept by PC/occurrence. A redirected
-      // preflight has no obligation to reach the EVU.
-      val commandTrace = freechips.rocketchip.util.PlusArg("evu_cmd_trace", width = 1)
-      val ticks = RegInit(0.U(64.W))
-      ticks := ticks + 1.U
-      val tag = source.bits.robIdx.asUInt
-      val reqPc = RegEnable(payload.pc, check.req.fire)
-      val reqTag = RegEnable(tag, check.req.fire)
-      val previousOpportunity = RegNext(arithLoadOpportunity, false.B)
-      val previousTag = RegEnable(tag, arithLoadOpportunity)
-      when(commandTrace.asBool && !reset.asBool) {
-        when(arithLoadOpportunity && (!previousOpportunity || previousTag =/= tag)) {
-          printf(p"[EVU-PREFLIGHT-CMD] event=opportunity rob=${tag} pc=0x${Hexadecimal(payload.pc)} t=${ticks}\n")
-        }
-        when(check.req.fire) {
-          printf(p"[EVU-PREFLIGHT-CMD] event=req rob=${tag} pc=0x${Hexadecimal(payload.pc)} write=${store} bytes=${effectiveLength} t=${ticks}\n")
-        }
-        when(check.cancel && (checking || check.req.fire)) {
-          printf(p"[EVU-PREFLIGHT-CMD] event=cancel rob=${Mux(checking, reqTag, tag)} pc=0x${Hexadecimal(Mux(checking, reqPc, payload.pc))} t=${ticks}\n")
-        }.elsewhen(check.resp.fire) {
-          printf(p"[EVU-PREFLIGHT-CMD] event=resp rob=${reqTag} pc=0x${Hexadecimal(reqPc)} fault=${check.resp.bits.fault} t=${ticks}\n")
-        }
-      }
-      val trace = freechips.rocketchip.util.PlusArg("evu_mem_trace", width = 1)
-      val fenceIndex = RegInit(0.U(32.W))
-      val outputWait = RegInit(0.U(64.W))
-      val serialWait = RegInit(0.U(64.W))
-      when(source.valid && memory && !check.resp.valid && !killed) { outputWait := outputWait + 1.U }
-      when(source.valid && memory && !checking && preflightBlocked && !killed) { serialWait := serialWait + 1.U }
-      when(csrio.evu.completed.valid && csrio.evu.completed.bits.opcode === xiangshan.evu.EvuOpcode.Fence) {
-        fenceIndex := fenceIndex + 1.U
-        when(trace.asBool) {
-          printf(p"[EVU-PREFLIGHT] fence=${fenceIndex} cmd=${perf.commands} busy=${perf.busy} checks=${perf.checks} reads=${perf.reads} writes=${perf.writes} fullstore=${perf.fullStores} lookupstall=${perf.lookupStall} tlbreq=${perf.tlbRequests} tlbmiss=${perf.tlbMisses} sbwait=${perf.sbWait} outputwait=${outputWait} serialwait=${serialWait}\n")
-        }
-      }
     }
   }
   wbDataPath.io.fromFpExu <> fpExuBlock.io.out

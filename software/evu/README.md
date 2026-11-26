@@ -279,12 +279,26 @@ Use the same guest and NEMU reference when comparing RTL builds. Add
 The preflight counters measure CPU cycles, not TLB latency. The six
 `evu_preflight_{load,store}_{control_only,status_only,both}` buckets partition
 `evu_preflight_serial_stall`; redirect-killed commands are excluded.
-`evu_preflight_load_arith_only_published` is a conservative subset of LOAD
-status-only stalls: plain LOAD, published legal configuration, no observed
-fault, and no non-arithmetic completion in or entering the drain window.
-It does not authorize early memory access.
+`evu_preflight_load_arith_only_published` counts would-have-stalled ordinary
+LOAD opportunities under the old status rule, not additional stall cycles.
+`evu_load_check_bypass` counts requests that actually handshook despite the
+old control/status barrier. Neither counts saved tile cycles.
 
-`[EVU-PREFLIGHT-CMD]` reports the start of each such opportunity, request
+Ordinary LOADs reserve one of two CPU slots at dispatch and capture their
+base, range and configuration on the scalar port. A younger LOAD may fill
+first, but only the scalar ROB head can use the shared address checker.
+Younger CPU memory operations cannot occupy the store queue ahead of this
+check. STORE and element-zero memory keep their original dispatch barriers.
+Only a stable load configuration may bypass an exclusively arithmetic status
+drain or its matching, already published immediate SETVLI control.
+The external command format and the in-order, post-retirement send are unchanged.
+
+`[EVU-LOAD-SLOT] event=capture` records the ordinary LOAD leaving the scalar
+port. Compare `evu_load_capture_before_head` to `evu_load_slot_capture`;
+`evu_load_both_reserved` counts cycles, not rejected loads.
+`evu_setvli_admitted_nonempty` counts cycles admitting a legal immediate SETVLI
+without waiting for an empty ROB. Younger commands still wait for publication.
+`[EVU-PREFLIGHT-CMD]` reports the start of each arithmetic opportunity, request
 and response handshakes, cancellation, and CPU send. Match by ROB tag and
 PC within a live command (tags wrap). Match sends to `[EVU-CMD] event=accept`
 by PC and occurrence in send order, not speculative request order. With CDC,

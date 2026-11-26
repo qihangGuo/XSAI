@@ -12,7 +12,7 @@ import xiangshan.{ExternalVectorKey, XSCoreParamsKey, XSTileKey}
 import xiangshan.backend.BackendParams
 import xiangshan.backend.fu.matrix.Bundles.AmuCtrlIO
 import xiangshan.backend.rob.AmuCtrlBuffer
-import xiangshan.evu.{EvuCompletion, EvuCoreCommand, EvuPageMap}
+import xiangshan.evu.{EvuCompletion, EvuCoreCommand, EvuIsa, EvuPageMap}
 
 class EvuAmuCompletionHarness(implicit p: Parameters) extends Module {
   private implicit val backend: BackendParams = p(XSCoreParamsKey).backendParams
@@ -25,6 +25,10 @@ class EvuAmuCompletionHarness(implicit p: Parameters) extends Module {
     val enqueue = Input(Bool())
     val writeback = Input(Bool())
     val commit = Input(Bool())
+    val commitNext = Input(Bool())
+    val publication = Flipped(Valid(UInt(6.W)))
+    val retiredTag = Output(UInt(6.W))
+    val unresolved = Output(Bool())
     val needAmu = Input(Bool())
     val pc = Input(UInt(64.W))
     val instr = Input(UInt(32.W))
@@ -47,6 +51,9 @@ class EvuAmuCompletionHarness(implicit p: Parameters) extends Module {
     val preflightBusy = Output(Bool())
   })
   val amu = Module(new AmuCtrlBuffer)
+  amu.io.configPublished := io.publication
+  io.retiredTag := amu.io.evuRetired.bits.robTag
+  io.unresolved := amu.io.evuPreflightReasons.unpublishedControl
   amu.io.enq := 0.U.asTypeOf(amu.io.enq)
   amu.io.enq(0).valid := io.enqueue
   amu.io.enq(0).reqValid := io.enqueue
@@ -58,6 +65,8 @@ class EvuAmuCompletionHarness(implicit p: Parameters) extends Module {
   val command = WireDefault(0.U.asTypeOf(new EvuCoreCommand(ep)))
   command.pc := io.pc
   command.instr := io.instr
+  command.length := ep.vlenBytes.U
+  command.vl := EvuIsa.cpuCommandVl(ep, io.instr, command.config.vl)
   command.pageMap := io.pageMap
   val wb = amu.io.wb.find(_.bits.amuCtrl.nonEmpty).get
   wb.valid := io.writeback
@@ -67,6 +76,8 @@ class EvuAmuCompletionHarness(implicit p: Parameters) extends Module {
   amu.io.deqCommit := 0.U.asTypeOf(amu.io.deqCommit)
   amu.io.deqCommit(0).valid := io.commit
   amu.io.deqCommit(0).ptr.value := io.index
+  amu.io.deqCommit(1).valid := io.commitNext
+  amu.io.deqCommit(1).ptr.value := io.index + 1.U
   amu.io.redirect := 0.U.asTypeOf(amu.io.redirect)
   amu.io.redirect.valid := io.redirect
   amu.io.redirect.all := io.redirect
@@ -91,6 +102,32 @@ class EvuAmuCompletionHarness(implicit p: Parameters) extends Module {
 
 class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with Matchers {
   behavior of "AMU ordered EVU completions"
+
+  it should "publish the configuration rather than older arithmetic retiring in the same cycle" in {
+    val (base, _, _) = ArgParser.parse(Array("--config", "DefaultExternalVectorMatrixConfig",
+      "--disable-perf", "--disable-alwaysdb"))
+    implicit val p: Parameters = base.alterPartial {
+      case XSCoreParamsKey => base(XSTileKey).head.copy(RobSize = 32)
+    }
+    test(new EvuAmuCompletionHarness).withAnnotations(Seq(TreadleBackendAnnotation)) { d =>
+      val i = d.io
+      i.issueReady.poke(false.B); i.commit.poke(false.B); i.commitNext.poke(false.B)
+      i.publication.valid.poke(false.B); i.redirect.poke(false.B); i.completion.valid.poke(false.B)
+      i.matrix.poke(false.B); i.needAmu.poke(true.B)
+      for ((op, n) <- Seq(0x32, 0x45).zipWithIndex) {
+        i.index.poke(n.U); i.instr.poke(((BigInt(op) << 25) | 0x0b).U)
+        i.enqueue.poke(true.B); d.clock.step(); i.enqueue.poke(false.B)
+        i.writeback.poke(true.B); d.clock.step(); i.writeback.poke(false.B)
+      }
+      i.index.poke(0.U); i.commit.poke(true.B); i.commitNext.poke(true.B)
+      i.retiredTag.expect(1.U); d.clock.step(); i.commit.poke(false.B); i.commitNext.poke(false.B)
+      i.preflightBusy.expect(true.B); i.unresolved.expect(true.B)
+      i.publication.valid.poke(true.B); i.publication.bits.poke(33.U); d.clock.step()
+      i.unresolved.expect(true.B)
+      i.publication.bits.poke(1.U); d.clock.step(); i.publication.valid.poke(false.B)
+      i.unresolved.expect(false.B); i.preflightBusy.expect(true.B)
+    }
+  }
 
   it should "restore separate page maps while preserving arithmetic and CUTE payloads" in {
     val (base, _, _) = ArgParser.parse(Array("--config", "DefaultExternalVectorMatrixConfig",

@@ -30,19 +30,16 @@ class RobEnqueueBarrier(tagWidth: Int) extends Module {
   private val needsEvuDrain = RegInit(true.B)
   private val owner = RegEnable(io.setvliOwner.bits, io.enqueue.valid && io.setvliOwner.valid)
   private val isSetvli = RegInit(false.B)
-  private val published = RegInit(false.B)
   private val matches = io.configPublished.valid && io.configPublished.bits === owner
-  private val configReady = isSetvli && !io.cancel && (published || matches)
-  io.releasedWhileBusy := blocked && io.robEmpty && io.evuBusy && configReady
-  when(io.robEmpty && (!needsEvuDrain || !io.evuBusy || configReady)) {
+  private val configReady = isSetvli && !io.cancel && matches
+  io.releasedWhileBusy := blocked && io.evuBusy && configReady
+  when(configReady || (io.robEmpty && (!needsEvuDrain || !io.evuBusy))) {
     blocked := false.B
   }
-  when(blocked && isSetvli && matches) { published := true.B }
   when(io.enqueue.valid) {
     blocked := true.B
     needsEvuDrain := !io.enqueue.bits
     isSetvli := io.setvliOwner.valid
-    published := false.B
   }
   // A squash revokes only the shortcut; the original drain path still works.
   when(io.cancel) { isSetvli := false.B }
