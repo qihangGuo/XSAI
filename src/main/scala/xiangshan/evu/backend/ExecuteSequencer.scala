@@ -58,7 +58,8 @@ class ExecuteSequencerIO(maxDepth: Int, nFUs: Int, forwarding: Boolean = false)(
 
 class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs: Int,
     ordinaryOnly: Boolean = false, val reductionOnly: Boolean = false,
-    resultForwarding: Boolean = false, val restrictedInteger: Boolean = false)(implicit p: Parameters)
+    resultForwarding: Boolean = false, val restrictedInteger: Boolean = false,
+    val unusedOperands: Set[Int] = Set.empty)(implicit p: Parameters)
     extends Sequencer[ExecuteMicroOp]()(p) {
   val supported_insns = if (restrictedInteger) IntegerContextRules.instructions(allInsns) else allInsns
   def usesPerm = supported_insns.count(_.props.contains(UsesGatherUnit.Y)) > 0
@@ -81,10 +82,10 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   val rvs2Captured = RegInit(false.B)
   val rvdCaptured = RegInit(false.B)
   val rvmCaptured = RegInit(false.B)
-  val rvs1Data = Reg(UInt(dLen.W))
+  val rvs1Data = Option.when(!unusedOperands(0))(Reg(UInt(dLen.W)))
   val rvs2Data = Reg(UInt(dLen.W))
-  val rvdData = Option.when(!restrictedInteger)(Reg(UInt(dLen.W)))
-  val rvmData = Option.when(!restrictedInteger)(Reg(UInt(dLen.W)))
+  val rvdData = Option.when(!restrictedInteger && !unusedOperands(2))(Reg(UInt(dLen.W)))
+  val rvmData = Option.when(!restrictedInteger && !unusedOperands(3))(Reg(UInt(dLen.W)))
   val inst  = Reg(new BackendIssueInst)
   val lowPrecision = EvuLowPrecision.backend(inst.funct3, inst.funct6, inst.rs1)
   val blockMax = xiangshan.evu.EvuBlock.amax(inst.funct3, inst.funct6)
@@ -163,13 +164,17 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   val rgather    = inst.opif6 === OPIFunct6.rgather && usesPerm.B
   val rgather_ix = rgather && inst.funct3.isOneOf(OPIVX, OPIVI)
   val rgather_v  = rgather && inst.funct3.isOneOf(OPIVV)
-  val renv1    = inst.renv1 && (!inst.reduction || acc_direct)
+  val renv1    = inst.renv1 && (!inst.reduction || acc_direct) && (!unusedOperands(0)).B
   val slide_source_index = Mux(slide_up, eidx - slide_offset, eidx +& slide_offset)
   val slide_source_valid = slide_source_index < inst.vconfig.vtype.vlMax
   val renv2    = Mux(rgather_ix, head, inst.renv2) && (!inst.reduction || (!acc_fold && !acc_merge)) &&
     (!aligned_slide || slide_source_valid)
-  val renvd    = inst.renvd && usesRvd.B
-  val renvm    = inst.renvm && !restrictedInteger.B
+  val renvd    = inst.renvd && (usesRvd && !unusedOperands(2)).B
+  val renvm    = inst.renvm && (!restrictedInteger && !unusedOperands(3)).B
+  for (i <- unusedOperands) {
+    val requested = Seq(io.dis.bits.renv1, io.dis.bits.renv2, io.dis.bits.renvd, io.dis.bits.renvm)
+    when(io.dis.fire) { assert(!requested(i), "External conversion requested a removed operand") }
+  }
   val renacc   = inst.reduction && usesAcc.B && !acc_direct
   // Forward only FP32 E0 operands. A full EG, mask, gather, or reduction
   // source must still read the preserved vector bytes from the SRAM.
@@ -474,20 +479,24 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   io.reductionPrefetch := reductionStream && io.prefetch(1).valid
   for (port <- 0 until 3) {
     when(io.atTail && io.lookahead(port).valid) { io.prefetch(port) := io.lookahead(port) }
+    if (unusedOperands(port)) {
+      when(io.atTail) { assert(!io.lookahead(port).valid, "Unreachable conversion prefetch") }
+      io.prefetch(port).valid := false.B
+    }
   }
 
   // Legacy VRF ready acknowledges the returning SRAM data. Forward it in
   // that cycle; retain it only while the current micro-op is stalled.
   val keepOperands = !io.iss.fire && !io.dis.fire
   when (io.rvs1.req.fire) {
-    rvs1Data := io.rvs1.resp
+    rvs1Data.foreach(_ := io.rvs1.resp)
     rvs1Captured := !io.dis.fire && (keepOperands || inst.scalarVrfSource)
     when(inst.scalarVrfSource && !io.dis.fire) { rvs1_mask := 0.U }
   }
   when (io.rvs2.req.fire) { rvs2Data := io.rvs2.resp; rvs2Captured := keepOperands }
   rvdData.foreach { data => when(io.rvd.req.fire) { data := io.rvd.resp; rvdCaptured := keepOperands } }
   rvmData.foreach { data => when(io.rvm.req.fire) { data := io.rvm.resp; rvmCaptured := keepOperands } }
-  val source1 = Mux(rvs1Captured, rvs1Data, io.rvs1.resp)
+  val source1 = rvs1Data.map(d => Mux(rvs1Captured, d, io.rvs1.resp)).getOrElse(0.U(dLen.W))
   io.rvs1_data := Mux(inst.scalarVrfSource, Fill(dLen / 32, source1(31, 0)), source1)
   io.rvs2_data := Mux(rvs2Captured, rvs2Data, io.rvs2.resp)
   io.rvd_data := rvdData.map(data => Mux(rvdCaptured, data, io.rvd.resp)).getOrElse(0.U(dLen.W))

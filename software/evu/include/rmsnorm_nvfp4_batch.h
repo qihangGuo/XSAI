@@ -48,7 +48,9 @@
 #define RN_QUANT_INVERSE 31
 #endif
 
-#define RN_QUANT_INITIALIZE() do { \
+#define RN_LOAD_QUANT_FACTOR() XV_LOAD_E0(RN_QUANT_FACTOR, &quant_integers[1])
+#define RN_QUANT_INITIALIZE() RN_QUANT_INIT_WITH(RN_LOAD_QUANT_FACTOR())
+#define RN_QUANT_INIT_WITH(load_factor) do { \
   (void)xv_setvli(16, 0x10); \
   XV_LOAD_E0(RN_QUANT_SIX, &quant_constants[0]); \
   XV_LOAD_E0(25, &quant_constants[1]); \
@@ -56,7 +58,7 @@
   XV_LOAD_E0(RN_QUANT_MIN_SCALE, &quant_constants[3]); \
   XV_LOAD_E0(RN_QUANT_ZERO, &constants[0]); \
   XV_LOAD_E0(RN_QUANT_INT_ONE, &quant_integers[0]); \
-  XV_LOAD_E0(RN_QUANT_FACTOR, &quant_integers[1]); \
+  load_factor; \
   XV_BROADCAST(RN_QUANT_SIX, RN_QUANT_SIX, 2); \
   XV_BROADCAST(25, 25, 2); \
   XV_BROADCAST(RN_QUANT_ONE, RN_QUANT_ONE, 2); \

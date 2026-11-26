@@ -286,13 +286,12 @@ static uint64_t sample_median(const uint64_t *values) {
 
 __attribute__((used, noinline)) static int rmsnorm_nvfp4_tile_test_main(void) {
   __asm__ volatile ("csrw frm, x0" ::: "memory");
-  const uint64_t capability = XV_CSR_READ(XV_EVCAP);
-  if (XV_CSR_READ(XV_EVLENB) != 512 || (capability & 255) != 2 ||
-      !(capability & XV_CAP_RVV_MATH) || !(capability & XV_CAP_LOW_PRECISION) ||
-      !(capability & XV_CAP_GATHER_IMM) ||
+  const uint64_t required = XV_CAP_RETURNED_VL | XV_CAP_RVV_MATH |
+                            XV_CAP_LOW_PRECISION | XV_CAP_GATHER_IMM;
+  if (xv_init(512, required) ||
       !(alpha >= 0x1p-100f && alpha <= 0x1p100f) ||
       !(epsilon >= 0x1p-100f && epsilon <= 0x1p100f)) {
-    printf("[RN] FAIL invalid EVU ABI or parameters\n");
+    printf("[RN] FAIL unsupported EVU configuration or invalid parameters\n");
     return 1;
   }
   if (xv_setvli(COLS, 0x10) != COLS || xv_setvli(16, 0x10) != 16) {

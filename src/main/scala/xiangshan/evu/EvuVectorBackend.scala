@@ -91,6 +91,7 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
     vrfBanking = p.vrfBanks,
     debugVrf = p.enableDifftest,
     diagnosticCounters = p.enableDifftest,
+    externalConversionOperands = true,
     enableChaining = true,
     enableOOO = true,
     pipelinedVatClear = true,
@@ -359,12 +360,11 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
   memoryContexts.io.allocate.valid := saturn.io.issue.fire && isMemory
   memoryContexts.io.allocate.bits.tag := nextVat
   memoryContexts.io.allocate.bits.pageMap := cmd.pageMap
-  memoryContexts.io.allocate.bits.virtualBase := Mux(cmd.pageMap.enabled, cmd.base & ~4095.U(64.W), 0.U)
+  when(memoryContexts.io.allocate.valid && cmd.pageMap.enabled) {
+    assert(cmd.base === cmd.pageMap.base, "Memory context has a mismatched checked base")
+  }
   memoryContexts.io.release.valid := false.B
   memoryContexts.io.release.bits := 0.U
-  val memoryErrorAddress = RegInit(VecInit.fill(vatEntries)(0.U(64.W)))
-  val memoryErrorSticky = RegInit(VecInit.fill(vatEntries)(false.B))
-  val memoryFaultSticky = RegInit(VecInit.fill(vatEntries)(EvuFault.None))
   // The final store Ack can release its VAT in the same cycle. Forward its
   // error into completion rather than waiting for the sticky registers.
   val returningMemoryFault = Wire(Valid(new Bundle {
@@ -372,6 +372,7 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
     val address = UInt(64.W)
     val cause = UInt(4.W)
   }))
+  memoryContexts.io.fault := returningMemoryFault
   when(io.command.fire) {
     when (immediateCompletion) {
       zeroIdentity.foreach { identity =>
@@ -406,8 +407,6 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
     opcodeByVat.foreach(_(nextVat) := cmd.opcode)
     vdByVat.foreach(_(nextVat) := cmd.vd)
     epochByVat.foreach(_(nextVat) := cmd.epoch)
-    memoryErrorSticky(nextVat) := false.B
-    memoryFaultSticky(nextVat) := EvuFault.None
     if (!unifiedCommands) { nextVat := nextVat + 1.U }
   }
   if (!unifiedCommands) { when(io.flush) { nextVat := 0.U } }
@@ -431,7 +430,8 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
   completionSelector.io.flush := io.flush
   val completionVat = completionSelector.io.out.bits
   val completionFaultNow = returningMemoryFault.valid && returningMemoryFault.bits.vat === completionVat
-  val completionMemoryError = memoryErrorSticky(completionVat) || completionFaultNow
+  val firstFault = memoryContexts.io.firstFault
+  val completionMemoryError = firstFault.valid || completionFaultNow
   val saturnCompletion = Wire(Decoupled(new EvuCompletion(p)))
   saturnCompletion.valid := completionSelector.io.out.valid
   completionSelector.io.out.ready := saturnCompletion.ready
@@ -440,12 +440,12 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
   saturnCompletion.bits.opcode := opcodeByVat.map(_(completionVat)).getOrElse(0.U)
   saturnCompletion.bits.vd := vdByVat.map(_(completionVat)).getOrElse(0.U)
   saturnCompletion.bits.pc := pcByVat.map(_(completionVat)).getOrElse(0.U)
-  saturnCompletion.bits.tval := Mux(memoryErrorSticky(completionVat),
-    memoryErrorAddress(completionVat), Mux(completionFaultNow, returningMemoryFault.bits.address, 0.U))
+  saturnCompletion.bits.tval := Mux(firstFault.valid,
+    firstFault.bits.address, Mux(completionFaultNow, returningMemoryFault.bits.address, 0.U))
   saturnCompletion.bits.tvalValid := memoryByVat(completionVat) && completionMemoryError
   saturnCompletion.bits.exception := memoryByVat(completionVat) && completionMemoryError
   saturnCompletion.bits.cause := Mux(memoryByVat(completionVat) && completionMemoryError,
-    Mux(memoryErrorSticky(completionVat), memoryFaultSticky(completionVat), returningMemoryFault.bits.cause),
+    Mux(firstFault.valid, firstFault.bits.cause, returningMemoryFault.bits.cause),
     EvuFault.None)
   val releasingCompletion = saturn.io.completed.map(r => r.valid && r.bits === completionVat)
   saturnCompletion.bits.fflags := Mux(releasingCompletion.reduce(_ || _),
@@ -487,16 +487,10 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
   when(io.flush) {
     contextLive.foreach(_.foreach(_ := false.B))
     pendingReleases := 0.U
-    memoryErrorSticky.foreach(_ := false.B)
     zeroCompletionPending := false.B
-    memoryFaultSticky.foreach(_ := EvuFault.None)
   }.otherwise {
     when(saturnCompletion.fire) { contextLive.foreach(_(completionVat) := false.B) }
     pendingReleases := visibleReleases & ~Mux(saturnCompletion.fire, UIntToOH(completionVat, vatEntries), 0.U(vatEntries.W))
-    when(saturnCompletion.fire && memoryByVat(completionVat)) {
-      memoryErrorSticky(completionVat) := false.B
-      memoryFaultSticky(completionVat) := EvuFault.None
-    }
   }
 
   saturn.io.scalarResp.ready := true.B
@@ -585,16 +579,6 @@ class EvuVectorBackend(p: EvuParams, unifiedCommands: Boolean = false)(implicit 
   returningMemoryFault.bits.address := hblAddress(responseTag)
   returningMemoryFault.bits.cause := io.memory.resp.bits.fault
   when(io.memory.resp.fire) {
-    // Cancelled responses still reclaim their tags, but cannot fault a new
-    // memory owner after flush (or resurrect a fault on the flush edge).
-    when(returningMemoryFault.valid && !(saturnCompletion.fire && completionVat === hblVat(responseTag))) {
-      val vat = hblVat(responseTag)
-      when(!memoryErrorSticky(vat)) {
-        memoryErrorAddress(vat) := hblAddress(responseTag)
-        memoryFaultSticky(vat) := io.memory.resp.bits.fault
-      }
-      memoryErrorSticky(vat) := true.B
-    }
     hblInFlight(responseTag) := false.B
     hblDrop(responseTag) := false.B
   }

@@ -27,6 +27,7 @@ class AmuCtrlBufferIO()(implicit val p: Parameters, val params: BackendParams) e
     val pcTransType = Option.when(env.EnableDifftest && HasMatrixExtension)(new AddrTransType)
   }
   val enq = Input(Vec(RenameWidth, new EnqBundle))
+  val dispatchEvuMaps = Option.when(p(ExternalVectorKey).enable)(Input(UInt(log2Ceil(RenameWidth + 1).W)))
   val canEnqueue = Output(Bool())
   val canEnqueueForDispatch = Output(Bool())
   val evuBusy = Output(Bool())
@@ -125,6 +126,11 @@ object AmuCtrlEntry {
   }
 }
 
+object AmuCtrlBuffer {
+  def needsEvuMap(inst: DynInst): Bool = inst.fuType === FuType.evu.U &&
+    (EvuIsa.isLoad(inst.instr(31, 25)) || EvuIsa.isStore(inst.instr(31, 25)))
+}
+
 /**
  * AMU Control Buffer
  *
@@ -153,14 +159,14 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
 
   def connectROB(robImp: RobImp) = {
     io.configPublished := robImp.io.evuConfigPublished
+    io.dispatchEvuMaps.foreach(_ := robImp.io.dispatchEvuMaps.get)
     for (i <- 0 until RenameWidth) {
       io.enq(i).valid := robImp.io.enq.req(i).valid && robImp.canEnqueue(i) && !robImp.io.redirect.valid
       io.enq(i).reqValid := robImp.io.enq.req(i).valid
       io.enq(i).allocPtr := robImp.allocatePtrVec(i)
       io.enq(i).needAMU := robImp.io.enq.req(i).bits.needAmuCtrl.get
       val inst = robImp.io.enq.req(i).bits
-      io.enq(i).evuMemory := p(ExternalVectorKey).enable.B && inst.fuType === FuType.evu.U &&
-        (EvuIsa.isLoad(inst.instr(31, 25)) || EvuIsa.isStore(inst.instr(31, 25)))
+      io.enq(i).evuMemory := p(ExternalVectorKey).enable.B && AmuCtrlBuffer.needsEvuMap(inst)
 
       if (env.EnableDifftest && HasMatrixExtension) {
         io.enq(i).pc.get := robImp.io.enq.req(i).bits.pc
@@ -192,7 +198,7 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
       i.U > io.redirect.begin && i.U < io.redirect.end,
       i.U > io.redirect.begin || i.U < io.redirect.end))
   }).asUInt
-  val mapCapacityReady = mapPool.map { pool =>
+  val (mapCapacityReady, mapDispatchReady) = mapPool.map { pool =>
     pool.io.cancelOwners := cancelledOwners
     pool.io.release := 0.U
     for (i <- 0 until RenameWidth) {
@@ -211,11 +217,17 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
       pool.io.write(i).bits.slot := amuCtrlEntries(wb.bits.robIdx.value).mapSlot.get
       pool.io.write(i).bits.owner := wb.bits.robIdx.value
       pool.io.write(i).bits.map := payload.pageMap
+      when(pool.io.write(i).valid && payload.pageMap.enabled) {
+        assert(payload.pageMap.base === payload.base, "Preflight checked a different command base")
+      }
     }
     val requested = PopCount(io.enq.map(e => e.reqValid && e.evuMemory))
-    // Leave a full rename group of credits for the registered admission signal.
-    GatedValidRegNext(pool.io.occupied +& requested <= (32 - RenameWidth).U, true.B)
-  }.getOrElse(true.B)
+    val grants = EvuPageMapPool.admission(pool.io.occupied, requested, io.dispatchEvuMaps.get, RenameWidth)
+    when(io.enq.map(_.reqValid).reduce(_ || _)) {
+      assert(grants._1, "dispatched ROB group lost its CPU translation capacity")
+    }
+    grants
+  }.getOrElse((true.B, true.B))
 
   def expandControl(entry: AmuCtrlEntry, map: EvuPageMap): AmuCtrlIO = {
     val result = Wire(new AmuCtrlIO)
@@ -249,8 +261,8 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
     true.B
   )
   io.canEnqueue := canEnqueue && mapCapacityReady
-  io.canEnqueueForDispatch := canEnqueueForDispatch && mapCapacityReady
-  XSPerfAccumulate("evu_translation_pool_full", !mapCapacityReady)
+  io.canEnqueueForDispatch := canEnqueueForDispatch && mapDispatchReady
+  XSPerfAccumulate("evu_translation_pool_full", !mapDispatchReady)
 
   // Enqueue (Sync with outer ROB)
   // DynInst does not carry amuCtrl info,
@@ -396,7 +408,10 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
     deqEntry.checkSanity(s"AMUCtrlBuffer: deqEntry[$i]")
     amuCtrl.valid := deqEntry.amuReqValid && !io.redirect.valid &&
       (if (separateIssue) olderIssued && !issueBarrier else true.B)
-    mapPool.foreach(_.io.read(i) := deqEntry.mapSlot.get)
+    mapPool.foreach { pool =>
+      pool.io.read(i) := deqEntry.mapSlot.get
+      pool.io.readBase(i) := deqEntry.amuCtrl.evuData.base
+    }
     val expanded = expandControl(deqEntry, mapPool.map(_.io.data(i)).getOrElse(
       0.U.asTypeOf(new EvuPageMap(p(ExternalVectorKey)))))
     amuCtrl.bits := Mux(deqEntry.amuReqValid, expanded, 0.U.asTypeOf(new AmuCtrlIO))

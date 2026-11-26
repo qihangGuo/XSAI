@@ -1,4 +1,4 @@
-"""Compare four fresh EMU runs of rmsnorm_nvfp4_tile_diag_evu_test."""
+"""Compare archived L/R/B/Q RMSNorm tile diagnostic EMU logs."""
 import argparse
 from pathlib import Path
 import re

@@ -32,6 +32,7 @@ class EvuAmuCompletionHarness(implicit p: Parameters) extends Module {
     val needAmu = Input(Bool())
     val pc = Input(UInt(64.W))
     val instr = Input(UInt(32.W))
+    val base = Input(UInt(64.W))
     val pageMap = Input(new EvuPageMap(ep))
     val matrix = Input(Bool())
     val matrixData = Input(UInt(150.W))
@@ -51,6 +52,7 @@ class EvuAmuCompletionHarness(implicit p: Parameters) extends Module {
     val preflightBusy = Output(Bool())
   })
   val amu = Module(new AmuCtrlBuffer)
+  amu.io.dispatchEvuMaps.foreach(_ := 0.U) // This harness drives ROB enqueue directly.
   amu.io.configPublished := io.publication
   io.retiredTag := amu.io.evuRetired.bits.robTag
   io.unresolved := amu.io.evuPreflightReasons.unpublishedControl
@@ -65,6 +67,7 @@ class EvuAmuCompletionHarness(implicit p: Parameters) extends Module {
   val command = WireDefault(0.U.asTypeOf(new EvuCoreCommand(ep)))
   command.pc := io.pc
   command.instr := io.instr
+  command.base := io.base
   command.length := ep.vlenBytes.U
   command.vl := EvuIsa.cpuCommandVl(ep, io.instr, command.config.vl)
   command.pageMap := io.pageMap
@@ -165,6 +168,7 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
         dut.clock.step()
         dut.io.enqueue.poke(false.B)
         dut.io.pageMap.enabled.poke(true.B)
+        dut.io.base.poke((0x10000 + index * 4096).U)
         dut.io.pageMap.base.poke((0x10000 + index * 4096).U)
         dut.io.pageMap.length.poke((64 + index).U)
         dut.io.pageMap.ppn.zipWithIndex.foreach { case (ppn, page) => ppn.poke((100 + index * 3 + page).U) }

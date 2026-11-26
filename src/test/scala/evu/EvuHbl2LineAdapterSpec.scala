@@ -74,7 +74,7 @@ class EvuHbl2LineAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with
           if (!flushOnResponse) {
             dut.io.client.resp.bits.tag.expect(0.U)
             dut.io.client.resp.bits.error.expect(false.B)
-            if (!write) { dut.io.client.resp.bits.data.expect(123.U) }
+            dut.io.client.resp.bits.data.expect((if (write) 0 else 123).U)
           }
           dut.clock.step()
           dut.io.memory.resp.valid.poke(false.B)
@@ -83,6 +83,7 @@ class EvuHbl2LineAdapterSpec extends AnyFlatSpec with ChiselScalatestTester with
             dut.io.client.resp.bits.tag.expect(1.U)
             dut.io.client.resp.bits.error.expect(true.B)
             dut.io.client.resp.bits.fault.expect(EvuFault.Bus)
+            dut.io.client.resp.bits.data.expect(0.U)
             dut.clock.step()
           }
           dut.io.client.resp.valid.expect(false.B)

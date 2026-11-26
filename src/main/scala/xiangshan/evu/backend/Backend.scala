@@ -91,8 +91,9 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
   val vls = Module(new LoadSequencer)
   val vss = Module(new StoreSequencer(resultForwarding = true))
+  val directSumLoad = dLen == 512 && xissParams.flatMap(_.seqs).count(_.name == "fp_fma") == 1
   val reductionSeqs = (0 until vParams.reductionContexts).map { i =>
-    Module(new SpecialSequencer(all_supported_insns, i, vParams.reductionContexts, interleave)).suggestName(s"vps$i")
+    Module(new SpecialSequencer(all_supported_insns, i, vParams.reductionContexts, interleave, directSumLoad)).suggestName(s"vps$i")
   }
   val vps = reductionSeqs.head // Only context zero handles permutations and VMU index/mask streams.
   val executionContexts = xissParams.zip(contextLayouts).map { case (q, layouts) =>
@@ -102,7 +103,12 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
           ordinaryOnly = layout.dedicated && layout.reductionOwner(c).isEmpty,
           reductionOnly = layout.reductionOwner(c).nonEmpty,
           resultForwarding = forwardingNames.contains(s.name),
-          restrictedInteger = s.name == "int" && c > 0))
+          restrictedInteger = s.name == "int" && c > 0,
+          unusedOperands = if (!vParams.externalConversionOperands) Set.empty[Int] else s.name match {
+            case "fp_bf16" | "fp_xx8" => Set(0, 2, 3)
+            case "fp_mxfp" => Set(2, 3)
+            case _ => Set.empty[Int]
+          }))
           .suggestName(s"vxs${s.name}_$c")
       }
     }
@@ -424,6 +430,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   val vrf = Module(new RegisterAccess(flat_vxs.size, maxPipeDepth,
     reductionContexts = vParams.reductionContexts,
     shortIntegerContexts = flat_vxs.zipWithIndex.collect { case (seq, i) if seq.restrictedInteger => i }.toSet,
+    unusedOperands = flat_vxs.zipWithIndex.flatMap { case (s, i) => s.unusedOperands.map((_, i)) }.toSet,
     executionClasses = contextsByFu.zip(xissParams.flatMap(_.seqs)).flatMap { case (seqs, factory) =>
       Seq.fill(seqs.size)(EvuReadClass.names.indexOf(factory.name) match { case -1 => 4; case id => id })
     }))
@@ -432,6 +439,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   io.vrfPerf := vrf.io.perf
 
   val forwardSeqs = flat_vxs.filter(_.io.forward.nonEmpty)
+  val forwardPorts = forwardSeqs.flatMap(s => (0 until 3).filterNot(s.unusedOperands).map(p => (s, p)))
+  val forwardIndex = forwardPorts.zipWithIndex.toMap
   val forwardUnits = flat_vxus.zip(xissParams.flatMap(_.seqs)).collect {
     case (unit, factory) if forwardingNames.contains(factory.name) && unit.pipe_fus.nonEmpty => unit
   }
@@ -457,7 +466,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     forwardWriter(hazard.valid, hazard.bits.vat, hazard.bits.eg_oh)
   }
   for (hazard <- pendingWrites) { forwardWriter(hazard.valid, hazard.bits.vat, hazard.bits.eg_oh) }
-  val forwarding = Module(new VectorResultForwarding(forwardUnits.size + forwardIterUnits.size, forwardSeqs.size * 3 + 1,
+  val forwarding = Module(new VectorResultForwarding(forwardUnits.size + forwardIterUnits.size, forwardPorts.size + 1,
     forwardWriters.size, partial = vParams.shortResultForwarding,
     retainCycles = if (vParams.shortResultForwarding) 4 else 0,
     invalidationPorts = vParams.vrfBanking))
@@ -482,8 +491,10 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     result.bits.vat := unit.io.iterWriteVat
     forwarding.io.accepted.foreach(_(forwardUnits.size + index) := unit.io.iter_write.fire)
   }
-  val forwardReads = forwardSeqs.flatMap(seq => Seq(seq.io.rvs1, seq.io.rvs2, seq.io.rvd)
-    .zip(seq.io.forward.get).map { case (read, port) => (read, port, seq.io.vat) })
+  forwardSeqs.foreach(s => s.unusedOperands.filter(_ < 3).foreach(i => s.io.forward.get(i).available := false.B))
+  val forwardReads = forwardPorts.map { case (s, p) =>
+    (Seq(s.io.rvs1, s.io.rvs2, s.io.rvd)(p), s.io.forward.get(p), s.io.vat)
+  }
   for (((read, port, vat), i) <- forwardReads.zipWithIndex) {
     forwarding.io.reads(i).valid := port.eligible
     forwarding.io.reads(i).bits.eg := read.req.bits.eg
@@ -544,10 +555,9 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     vxs.io.rvs2.resp := vrf.io.vxs(i).rvs2.resp
     vxs.io.rvd.resp := vrf.io.vxs(i).rvd.resp
     if (vxs.io.forward.nonEmpty) {
-      val base = forwardSeqs.indexOf(vxs) * 3
       for (((read, memory), port) <- Seq((vxs.io.rvs1, vrf.io.vxs(i).rvs1),
-        (vxs.io.rvs2, vrf.io.vxs(i).rvs2), (vxs.io.rvd, vrf.io.vxs(i).rvd)).zipWithIndex) {
-        val arithmeticResult = forwarding.io.out(base + port)
+        (vxs.io.rvs2, vrf.io.vxs(i).rvs2), (vxs.io.rvd, vrf.io.vxs(i).rvd)).zipWithIndex if !vxs.unusedOperands(port)) {
+        val arithmeticResult = forwarding.io.out(forwardIndex((vxs, port)))
         val result = WireInit(arithmeticResult)
         // Only ordinary FMAs need the wide load bypass for load -> square.
         if (port < 2 && vxu.descName == "fp_fma" && !vxs.reductionOnly) {
@@ -702,6 +712,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
 
   // Contexts share one arithmetic unit and one physical result channel.
   // Reserve output time across all contexts, including different latencies.
+  val directSumFire = WireInit(false.B)
+  io.executionPerf.reductionDirectLoads := diagnosticCount("reductionDirectLoads", directSumFire)
   for (((seqs, xu), factory) <- contextsByFu.zip(flat_vxus).zip(xissParams.flatMap(_.seqs))) {
     seqs.foreach(_.io.lookahead := 0.U.asTypeOf(seqs.head.io.lookahead))
     val lookaheadEligible = WireInit(false.B)
@@ -737,7 +749,11 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
     val criticalPriority = Set("fp_fma", "fp_cmp").contains(factory.name)
     val arb = Module(new SharedExecutionArbiter(seqs.size, maxPipeDepth, xu.nFUs, criticalPriority))
     for ((seq, c) <- seqs.zipWithIndex) { arb.io.in(c) <> executeCandidates(flat_vxs.indexOf(seq)) }
-    xu.io.iss <> arb.io.out
+    if (factory.name == "fp_fma" && directSumLoad) {
+      directSumFire := ReductionFirstGroup.route(arb.io.out, xu.io.iss, reductionSeqs)
+    } else {
+      xu.io.iss <> arb.io.out
+    }
     val perfIndex = EvuFuPerf.names.indexOf(factory.name)
     if (perfIndex >= 0 && (vParams.diagnosticCounters || !Set("int", "fp_div").contains(factory.name))) {
       val counters = io.executionPerf.byFu(perfIndex)
@@ -807,16 +823,15 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       val loadWrites = vls.io.seq_hazard.bits.wintent & Fill(egsTotal, vls.io.seq_hazard.valid) |
         vlissq.io.hazards.map(h => Mux(h.valid, FillInterleaved(egsPerVReg, h.bits.wintent), 0.U)).reduce(_ | _)
       val operands = seqs.filter(_.io.forward.nonEmpty).flatMap { seq =>
-        val base = forwardSeqs.indexOf(seq) * 3
-        Seq(seq.io.rvs1, seq.io.rvs2, seq.io.rvd).zipWithIndex.map { case (read, port) =>
-          (seq.io.forward.get(port).eligible, read, base + port)
+        Seq(seq.io.rvs1, seq.io.rvs2, seq.io.rvd).zipWithIndex.collect { case (read, port) if !seq.unusedOperands(port) =>
+          (seq.io.forward.get(port).eligible, read, forwardIndex((seq, port)))
         }
       }
       counters.loadWait := diagnosticCount(s"${factory.name}_loadWait",
         seqs.map(s => s.io.busy && (s.io.rawDependencies & loadWrites).orR).reduce(_ || _))
       counters.forwardWait := diagnosticCount(s"${factory.name}_forwardWait", operands.map {
         case (eligible, read, index) => eligible && !forwarding.io.out(index).valid &&
-          forwardSeqs(index / 3).io.rawDependencies(read.req.bits.eg) && !loadWrites(read.req.bits.eg)
+          forwardPorts(index)._1.io.rawDependencies(read.req.bits.eg) && !loadWrites(read.req.bits.eg)
       }.foldLeft(false.B)(_ || _))
       counters.idleWithWork := diagnosticCount(s"${factory.name}_idleWithWork", pendingWork && !xu.io.iss.fire)
       counters.readyArbitrationWait := diagnosticCount(s"${factory.name}_readyArbitrationWait", arb.io.contended)

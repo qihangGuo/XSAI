@@ -112,7 +112,7 @@ static unsigned run_case(unsigned operation, unsigned mode) {
 }
 
 __attribute__((used, noinline)) static int rvv_math_test_main(void) {
-  if (XV_CSR_READ(XV_EVLENB) != VECTOR_BYTES || !(XV_CSR_READ(XV_EVCAP) & XV_CAP_RVV_MATH)) {
+  if (xv_init(VECTOR_BYTES, XV_CAP_RETURNED_VL | XV_CAP_RVV_MATH)) {
     printf("[RVVMATH] FAIL requires EVLEN=4096 and EVCAP.RVV_MATH\n");
     return 1;
   }

@@ -40,8 +40,11 @@ static void mp_backend_init(void) {
 }
 
 static unsigned mp_backend_check(void) {
-  if (XV_CSR_READ(XV_EVLENB) == 512) return 0;
-  printf("[MP-EVU] FAIL require VLEN=4096\n");
+  uint64_t required = 0;
+  if (MEM_PATH_CASE == 1 || MEM_PATH_CASE == 2) required = online_required_caps(MEM_PATH_CASE - 1);
+  else if (!MEM_PATH_CASE && MEM_PATH_GROUP <= 1) required = online_required_caps(-1);
+  if (!xv_init(512, required)) return 0;
+  printf("[MP-EVU] FAIL unsupported EVU configuration\n");
   return 1;
 }
 

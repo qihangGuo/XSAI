@@ -6,7 +6,7 @@ import org.chipsalliance.cde.config._
 import xiangshan.evu.common._
 import xiangshan.evu.insns._
 
-class SpecialSequencerIO(implicit p: Parameters) extends SequencerIO(new SpecialMicroOp) {
+class SpecialSequencerIO(directLoad: Boolean)(implicit p: Parameters) extends SequencerIO(new SpecialMicroOp) {
   val rvs2 = Decoupled(new VectorReadReq)
   val rvm  = Decoupled(new VectorReadReq)
   val e0Read = Output(Bool())
@@ -24,11 +24,12 @@ class SpecialSequencerIO(implicit p: Parameters) extends SequencerIO(new Special
   val rvm_data = Output(UInt(dLen.W))
   val acc_fu_resp = Input(Valid(new VectorWrite(dLen)))
   val acc_fu_resp_slot = Input(UInt(2.W))
+  val acc_load = Option.when(directLoad)(Flipped(Valid(UInt(dLen.W))))
   val acc_done = Input(Bool())
 }
 
 class SpecialSequencer(exu_insns: Seq[VectorInstruction], context: Int = 0, contexts: Int = 1,
-    dynamicContext: Boolean = false)(implicit p: Parameters) extends Sequencer[SpecialMicroOp]()(p) {
+    dynamicContext: Boolean = false, directLoad: Boolean = false)(implicit p: Parameters) extends Sequencer[SpecialMicroOp]()(p) {
   def accepts(inst: VectorIssueInst) = {
     val needs_mask = inst.vmu && (!inst.vm && inst.mop =/= mopUnit)
     val needs_index = inst.vmu && inst.mop(0)
@@ -43,7 +44,7 @@ class SpecialSequencer(exu_insns: Seq[VectorInstruction], context: Int = 0, cont
       (reduction && (dynamicContext.B || (inst.vat % contexts.U) === context.U))
   }
 
-  val io = IO(new SpecialSequencerIO)
+  val io = IO(new SpecialSequencerIO(directLoad))
 
   val valid = RegInit(false.B)
   val rvs2Captured = RegInit(false.B)
@@ -230,17 +231,25 @@ class SpecialSequencer(exu_insns: Seq[VectorInstruction], context: Int = 0, cont
     valid := false.B
   }
 
+  // Direct initialization shares the registered write port; it is not a
+  // combinational return to the operation that supplied the data.
+  val load = io.acc_load.map(_.valid).getOrElse(false.B)
+  val writeData = io.acc_load.map(v => Mux(load, v.bits, io.acc_fu_resp.bits.data)).getOrElse(io.acc_fu_resp.bits.data)
+  val writeSlot = Mux(load, io.acc_slot, io.acc_fu_resp_slot)
+  when(load) {
+    assert(!io.acc_fu_resp.valid && io.acc_data.fire && io.acc_slot =/= 0.U && !acc_busy(io.acc_slot))
+  }
   for (slot <- 0 until 4) {
-    when (io.acc_fu_resp.valid && io.acc_fu_resp_slot === slot.U) {
+    when ((io.acc_fu_resp.valid || load) && writeSlot === slot.U) {
       acc_busy(slot) := false.B
       for (i <- 0 until dLenB) {
-        when (io.acc_fu_resp.bits.mask(i*8)) {
-          acc_regs(slot)(i) := io.acc_fu_resp.bits.data >> (i*8)
+        when (load || io.acc_fu_resp.bits.mask(i*8)) {
+          acc_regs(slot)(i) := writeData >> (i*8)
         }
       }
     }
     when (io.acc_data.fire && io.acc_slot === slot.U) {
-      acc_busy(slot) := true.B
+      acc_busy(slot) := !load
     }
   }
 

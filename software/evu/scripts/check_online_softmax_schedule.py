@@ -216,6 +216,9 @@ class Machine:
             self.regs[d][:count] = [f32(2.0 ** v) for v in values]
             return
         a, b = self.expression(args[1]), self.expression(args[2])
+        if name == 'XV_SLIDEUP':
+            self.regs[d][a:count] = self.regs[b][:count-a]
+            return
         if name in ['XV_GATHER', 'XV_GATHER_IMM', 'XV_BROADCAST']:
             if name == 'XV_BROADCAST':
                 b = a
@@ -348,7 +351,7 @@ for rows, cols, stride, scale, state, reduce, pipeline, load_batch in [
         if cols == 256:
             assert dut.counts['read_scores'] == rows * cols
             if not state and reduce == 128 and not load_batch:
-                assert dut.counts['configs'] == 1
+                assert dut.counts['configs'] == 1 + int(pipeline and first and rows <= 128)
             assert dut.counts['read_row_alpha'] == 0
             assert dut.counts['XV_FREDUCE_MAX'] == rows
             assert dut.counts['XV_FREDUCE_SUM'] == rows
@@ -369,7 +372,7 @@ for rows, cols, stride, scale, state, reduce, pipeline, load_batch in [
                 assert dut.counts['XV_GATHER_IMM'] == (rows * 2 if load_batch and not first else 0)
                 assert dut.counts['read_state_pack'] == 0
                 assert dut.counts['write_state_pack'] == 0
-                assert dut.counts['configs'] == (1 + rows // 2 if load_batch and not first else 1)
+                assert dut.counts['configs'] == 1 + (rows // 2 if load_batch and not first else 0) + int(first and rows <= 128)
                 assert dut.counts['XV_EXP2_E0'] == (0 if first else rows)
             assert dut.counts['write_row_max'] == rows
             assert dut.counts['write_row_sum'] == rows
@@ -389,14 +392,15 @@ for (batch, first), (commands, configs, gathers) in sorted(memory_costs.items())
     print(f'COST: loads4={batch} first={first} memory_commands={commands} '
           f'configs={configs} gathers={gathers}')
 for first, counts in sorted(default_costs.items()):
-    expected = ({'configs': 1, 'XV_LOAD_E0': 69, 'XV_LOAD': 64,
+    expected = ({'configs': 1, 'XV_LOAD_E0': 67, 'XV_LOAD': 64,
                  'XV_STORE_E0': 96, 'XV_STORE': 64, 'XV_FMAX': 32,
                  'XV_FREDUCE_MAX': 32, 'XV_FMAX_E0': 32, 'XV_FMUL_SCALAR': 64,
                  'XV_FSUB_E0': 32, 'XV_FMUL_E0': 96, 'XV_EXP2_E0': 32,
                  'XV_FSUB_SCALAR': 64, 'XV_EXP2': 64, 'XV_FADD': 32,
-                 'XV_FREDUCE_SUM': 32, 'XV_FADD_E0': 32} if not first else
-                {'configs': 1, 'XV_LOAD_E0': 5, 'XV_LOAD': 64,
-                 'XV_STORE_E0': 96, 'XV_STORE': 64, 'XV_FMAX': 32,
+                 'XV_FREDUCE_SUM': 32, 'XV_FADD_E0': 33} if not first else
+                {'configs': 2, 'XV_LOAD_E0': 3, 'XV_LOAD': 64,
+                 'XV_STORE_E0': 64, 'XV_STORE': 65, 'XV_FMAX': 32,
+                 'XV_FADD_E0': 1, 'XV_BROADCAST': 1,
                  'XV_FREDUCE_MAX': 32, 'XV_FMUL_SCALAR': 64,
                  'XV_FMUL_E0': 32, 'XV_FSUB_SCALAR': 64, 'XV_EXP2': 64,
                  'XV_FADD': 32, 'XV_FREDUCE_SUM': 32})

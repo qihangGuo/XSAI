@@ -106,6 +106,8 @@ class NewDispatch(implicit p: Parameters) extends XSModule with HasPerfEvents wi
     val evuLoadFull = Input(Bool())
     val evuLoadPending = Input(Bool())
     val evuStableConfig = Input(Bool())
+    val evuConfigPublished = Input(Valid(UInt((new xiangshan.backend.rob.RobPtr).getWidth.W)))
+    val evuConfigOwner = Output(Valid(new xiangshan.backend.rob.RobPtr))
     val evuLoadReserve = Output(Valid(new xiangshan.backend.rob.RobPtr))
     val demandWithoutRob = Output(Bool()) // Diagnostic only, before ROB backpressure.
     // IssueQueues
@@ -783,15 +785,25 @@ class NewDispatch(implicit p: Parameters) extends XSModule with HasPerfEvents wi
   val isBlockBackward  = VecInit(fromRename.map(x => x.valid && x.bits.blockBackward))
   private val loadCandidate = fromRename.map(x => x.valid && x.bits.fuType === FuType.evu.U &&
     x.bits.instr(31, 25) === xiangshan.evu.EvuIsa.load && p(ExternalVectorKey).enable.B)
+  private val configBarrier = Module(new xiangshan.backend.rob.EvuConfigIssueBarrier(RobSize))
+  configBarrier.io.published := io.evuConfigPublished
+  configBarrier.io.redirect.valid := io.redirect.valid
+  configBarrier.io.redirect.bits := io.redirect.bits.robIdx
+  configBarrier.io.flushSelf := io.redirect.bits.flushItself()
+  io.evuConfigOwner := configBarrier.io.owner
+  private val configPending = configBarrier.io.owner.valid
   private val admittedSetvli = fromRename.indices.map { i =>
     val u = fromRename(i).bits
     val ep = p(ExternalVectorKey)
     val olderLoad = loadCandidate.take(i).foldLeft(false.B)(_ || _)
     val requested = Cat(u.instr(14, 12), u.instr(24, 20))
-    ep.enable.B && io.evuStableConfig && !io.evuLoadPending && !olderLoad && !io.singleStep &&
+    ep.enable.B && !configPending && io.evuStableConfig && !io.evuLoadPending && !olderLoad && !io.singleStep &&
       !u.hasException && u.fuType === FuType.evu.U && u.instr(31, 25) === xiangshan.evu.EvuIsa.setvli &&
       !xiangshan.evu.EvuConfigRules.normalize(ep, 0.U, requested).vill
   }
+  private val takeOwner = fromRename.indices.map(i => fromRename(i).fire && admittedSetvli(i))
+  configBarrier.io.admit.valid := VecInit(takeOwner).asUInt.orR
+  configBarrier.io.admit.bits := Mux1H(takeOwner, fromRename.map(_.bits.robIdx))
   val isWaitForward = VecInit(fromRename.indices.map(i =>
     fromRename(i).valid && fromRename(i).bits.waitForward && !admittedSetvli(i)))
   XSPerfAccumulate("evu_setvli_admitted_nonempty", !io.enqRob.isEmpty &&
@@ -807,7 +819,10 @@ class NewDispatch(implicit p: Parameters) extends XSModule with HasPerfEvents wi
   for (i <- 0 until RenameWidth) {
 
     updatedUop(i) := fromRename(i).bits
-    when(admittedSetvli(i)) { updatedUop(i).waitForward := false.B }
+    when(admittedSetvli(i)) {
+      updatedUop(i).waitForward := false.B
+      updatedUop(i).blockBackward := false.B
+    }
     updatedUop(i).debugInfo.eliminatedMove := fromRename(i).bits.eliminatedMove
     // For the LUI instruction: psrc(0) is from register file and should always be zero.
     when (fromRename(i).bits.isLUI) {
@@ -876,9 +891,17 @@ class NewDispatch(implicit p: Parameters) extends XSModule with HasPerfEvents wi
   // would prevent the older preflight's sbIsEmpty handshake until retirement.
   private val loadHold = ordinaryLoad.indices.map { i =>
     val older = ordinaryLoad.take(i).foldLeft(false.B)(_ || _)
-    (ordinaryLoad(i) && (io.evuLoadFull || older)) ||
+    val u = fromRename(i).bits
+    val arithmetic = u.fuType === FuType.evu.U && !loadCandidate(i) && !u.blockBackward && !u.waitForward
+    val safe = (FuType.isAlu(u.fuType) || arithmetic) &&
+      !u.blockBackward && !u.waitForward && !u.hasException && !io.singleStep
+    (fromRename(i).valid && configPending && !safe) ||
+      (ordinaryLoad(i) && (io.evuLoadFull || older)) ||
       ((io.evuLoadPending || older) && (isMem(i) || isMlsVec(i)))
   }
+  XSPerfAccumulate("evu_config_pending_younger_enqueues", PopCount(fromRename.map(u => configPending && u.fire)))
+  XSPerfAccumulate("evu_config_pending_compute_enqueues",
+    PopCount(fromRename.map(u => configPending && u.fire && u.bits.fuType === FuType.evu.U)))
   private val blockedByWaitForward = Wire(Vec(RenameWidth, Bool()))
   blockedByWaitForward(0) := (!io.enqRob.isEmpty && isWaitForward(0)) || loadHold(0)
   for (i <- 1 until RenameWidth) {

@@ -46,7 +46,7 @@
 #define EVU_SOFTMAX_STATE_LOAD_BATCH 0
 #endif
 #ifndef EVU_SOFTMAX_DRAIN_DIAG
-#define EVU_SOFTMAX_DRAIN_DIAG 1
+#define EVU_SOFTMAX_DRAIN_DIAG 0
 #endif
 #if EVU_SOFTMAX_ROWS <= 0 || EVU_SOFTMAX_ROWS % 4 != 0
 #error "EVU_SOFTMAX_ROWS must be a positive multiple of four"
@@ -96,7 +96,7 @@ enum {
 #if EVU_SOFTMAX_COLS <= 128 || EVU_SOFTMAX_COLS == 256
 #define OS_RESIDENT 1
 #if EVU_SOFTMAX_PIPELINE
-#define OS_SCHEDULE "wave4x2"
+#define OS_SCHEDULE "wave4x2_state_v2"
 #else
 #define OS_SCHEDULE "resident_pair2"
 #endif
@@ -123,9 +123,6 @@ static float input_template[ROWS * STRIDE] ALIGN;
 static float seeds[2][VL_MAX] ALIGN;
 static float parameters[3] ALIGN; /* scale, scale * log2(e), log2(e). */
 static volatile float online_scale = EVU_SOFTMAX_SCALE;
-#if EVU_SOFTMAX_STATE_BATCH
-static float state_pack[4] ALIGN;
-#endif
 #if EVU_SOFTMAX_REDUCE_VL != 128
 static uint32_t fold_indices[128 / EVU_SOFTMAX_REDUCE_VL - 1][EVU_SOFTMAX_REDUCE_VL] ALIGN;
 #endif
@@ -254,14 +251,9 @@ static void reset_case(void) {
 #define OS_ADD_SUM(lane, value, tail, acc, max, alpha, old_sum) XV_FADD_E0(acc, old_sum, acc);
 #define OS_SAVE_SUM(lane, value, tail, acc, max, alpha, old_sum) \
   XV_STORE_E0(acc, &row_sum.data[base + (lane)]);
-/* No new insert/slide ISA is assumed. Packing uses measured EVU scratch
- * stores plus a four-element load; this cost may outweigh state-load savings. */
 #define OS_PACK4(vd, a, b, c, d) do { \
-  XV_STORE_E0(a, &state_pack[0]); \
-  XV_STORE_E0(b, &state_pack[1]); \
-  XV_STORE_E0(c, &state_pack[2]); \
-  XV_STORE_E0(d, &state_pack[3]); \
-  XV_LOAD(vd, state_pack, 2); \
+  XV_SLIDEUP(vd, 0, a, 2); XV_SLIDEUP(vd, 1, b, 2); \
+  XV_SLIDEUP(vd, 2, c, 2); XV_SLIDEUP(vd, 3, d, 2); \
 } while (0)
 #define OS_FOLD_MAX(lane, value, tail, acc, max, alpha, old_sum) \
   XV_GATHER(24, 25, acc, 2); XV_FMAX(acc, acc, 24, 2);
@@ -328,13 +320,18 @@ static void reset_case(void) {
  * pair before submitting another max reduction; interleave head EXP2 with
  * tail shifts, and next-batch loads with independent current-batch work.
  */
+#if EVU_SOFTMAX_ROWS <= 128
+#define OS_PIPE_ZERO_ALPHA(PAIR)
+#else
+#define OS_PIPE_ZERO_ALPHA(PAIR) PAIR(OS_ZERO_ALPHA)
+#endif
 #define OS_PIPE_PREPARE(PAIR) do { \
   if (scale != 1.0f) { PAIR(OS_SCALE_MAX) } \
   if (!first) { \
     PAIR(OS_MERGE_MAX) PAIR(OS_ALPHA_DIFF) \
     PAIR(OS_ALPHA_LOG2) PAIR(OS_ALPHA_EXP) \
     PAIR(OS_SAVE_ALPHA) \
-  } else { PAIR(OS_ZERO_ALPHA) } \
+  } else { OS_PIPE_ZERO_ALPHA(PAIR) } \
   PAIR(OS_SAVE_MAX) PAIR(OS_RESIDENT_BIAS) \
 } while (0)
 #define OS_PIPE_STEP(PAIR0, PAIR1, NEXT0, NEXT1, current, next) do { \
@@ -385,9 +382,14 @@ __attribute__((noinline)) static void online_update(unsigned first) {
   XV_LOAD(28, seeds[0], 2);
   XV_LOAD(29, seeds[1], 2);
 #endif
-  XV_LOAD_E0(27, &parameters[0]);
-  XV_LOAD_E0(30, &parameters[1]);
   XV_LOAD_E0(31, &parameters[2]);
+  if (scale != 1.0f) {
+    XV_LOAD_E0(27, &parameters[0]);
+    XV_LOAD_E0(30, &parameters[1]);
+  } else {
+    /* scale * log2(e) == log2(e); v27 is never consumed for unit scale. */
+    XV_FADD_E0(30, 29, 31);
+  }
 #if EVU_SOFTMAX_PIPELINE
   {
     const unsigned base = 0;
@@ -399,6 +401,15 @@ __attribute__((noinline)) static void online_update(unsigned first) {
       OS_PIPE_STEP(OS_B0, OS_B1, OS_A0, OS_A1, block + 4, block + 8);
     }
   }
+#if EVU_SOFTMAX_ROWS <= 128
+  /* Alpha is an output, even on the first update. Publish all +0s with
+   * a single ordinary store instead of a separately preflighted E0 per row. */
+  if (first) {
+    configure(ROWS);
+    XV_BROADCAST(26, 29, 2);
+    XV_STORE(26, row_alpha.data, 2);
+  }
+#endif
 #else
   for (unsigned base = 0; base < ROWS; base += 4) {
 #if OS_RESIDENT
@@ -657,11 +668,19 @@ static int run_case(unsigned first) {
   return failures != 0;
 }
 
+/* first=-1 runs both updates; the two paths can use different broadcasts. */
+static uint64_t online_required_caps(int first) {
+  if (EVU_SOFTMAX_STATE_BATCH || (EVU_SOFTMAX_PIPELINE &&
+      ((first != 1 && EVU_SOFTMAX_STATE_LOAD_BATCH) || (first != 0 && ROWS <= 128))))
+    return XV_CAP_GATHER_IMM;
+  return 0;
+}
+
 __attribute__((used, noinline)) static int online_softmax_test_main(void) {
   __asm__ volatile ("csrw frm, x0\ncsrw fflags, x0" ::: "memory");
-  if (XV_CSR_READ(XV_EVLENB) != 512 || !(online_scale > 0.0f) ||
+  if (xv_init(512, online_required_caps(EVU_SOFTMAX_FIRST)) || !(online_scale > 0.0f) ||
       (float_bits(online_scale) & 0x7f800000u) == 0x7f800000u) {
-    printf("[OS] FAIL require EVLEN=4096 and positive finite scale\n");
+    printf("[OS] FAIL unsupported EVU configuration or invalid scale\n");
     return 1;
   }
 #if OS_RESIDENT

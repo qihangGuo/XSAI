@@ -71,7 +71,9 @@ class FusedProfileTest(unittest.TestCase):
     def test_driver_runs_only_fused_row_major_and_checker_does_not_replay_evu(self):
         source = (SOFTWARE / 'rmsnorm_nvfp4_fused_evu_test.c').read_text()
         driver = function_body(source, 'rmsnorm_nvfp4_fused_test_main')
-        self.assertEqual(re.findall(r'\bexecute\(([^)]*)\)', driver), ['FUSED_NVFP4, 0'])
+        self.assertEqual(re.findall(r'\bexecute_fused\(([^)]*)\)', driver), [''])
+        self.assertNotIn('execute(', driver)
+        self.assertIn('execute(FUSED_NVFP4, 0);', source)
         self.assertEqual(re.findall(r'\bprepare\(([^)]*)\)', driver), ['FUSED_NVFP4, 0'])
         self.assertNotIn('wave4', driver)
         self.assertNotIn('check(FUSED_NVFP4', driver)

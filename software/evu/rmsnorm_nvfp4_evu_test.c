@@ -422,12 +422,12 @@ static uint64_t sample_median(const uint64_t *values) {
 #ifndef EVU_RMS_KERNELS_ONLY
 __attribute__((used, noinline)) static int rmsnorm_nvfp4_test_main(void) {
   __asm__ volatile ("csrw frm, x0" ::: "memory");
-  if (XV_CSR_READ(XV_EVLENB) != 512 || (XV_CSR_READ(XV_EVCAP) & 255) != 2 ||
-      !(XV_CSR_READ(XV_EVCAP) & XV_CAP_RVV_MATH) ||
-      (!EVU_RMS_ONLY && !(XV_CSR_READ(XV_EVCAP) & XV_CAP_LOW_PRECISION)) ||
+  const uint64_t required = XV_CAP_RETURNED_VL | XV_CAP_RVV_MATH |
+      (EVU_RMS_ONLY ? 0 : XV_CAP_LOW_PRECISION | XV_CAP_GATHER_IMM);
+  if (xv_init(512, required) ||
       !(alpha >= 0x1p-100f && alpha <= 0x1p100f) ||
       !(epsilon >= 0x1p-100f && epsilon <= 0x1p100f)) {
-    printf("[RN] FAIL invalid EVU ABI or epsilon\n");
+    printf("[RN] FAIL unsupported EVU configuration or invalid parameters\n");
     return 1;
   }
   if (xv_setvli(CHUNK, 0x10) != CHUNK) {

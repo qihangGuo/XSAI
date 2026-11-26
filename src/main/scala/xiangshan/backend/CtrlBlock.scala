@@ -705,6 +705,8 @@ class CtrlBlockImp(
   dispatch.io.evuLoadFull := io.evuLoadFull
   dispatch.io.evuLoadPending := io.evuLoadPending
   dispatch.io.evuStableConfig := io.evuStableConfig
+  dispatch.io.evuConfigPublished := io.evuConfigPublished
+  io.evuConfigOwner := dispatch.io.evuConfigOwner
   io.evuLoadReserve := dispatch.io.evuLoadReserve
   val enqRob = Wire(chiselTypeOf(rob.io.enq))
   enqRob.canAccept := rob.io.enq.canAccept
@@ -712,6 +714,10 @@ class CtrlBlockImp(
   enqRob.isEmpty := rob.io.enq.isEmpty
   enqRob.resp := rob.io.enq.resp
   enqRob.needAlloc := RegNext(dispatch.io.enqRob.needAlloc)
+  rob.io.dispatchEvuMaps.foreach { count =>
+    count := PopCount(dispatch.io.enqRob.req.map(r => r.valid && !rob.io.redirect.valid &&
+      xiangshan.backend.rob.AmuCtrlBuffer.needsEvuMap(r.bits)))
+  }
   enqRob.req.zip(dispatch.io.enqRob.req).map { case (sink, source) =>
     sink.valid := RegNext(source.valid && !rob.io.redirect.valid)
     sink.bits := RegEnable(source.bits, source.valid)
@@ -973,6 +979,7 @@ class CtrlBlockIO()(implicit p: Parameters, params: BackendParams) extends XSBun
   val evuLoadFull = Input(Bool())
   val evuLoadPending = Input(Bool())
   val evuStableConfig = Input(Bool())
+  val evuConfigOwner = Output(Valid(new RobPtr))
   val evuLoadReserve = Output(Valid(new RobPtr))
   val evuPreflightReasons = Output(new xiangshan.evu.EvuPreflightReasons)
   val evuRetired = Output(Valid(new xiangshan.evu.EvuRetiredCommand(p(ExternalVectorKey), (new RobPtr).getWidth)))

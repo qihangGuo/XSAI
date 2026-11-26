@@ -53,8 +53,16 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
   val second = RegInit(VecInit.fill(n)(false.B))
   val crosses = Reg(Vec(n, Bool()))
   val dropped = RegInit(VecInit.fill(n)(false.B))
-  val putData = Reg(Vec(n, UInt(512.W)))
-  val results = Reg(Vec(n, new EvuLineMemoryResponse(p)))
+  val lineData = Reg(Vec(n, UInt(512.W)))
+  val errors = Reg(Vec(n, Bool()))
+  val faults = Reg(Vec(n, chiselTypeOf(io.client.resp.bits.fault)))
+  val results = Wire(Vec(n, new EvuLineMemoryResponse(p)))
+  for (i <- 0 until n) {
+    results(i).data := Mux(requests(i).write, 0.U, lineData(i))
+    results(i).error := errors(i)
+    results(i).fault := faults(i)
+    results(i).tag := i.U
+  }
 
   val shiftedData = Wire(Vec(n, UInt(1024.W)))
   val shiftedMask = Wire(Vec(n, UInt(128.W)))
@@ -89,12 +97,11 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
     crosses(incoming.tag) := incomingCrosses
     second(incoming.tag) := false.B
     dropped(incoming.tag) := false.B
-    results(incoming.tag).data := 0.U
-    results(incoming.tag).error := false.B
-    results(incoming.tag).fault := EvuFault.None
-    results(incoming.tag).tag := incoming.tag
+    errors(incoming.tag) := false.B
+    faults(incoming.tag) := EvuFault.None
     val mask = (Cat(0.U(64.W), incoming.mask) << incoming.addr(5, 0))(63, 0)
-    putData(incoming.tag) := (Cat(0.U(512.W), incoming.data) << (incoming.addr(5, 0) << 3))(511, 0)
+    lineData(incoming.tag) := Mux(incoming.write,
+      (Cat(0.U(512.W), incoming.data) << (incoming.addr(5, 0) << 3))(511, 0), 0.U)
     states(incoming.tag) := Mux(incoming.write && !incoming.mask.orR, respond,
       Mux(incoming.write && (mask.andR || incoming.fullLineData), writeReq, readReq))
   }
@@ -108,7 +115,7 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
   for (i <- 0 until n) {
     arbiter.io.in(i).valid := !io.flush && (states(i) === readReq || states(i) === writeReq)
     arbiter.io.in(i).bits.addr := (requests(i).addr & ~63.U(64.W)) + Mux(second(i), 64.U, 0.U)
-    arbiter.io.in(i).bits.data := putData(i)
+    arbiter.io.in(i).bits.data := lineData(i)
     // Bus writes are still PutFullData. Retain the logical byte mask solely
     // for exact difftest attribution after cross-command store combining.
     arbiter.io.in(i).bits.mask := Mux(states(i) === writeReq, partMask(i), Fill(64, 1.U(1.W)))
@@ -144,7 +151,7 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
     (d.error || states(d.tag) === writeWait || !requests(d.tag).write)
   val bypass = finalResponse && !responses.io.out.valid
   // Until the second line arrives, the response buffer holds the raw first line.
-  val combinedReadData = Mux(second(d.tag), Cat(d.data, results(d.tag).data), Cat(0.U(512.W), d.data))
+  val combinedReadData = Mux(second(d.tag), Cat(d.data, lineData(d.tag)), Cat(0.U(512.W), d.data))
   val returnedReadData = (combinedReadData >> (requests(d.tag).addr(5, 0) << 3))(511, 0)
   val bypassBits = WireDefault(results(d.tag))
   bypassBits.error := d.error
@@ -164,7 +171,7 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
     def finishPart(): Unit = {
       when(!second(i) && crosses(i)) {
         second(i) := true.B
-        putData(i) := shiftedData(i)(1023, 512)
+        when(requests(i).write) { lineData(i) := shiftedData(i)(1023, 512) }
         val mask = shiftedMask(i)(127, 64)
         states(i) := Mux(requests(i).write,
           Mux(!mask.orR, respond, Mux(mask.andR, writeReq, readReq)), readReq)
@@ -176,18 +183,18 @@ class EvuHbl2LineAdapter(p: EvuParams) extends Module {
         dropped(i) := false.B
       }.elsewhen(d.error) {
         when(second(i) && !requests(i).write) {
-          results(i).data := results(i).data >> (requests(i).addr(5, 0) << 3)
+          lineData(i) := lineData(i) >> (requests(i).addr(5, 0) << 3)
         }
-        results(i).error := true.B
-        results(i).fault := d.fault
+        errors(i) := true.B
+        faults(i) := d.fault
         states(i) := respond
       }.elsewhen(states(i) === readWait && requests(i).write) {
         val mask = FillInterleaved(8, partMask(i))
-        putData(i) := (d.data & ~mask) | (partData(i) & mask)
+        lineData(i) := (d.data & ~mask) | (partData(i) & mask)
         states(i) := writeReq
       }.otherwise {
         when(states(i) === readWait) {
-          results(i).data := Mux(!second(i) && crosses(i), d.data, returnedReadData)
+          lineData(i) := Mux(!second(i) && crosses(i), d.data, returnedReadData)
         }
         finishPart()
       }

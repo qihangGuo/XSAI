@@ -210,6 +210,7 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
 
   private val ctrlBlock = wrapper.ctrlBlock.module
   private val intScheduler: SchedulerImpBase = wrapper.intScheduler.get.module
+  intScheduler.io.evuConfigOwner.foreach(_ := ctrlBlock.io.evuConfigOwner)
   private val fpScheduler = wrapper.fpScheduler.get.module
   private val vfScheduler = wrapper.vfScheduler.get.module
   private val mfScheduler = Option.when(HasMatrixExtension)(wrapper.mfScheduler.get.get.module)
@@ -861,9 +862,21 @@ class BackendInlinedImp(override val wrapper: BackendInlined)(implicit p: Parame
       .filter(_._2.bits.params.fuConfigs.contains(FuConfig.EvuCfg))
     require(lanes.size == 1, "EVU preflight requires one scalar command producer")
     val (sink, source) = lanes.head
+    val pmaWrite = csrio.customCtrl.distribute_csr.w
+    val pmaChanged = pmaWrite.valid &&
+      pmaWrite.bits.addr >= xiangshan.backend.fu.util.CSRConst.PmacfgBase.U &&
+      pmaWrite.bits.addr < (xiangshan.backend.fu.util.CSRConst.PmaaddrBase + p(xiangshan.PMParameKey).NumPMAReal).U
+    val resetPma = RegInit(true.B)
+    when(pmaChanged) { resetPma := false.B }
+    val plainMemory = if (HasBitmapCheck) {
+      val ctrl = csrio.tlb.mbmc
+      !(ctrl.BME.asBool || ctrl.CMODE.asBool || ctrl.KEYIDEN.asBool)
+    } else true.B
+    val physicalStore = resetPma && !pmaChanged && plainMemory && csrio.tlb.priv.dmode === 3.U &&
+      !csrio.tlb.priv.virt && !csrio.tlb.priv.debug && csrio.tlb.satp.mode === 0.U
     val (full, pending) = EvuScalarPreflight.connect(source, sink, check, csrio.evu,
       ctrlBlock.io.evuLoadReserve, ctrlBlock.io.robio.robDeqPtr, ctrlBlock.io.redirect,
-      ctrlBlock.io.evuPreflightReasons, reset.asBool)
+      ctrlBlock.io.evuPreflightReasons, reset.asBool, physicalStore)
     ctrlBlock.io.evuLoadFull := full
     ctrlBlock.io.evuLoadPending := pending
     when(check.resp.fire && check.resp.bits.fault =/= EvuAddressFault.None) {

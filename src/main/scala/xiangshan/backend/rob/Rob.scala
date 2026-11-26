@@ -67,6 +67,7 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
     val hartId = Input(UInt(hartIdLen.W))
     val redirect = Input(Valid(new Redirect))
     val enq = new RobEnqIO
+    val dispatchEvuMaps = Option.when(p(ExternalVectorKey).enable)(Input(UInt(log2Ceil(RenameWidth + 1).W)))
     val dispatchDemandWithoutRob = Input(Bool())
     val flushOut = ValidIO(new Redirect)
     val exception = ValidIO(new ExceptionInfo)

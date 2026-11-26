@@ -3,7 +3,7 @@
 
 #include "evu_intrinsics.h"
 
-/* Independent EVU CSR ABI 2, RV64. Core fcsr/vcsr/vstart are unrelated. */
+/* Independent EVU CSRs, RV64. Core fcsr/vcsr/vstart are unrelated. */
 #define XV_EVCFG 0x8c0
 #define XV_EFFLAGS 0x8c1
 #define XV_EVXSAT 0x8c2
@@ -16,6 +16,10 @@
 #define XV_CAP_RVV_MATH (UINT64_C(1) << 28)
 #define XV_CAP_LOW_PRECISION (UINT64_C(1) << 29)
 #define XV_CAP_BLOCK_QUANT (UINT64_C(1) << 30)
+/* Packed CVT groups: each bit promises the complete group. */
+#define XV_CAP_CVT_RAW_EXTENSION (UINT64_C(1) << 31)
+#define XV_CAP_CVT_MX_EXTENSION (UINT64_C(1) << 32)
+#define XV_CAP_CVT_BF16 (UINT64_C(1) << 33)
 #define XV_CONTEXT_MAGIC UINT64_C(0x4556554354580002)
 #define XV_EVSTATUS 0xcd2
 #define XV_EVCAUSE 0xcd3
@@ -29,6 +33,14 @@
   __asm__ volatile ("csrr %0, " XV_STR(addr) : "=r"(xv_csr_value_) :: "memory"); xv_csr_value_; })
 #define XV_CSR_WRITE(addr, value) do { uint64_t xv_csr_value_ = (uint64_t)(value); \
   __asm__ volatile ("csrw " XV_STR(addr) ", %0" :: "r"(xv_csr_value_) : "memory"); } while (0)
+
+/* Call after EVU CSR access is enabled. Check the interface revision, exact
+ * register size in bytes and all requested features without changing EVU state. */
+static inline int xv_init(uint64_t required_vlenb, uint64_t required_caps) {
+  const uint64_t caps = XV_CSR_READ(XV_EVCAP);
+  if ((caps & UINT64_C(0xff)) != 2 || (caps & required_caps) != required_caps) return -1;
+  return XV_CSR_READ(XV_EVLENB) == required_vlenb ? 0 : -1;
+}
 
 /* M-mode only. U/S also require mstateen0.C, and U additionally sstateen0.C.
  * Set Initial only if Off; never relabel an existing Dirty context as clean. */
@@ -51,13 +63,12 @@ typedef struct {
   uint64_t status, cause, pc, tval;
 } xv_context;
 
-/* ABI 2 context helpers require VLEN=4096 and M-mode. Return -1 for an
+/* Context helpers require VLEN=4096 and M-mode. Return -1 for an
  * unsupported/disabled context, -2 for an error requiring software handling.
  * CSR reads drain all old work before changing the temporary save configuration.
  * Read-only error records are copied for diagnosis, not restored into hardware. */
 static inline int xv_context_save(xv_context *ctx) {
-  if ((XV_CSR_READ(XV_EVCAP) & 255) != 2) return -1;
-  if (XV_CSR_READ(XV_EVLENB) != sizeof(ctx->vr[0])) return -1;
+  if (xv_init(sizeof(ctx->vr[0]), XV_CAP_RETURNED_VL)) return -1;
   ctx->abi = XV_CONTEXT_MAGIC;
   ctx->state = XV_CSR_READ(XV_MEVSTATE);
   if (!(ctx->state & 3)) return -1;
@@ -119,8 +130,8 @@ static inline int xv_context_save(xv_context *ctx) {
 }
 
 static inline int xv_context_restore(const xv_context *ctx) {
-  if (ctx->abi != XV_CONTEXT_MAGIC || (XV_CSR_READ(XV_EVCAP) & 255) != 2) return -1;
-  if (!(ctx->state & 3) || XV_CSR_READ(XV_EVLENB) != sizeof(ctx->vr[0])) return -1;
+  if (ctx->abi != XV_CONTEXT_MAGIC || !(ctx->state & 3)) return -1;
+  if (xv_init(sizeof(ctx->vr[0]), XV_CAP_RETURNED_VL)) return -1;
   if (ctx->status & 2) return -2;
   xv_enable_m(0);
   if (XV_CSR_READ(XV_EVSTATUS) & 2) return -2;
@@ -165,10 +176,5 @@ static inline int xv_context_restore(const xv_context *ctx) {
   XV_CSR_WRITE(XV_MEVSTATE, ctx->state);
   return 0;
 }
-
-/* Packed CVT groups: each bit promises the complete group. */
-#define XV_CAP_CVT_RAW_EXTENSION (UINT64_C(1) << 31)
-#define XV_CAP_CVT_MX_EXTENSION (UINT64_C(1) << 32)
-#define XV_CAP_CVT_BF16 (UINT64_C(1) << 33)
 
 #endif

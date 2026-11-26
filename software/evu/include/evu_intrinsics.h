@@ -8,7 +8,7 @@
 #define XV_XREG_1(x) "x" #x
 #define XV_XREG(x) XV_XREG_1(x)
 
-/* ABI 2 configuration: unsigned AVL, RVV low-byte VTYPE encoding, scalar rd=VL.
+/* Vector configuration: unsigned AVL, RVV low-byte VTYPE encoding, scalar rd=VL.
  * rs1=x0 means AVL zero; UINT64_MAX requests VLMAX. No implicit keep-VL form.
  */
 static inline uint32_t xv_setvl(uint64_t avl, uint64_t vtype) {

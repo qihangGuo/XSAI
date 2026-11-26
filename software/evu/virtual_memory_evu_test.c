@@ -1,7 +1,7 @@
 #include <am.h>
 #include <klib.h>
 #include <stdint.h>
-#include "evu_intrinsics.h"
+#include "evu_csr.h"
 
 /* Build on the server with NAME=virtual_memory_evu_test. All guest addresses
  * below are virtual; consecutive pages deliberately map across a guard page.
@@ -153,6 +153,7 @@ static void supervisor_main(void) {
 
 static void evu_vm_main(void) __attribute__((used, noreturn));
 static void evu_vm_main(void) {
+  if (xv_init(sizeof(checkpoint), 0)) _halt(1);
   root[1] = pte(middle, 1);
   middle[0] = pte((const void *)leaves, 1);
   /* Identity-map the program, stack and physical test buffers at 0x80000000. */

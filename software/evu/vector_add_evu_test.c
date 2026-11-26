@@ -1,7 +1,7 @@
 #include <am.h>
 #include <klib.h>
 #include <stdint.h>
-#include "evu_intrinsics.h"
+#include "evu_csr.h"
 
 /* DefaultExternalVectorMatrixConfig: VLEN=4096. No AME/CUTE instructions.
  * Use the updated CONFIG_CUSTOM_EVU NEMU reference for architectural Difftest.
@@ -103,6 +103,7 @@ static int check_results(unsigned sew, unsigned round)
 static int vector_add_test_main(void) __attribute__((used, noinline));
 static int vector_add_test_main(void)
 {
+  if (xv_init(VECTOR_BYTES, 0)) return 1;
   for (unsigned sew = 0; sew < 3; ++sew) {
     for (unsigned round = 0; round < ROUNDS; ++round) {
       initialize(round);

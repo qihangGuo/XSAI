@@ -14,7 +14,7 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import xiangshan.evu._
 import xiangshan.evu.adapter.EvuVectorParameters
-import xiangshan.evu.backend.{ExecuteSequencer, SharedExecutionArbiter, SpecialSequencer, VectorBackend}
+import xiangshan.evu.backend.{ExecuteSequencer, ReductionFirstGroup, SharedExecutionArbiter, SpecialSequencer, VectorBackend}
 import xiangshan.evu.common._
 import xiangshan.evu.exu._
 
@@ -42,6 +42,7 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
     val issueReady = Input(Bool())
     val writeReady = Input(Bool())
     val issues = Output(Vec(2, UInt(32.W)))
+    val firstLoads = Output(Vec(2, UInt(32.W)))
     val directs = Output(Vec(2, UInt(32.W)))
     val returns = Output(Vec(2, UInt(32.W)))
     val ownerBusy = Output(Vec(2, Bool()))
@@ -52,11 +53,18 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
   val insns = VXSequencerParams("fp_fma", Seq(factory)).insns
   val fu = Module(new ExecutionUnit(Seq(factory), "shared_reduction_test"))
   val execute = Seq.fill(2)(Module(new ExecuteSequencer(insns, fu.maxPipeDepth, 1, reductionOnly = true)))
-  val accumulators = (0 until 2).map(i => Module(new SpecialSequencer(insns, i, 2, true)))
+  val directSum = !maximum && dLen == 512
+  val accumulators = (0 until 2).map(i => Module(new SpecialSequencer(insns, i, 2, true, directSum)))
   val arb = Module(new SharedExecutionArbiter(2, fu.maxPipeDepth, 1, prioritizeCritical = true))
-  fu.io.iss.valid := arb.io.out.valid && (if (controlled) io.issueReady else true.B)
-  fu.io.iss.bits := arb.io.out.bits
-  arb.io.out.ready := fu.io.iss.ready && (if (controlled) io.issueReady else true.B)
+  val selected = Wire(Decoupled(chiselTypeOf(arb.io.out.bits)))
+  val allowIssue = if (controlled) io.issueReady else true.B
+  selected.valid := arb.io.out.valid && allowIssue
+  selected.bits := arb.io.out.bits
+  arb.io.out.ready := selected.ready && allowIssue
+  val firstLoad = if (directSum) ReductionFirstGroup.route(selected, fu.io.iss, accumulators) else {
+    fu.io.iss <> selected
+    false.B
+  }
   fu.io.iter_write.ready := true.B
   fu.io.scalar_write.ready := true.B
   fu.io.shared_fp_req.ready := true.B
@@ -82,6 +90,7 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
   io.returns := returns
   io.seedReads := seedReads
   for (context <- 0 until 2) {
+    io.firstLoads(context) := Counter(firstLoad && selected.bits.vat === (context + 1).U, 256)._1
     when(fu.io.iss.fire && fu.io.iss.bits.vat === (context + 1).U) {
       issues(context) := issues(context) + 1.U
       when(fu.io.iss.bits.acc_direct) { directs(context) := directs(context) + 1.U }
@@ -312,6 +321,21 @@ class EvuInterleavedReductionSpec extends AnyFlatSpec with ChiselScalatestTester
   }
   behavior of "Shared-FMA reduction contexts"
 
+  it should "fall back when even one lane is zero, subnormal, infinite or NaN" in {
+    test(new Module {
+      val io = IO(new Bundle { val data = Input(UInt(512.W)); val normal = Output(Bool()) })
+      io.normal := ReductionFirstGroup.allNormal(io.data)
+    }).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+      val base = (0 until 16).map(i => BigInt(if ((i & 1) == 0) 0x80800000L else 0x7f7fffffL) << (i*32)).sum
+      dut.io.data.poke(base.U); dut.io.normal.expect(true.B)
+      for (lane <- 0 until 16; bits <- Seq(0L, 0x80000000L, 1L, 0x807fffffL, 0x7f800000L,
+          0xff800000L, 0x7f800001L, 0x7fc00000L)) {
+        dut.io.data.poke(((base & ~(BigInt(0xffffffffL) << (lane*32))) | (BigInt(bits) << (lane*32))).U)
+        dut.io.normal.expect(false.B)
+      }
+    }
+  }
+
   it should "interleave production sequencers on a shared FMA under operand backpressure" in {
     implicit val p: Parameters = EvuVectorParameters(base, 512, 64, 64,
       VectorParams.lgvParams.copy(reductionContexts = 2, interleaveReductions = true))
@@ -403,6 +427,12 @@ class EvuInterleavedReductionSpec extends AnyFlatSpec with ChiselScalatestTester
               dut.io.result(context).expect((java.lang.Float.floatToRawIntBits(expected).toLong & 0xffffffffL).U)
               dut.io.merges(context).expect((math.min(4, (length + 15) / 16) - 1).U)
               dut.io.folds(context).expect((if (maximum && tree) 1 else 4).U)
+              val loaded = dut.io.firstLoads(context).peek().litValue.toInt
+              loaded should be <= (if (maximum) 0 else (length / 16 - 1).max(0).min(3))
+              if (!maximum && length == 64 && context == 1)
+                dut.io.firstLoads.map(_.peek().litValue).sum should be > BigInt(0)
+              if (!maximum) dut.io.issues(context).expect(((length + 15) / 16 +
+                math.min(4, (length + 15) / 16) - 1 + 4 - loaded).U)
             }
             dut.io.flags.expect(0.U)
           }

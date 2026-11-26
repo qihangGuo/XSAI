@@ -10,10 +10,18 @@ class EvuMemoryContextTable(p: EvuParams, tagBits: Int) extends Module {
     val allocate = Flipped(Valid(new Bundle {
       val tag = UInt(tagBits.W)
       val pageMap = new EvuPageMap(p)
-      val virtualBase = UInt(64.W)
     }))
     val release = Flipped(Valid(UInt(tagBits.W)))
     val lookup = Input(UInt(tagBits.W))
+    val fault = Flipped(Valid(new Bundle {
+      val vat = UInt(tagBits.W)
+      val address = UInt(64.W)
+      val cause = UInt(4.W)
+    }))
+    val firstFault = Output(Valid(new Bundle {
+      val address = UInt(64.W)
+      val cause = UInt(4.W)
+    }))
     val found = Output(Bool())
     val pageMap = Output(new EvuPageMap(p))
     val virtualBase = Output(UInt(64.W))
@@ -22,21 +30,30 @@ class EvuMemoryContextTable(p: EvuParams, tagBits: Int) extends Module {
   val valid = RegInit(VecInit.fill(n)(false.B))
   val tags = Reg(Vec(n, UInt(tagBits.W)))
   val maps = Reg(Vec(n, new EvuPageMap(p)))
-  val bases = Reg(Vec(n, UInt(64.W)))
+  val failed = RegInit(VecInit.fill(n)(false.B))
+  val faults = Reg(Vec(n, chiselTypeOf(io.firstFault.bits)))
+  val completed = VecInit((0 until n).map(i => valid(i) && failed(i) && tags(i) === io.release.bits))
+  io.firstFault.valid := completed.asUInt.orR
+  io.firstFault.bits := Mux1H(completed, faults)
   val releasing = VecInit((0 until n).map(i => valid(i) && io.release.valid && tags(i) === io.release.bits))
   val available = ~valid.asUInt | releasing.asUInt
   val chosen = PriorityEncoderOH(available)
   val matches = VecInit((0 until n).map(i => valid(i) && tags(i) === io.lookup))
   io.found := matches.asUInt.orR
   io.pageMap := Mux1H(matches, maps)
-  io.virtualBase := Mux1H(matches, bases)
+  io.virtualBase := Mux(io.pageMap.enabled, Cat(io.pageMap.base(63, 12), 0.U(12.W)), 0.U)
   for (i <- 0 until n) {
+    when(valid(i) && !failed(i) && io.fault.valid && tags(i) === io.fault.bits.vat) {
+      failed(i) := true.B
+      faults(i).address := io.fault.bits.address
+      faults(i).cause := io.fault.bits.cause
+    }
     when(releasing(i)) { valid(i) := false.B }
     when(io.allocate.valid && chosen(i)) {
+      failed(i) := false.B
       valid(i) := true.B
       tags(i) := io.allocate.bits.tag
       maps(i) := io.allocate.bits.pageMap
-      bases(i) := io.allocate.bits.virtualBase
     }
     when(io.flush) { valid(i) := false.B }
   }

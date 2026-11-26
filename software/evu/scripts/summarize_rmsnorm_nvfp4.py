@@ -67,10 +67,11 @@ def summarize(text):
         raise ValueError("format 6/7/8/10/11/12 requires warmup=0")
     if header.get("format") in ("7", "8", "10", "11", "12") and header.get("quant_batch") != "16":
         raise ValueError("format 7/8/10/11/12 requires quant_batch=16")
+    block_fused = header.get("format") == "11" and header.get("profile") == "fused_row_major" and header.get("quant_schedule") == "block64_pack16"
     if header.get("format") in ("8", "10", "11") and (header.get("quant_vl") != "16" or
                                         header.get("quant_sew") != "32" or
-                                        header.get("quant_schedule") != "overlap"):
-        raise ValueError("format 8/10/11 requires quant_vl=16 quant_sew=32 quant_schedule=overlap")
+                                        not (header.get("quant_schedule") == "overlap" or block_fused)):
+        raise ValueError("unsupported format 8/10/11 quantization configuration")
     if header.get("format") in ("10", "11") and any(header.get(field) not in ("0", "1")
                                            for field in ("lane_sum", "quant_rename")):
         raise ValueError("format 10/11 requires lane_sum and quant_rename switches")

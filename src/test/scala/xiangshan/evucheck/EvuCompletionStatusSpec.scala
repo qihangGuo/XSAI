@@ -33,6 +33,7 @@ class EvuCompletionStatusHarness(implicit p: Parameters) extends Module {
     val sstatus = Output(UInt(64.W))
   })
   val amu = Module(new AmuCtrlBuffer)
+  amu.io.dispatchEvuMaps.foreach(_ := 0.U)
   amu.io.configPublished := 0.U.asTypeOf(amu.io.configPublished)
   amu.io.enq := 0.U.asTypeOf(amu.io.enq)
   amu.io.enq(0).valid := io.enqueue

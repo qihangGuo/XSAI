@@ -10,6 +10,7 @@ static uint32_t result[128] __attribute__((aligned(64)));
 
 static int csr_context_test_main(void) __attribute__((used, noinline));
 static int csr_context_test_main(void) {
+  if (xv_init(sizeof(one), XV_CAP_RETURNED_VL)) return 1;
   uint64_t core_status, core_fcsr, core_start, core_sat, core_rm;
   __asm__ volatile ("csrr %0, mstatus" : "=r"(core_status));
   __asm__ volatile ("li t0, 0x50\ncsrw fcsr, t0\nli t0, 37\ncsrw vstart, t0\n"
@@ -19,7 +20,9 @@ static int csr_context_test_main(void) {
   for (unsigned i = 0; i < 128; ++i) { one[i] = 0x3f800000; three[i] = 0x40400000; }
   /* Execute EVU FP with both core contexts Off, core FRM=RDN, vstart=37. */
   __asm__ volatile ("li t0, 0x6600\ncsrc mstatus, t0" ::: "t0", "memory");
-  int ok = (XV_CSR_READ(XV_EVCAP) & 255) == 2;
+  /* A wrong register size or a request for reserved bit 25 must be rejected. */
+  int ok = xv_init(sizeof(one) / 2, 0) == -1;
+  ok &= xv_init(sizeof(one), XV_CAP_RETURNED_VL | (UINT64_C(1) << 25)) == -1;
   ok &= ((XV_CSR_READ(XV_EVCAP) >> 8) & 255) == 0;
   ok &= xv_setvli(UINT64_MAX, 0x10) == 128;
   ok &= xv_setvl(13, 0x0f) == 13;
@@ -87,7 +90,7 @@ done:
                     : "=r"(core_fcsr), "=r"(core_start), "=r"(core_sat), "=r"(core_rm));
   ok &= core_fcsr == 0x50 && core_start == 37 && core_sat == 0 && core_rm == 3;
   __asm__ volatile ("csrw vstart, zero" ::: "memory");
-  printf("EVU CSR/context ABI2 %s: fixed RNE, core FS/VS Off, isolated flags/start, 32 VRFs\n", ok ? "PASS" : "FAIL");
+  printf("EVU CSR/context %s: fixed RNE, core FS/VS Off, isolated flags/start, 32 VRFs\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
 

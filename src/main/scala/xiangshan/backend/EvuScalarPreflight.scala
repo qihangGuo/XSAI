@@ -13,7 +13,7 @@ import xiangshan.evu._
 object EvuScalarPreflight {
   def connect(source: DecoupledIO[ExuOutput], sink: DecoupledIO[ExuOutput], check: EvuRangeIO,
       csr: EvuCSRCoreIO, reserve: ValidIO[RobPtr], robHead: RobPtr, redirect: ValidIO[Redirect],
-      barrier: EvuPreflightReasons, inReset: Bool)(implicit p: Parameters): (Bool, Bool) = {
+      barrier: EvuPreflightReasons, inReset: Bool, physicalStore: Bool)(implicit p: Parameters): (Bool, Bool) = {
     val ep = p(ExternalVectorKey)
     val incoming = source.bits.amuCtrl.get.data.asTypeOf(new EvuCoreCommand(ep))
     val incomingOp = incoming.instr(31, 25)
@@ -79,7 +79,28 @@ object EvuScalarPreflight {
     val stable = csr.preflightConfigReady && csr.permitted &&
       (!queued || q.bits.cmd.config.asUInt === csr.config.asUInt)
     val generalBarrier = barrier.control || barrier.status
-    val preflightBlocked = Mux(load, EvuPreflightReasons.blocksLoad(barrier, stable), generalBarrier)
+    val fullLine = (ep.mlenBits == 512).B && f7 === EvuIsa.store &&
+      !payload.base(5, 0).orR && !effectiveLength(5, 0).orR
+    // Only use page-aligned, cacheable reset TOR ranges with no higher-priority
+    // overlapping PMA entry. An unrecognised map simply keeps the old barrier.
+    val soc = p(system.SoCParamsKey)
+    val pmas = soc.PMAConfigs
+    val safePages = for {
+      i <- 0 until (pmas.size - 1)
+      hi = pmas(i); lo = pmas(i+1).base_addr
+      if hi.a == 1 && hi.c && hi.w && pmas.drop(i+1).forall(e =>
+        e.a == 0 || (e.a == 1 && e.base_addr <= lo))
+      ram <- soc.PmemRanges
+      start = (lo.max(ram.lower) + 4095) >> 12
+      end = (hi.base_addr.min(ram.upper).min(BigInt(1) << soc.PAddrBits)) >> 12
+      if end > start
+    } yield payload.base(63, 12) >= start.U && payload.base(63, 12) < end.U
+    val onePage = effectiveLength <= 4096.U &&
+      (payload.base(11, 0) +& effectiveLength(12, 0)) <= 4096.U
+    val earlyStore = fullLine && physicalStore && csr.configured && stable && effectiveLength.orR &&
+      safePages.foldLeft(false.B)(_ || _) && onePage && !barrier.control &&
+      barrier.status && barrier.arithmeticOnly && !barrier.otherCompletion && !barrier.unpublishedControl
+    val preflightBlocked = Mux(load, EvuPreflightReasons.blocksLoad(barrier, stable), generalBarrier && !earlyStore)
     check.req.valid := memory && !checking && !preflightBlocked && !redirect.valid
     val stalled = memory && !checking && preflightBlocked && !redirect.valid
     XSPerfAccumulate("evu_preflight_serial_stall", stalled)
@@ -87,6 +108,7 @@ object EvuScalarPreflight {
     XSPerfAccumulate("evu_load_capture_before_head", slots.io.capture.fire && source.bits.robIdx =/= robHead)
     XSPerfAccumulate("evu_load_both_reserved", slots.io.full)
     XSPerfAccumulate("evu_load_check_bypass", check.req.fire && load && generalBarrier)
+    XSPerfAccumulate("evu_store_check_bypass", check.req.fire && earlyStore)
     for ((name, selected) <- Seq("load" -> load, "store" -> store)) {
       val active = stalled && selected
       XSPerfAccumulate(s"evu_preflight_${name}_control_only", active && barrier.control && !barrier.status)
@@ -102,18 +124,19 @@ object EvuScalarPreflight {
     check.req.bits.write := store
     // Custom ordinary stores are unmasked and unit-stride. Only a 64-byte
     // VMU beat with full aligned coverage is guaranteed to avoid external RMW.
-    check.req.bits.fullLineWrite := (p(ExternalVectorKey).mlenBits == 512).B &&
-      f7 === EvuIsa.store && !payload.base(5, 0).orR && !effectiveLength(5, 0).orR
+    check.req.bits.fullLineWrite := fullLine
     check.req.bits.alignment := effectiveSew
     check.req.bits.illegal := Mux(queued, q.bits.cmd.config.vill, csr.config.vill) ||
       ((load || store) && effectiveSew > EvuIsa.maxSupportedSew.U)
     // A revoke also invalidates a response already waiting for the WB port.
     // Redispatch the head as an illegal instruction after cancelling the lookup.
     check.cancel := redirect.valid || (checking && !csr.permitted)
-    check.resp.ready := memory && checking && sink.ready && !check.cancel
+    val checkedEarlyStore = RegEnable(earlyStore, false.B, check.req.fire)
+    val holdFault = checkedEarlyStore && generalBarrier && check.resp.bits.fault =/= EvuAddressFault.None
+    check.resp.ready := memory && checking && sink.ready && !check.cancel && !holdFault
     when(check.req.fire) { checking := true.B }
     when(check.resp.fire || check.cancel) { checking := false.B }
-    val result = checking && check.resp.valid && !check.cancel
+    val result = checking && check.resp.valid && !check.cancel && !holdFault
     val queuedWb = queued && (invalidQueued || result) && !check.cancel
     val directReady = !queuedWb && (!directMemory || (!queued && result))
     sink.valid := queuedWb || (direct && directReady)

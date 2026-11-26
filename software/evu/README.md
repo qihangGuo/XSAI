@@ -11,21 +11,26 @@ Use the server's existing `AM_HOME`, RISC-V LLVM toolchain and NEMU checkout.
 
 ## Supported Tests
 
+The four primary low-precision and RMSNorm guests are:
+
+| NAME | Coverage |
+| --- | --- |
+| `low_precision_evu_test` | 18 conversion operations: base, raw, MX and BF16; packing, tails, flags and guards |
+| `rmsnorm_nvfp4_fused_evu_test` | Fused four-row RMSNorm/NVFP4 with a CPU reference and cycle counts |
+| `rmsnorm_nvfp4_tile128x64_evu_test` | Fused 128x64 FP32 tile with exact output checking |
+| `rmsnorm_nvfp4_tile128x64_perf_evu_test` | Optimized 128x64 tile schedule; cycle counts without a guest CPU reference |
+
+Additional regression and diagnostic guests:
+
 | NAME | Coverage |
 | --- | --- |
 | `vector_add_evu_test` | Integer e8/e16/e32 arithmetic, aliases, memory and guards |
-| `exp2_evu_test` | FP16/FP32 EXP2 and ordinary vector execution |
-| `csr_context_evu_test` | Independent EVU CSR ABI 2, returned VL and context restore |
+| `csr_context_evu_test` | Independent EVU CSRs, returned VL and context restore |
 | `virtual_memory_evu_test` | Sv39 translation, permissions and precise memory faults |
 | `vector_memory_path_evu_test` | Bulk/state load-store patterns and cache-state diagnostics |
 | `online_softmax_evu_test` | Ordinary FP32 softmax, four-row scheduling and interval diagnostics |
 | `rvv_math_evu_test` | 15 RVV-mapped operations, m1/m2/mf2, E0, tails, flags and saturation |
-| `low_precision_evu_test` | Six low-precision operations, 88 directed cases, packing, tails, flags and guards |
-| `slide_evu_test` | 216 slide-up/down cases covering widths, LMUL, aliases, offsets and tails |
-| `rmsnorm_nvfp4_evu_test` | EVU RMSNorm and full NVFP4 with final-output-only stores; 11 cases |
-| `rmsnorm_nvfp4_fused_evu_test` | Only fused NVFP4 row-major; timed FENCE snapshots and CPU-only checking |
-| `rmsnorm_nvfp4_tile128x64_evu_test` | Fused RMSNorm/NVFP4 on 128 rows of 64 FP32 elements; exact output checking |
-| `rmsnorm_nvfp4_tile128x64_perf_evu_test` | Optimized sixteen-row tile schedule without guest CPU reference; cycles-only output |
+| `rmsnorm_nvfp4_evu_test` | Stage-by-stage RMSNorm/NVFP4 checks; also supplies kernels to the fused four-row guest |
 
 `Makefile` defaults to `vector_add_evu_test`. The old fused FlashAttention and
 `quanti8mma_evu_example` programs are retired; their binaries cannot run on the
@@ -91,8 +96,12 @@ the old tentative VRF-element-zero offset convention no longer applies.
 
 The public instruction and CSR helpers are [evu_intrinsics.h](include/evu_intrinsics.h)
 and [evu_csr.h](include/evu_csr.h). EVU uses private custom encodings, not the
-standard RVV binary interface. ABI 2 uses a 13-word CSR snapshot and returned-VL
-configuration: `xv_setvl` and `xv_setvli` return the actual vector length.
+standard RVV binary interface. After enabling CSR access and before entering a
+timed region, call `xv_init(required_vlenb, required_caps)`. It returns 0 if the
+interface is compatible, the register size matches exactly (in bytes), and all
+requested feature bits are set; otherwise it returns -1. Pass 0 for tests that
+need only the base interface. The helper never writes a CSR or issues an EVU command.
+The CSR snapshot contains 13 words; `xv_setvl` and `xv_setvli` return the actual vector length.
 Unsupported vector types set VILL and VL=0; removed descriptor CSRs are illegal.
 Software context save/restore uses the versioned helpers rather than assuming
 that the execution contexts inside the backend are architectural contexts.
@@ -116,20 +125,22 @@ make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM \
 
 Nondefault build options produce a variant-specific image path printed by the
 Makefile. Use that path for the correctness run. For the default performance
-image and formal FENCE interval counters:
+image, read the two `[OS]` lines (one per `first` mode):
 
 ```sh
 make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM NAME=online_softmax_evu_test
 ./build/emu --diff ../NEMU/build/riscv64-nemu-interpreter-so \
   -C 100000000 -i software/evu/build/online_softmax_evu_test-riscv64-xs.bin \
-  -- +evu_mem_trace=1 2>&1 | tee evu_softmax.log
-/usr/bin/python3 software/evu/scripts/summarize_softmax_fences.py evu_softmax.log
+  2>&1 | tee evu_softmax.log
 ```
 
 The kernel contains no CUTE operation, dedicated quantization or final
 probability normalization. Compare identical software options, warmup and
 completion boundaries. Historical cycle counts are not new migration results.
-The schedule is implemented in [online_softmax_bench.h](include/online_softmax_bench.h).
+For formal FENCE intervals, build with `EVU_SOFTMAX_DRAIN_DIAG=1`, use
+the variant-specific image with `-- +evu_mem_trace=1`, then run
+`software/evu/scripts/summarize_softmax_fences.py` on its log.
+The schedule is implemented in [online_softmax_evu_test.c](online_softmax_evu_test.c).
 
 ## Focused Validation
 
@@ -140,11 +151,10 @@ Lightweight parser checks do not build or run hardware:
 ```
 
 Run every supported guest above with the matching reference library on the
-server, including configuration, memory, slide and low-precision regressions.
+server, including configuration, memory, math and low-precision regressions.
 Retired funct7 values `0x18`, `0x50` and `0x5e` must trap at every encoded
 element width, including VL=0, with no memory or register effects. EVCAP bit 25
-reads zero. Other instruction encodings and the 13-word CSR snapshot stay at
-ABI 2. FAST/FORK reference modes and incomplete accelerator replay are rejected
+reads zero. FAST/FORK reference modes and incomplete accelerator replay are rejected
 when the required EVU/reference-state support is unavailable.
 
 ## RMSNorm / NVFP4 Performance Baseline
@@ -194,10 +204,13 @@ make -C software/evu ARCH=riscv64-xs TOOLCHAIN=LLVM NAME=rmsnorm_nvfp4_fused_evu
 /usr/bin/python3 software/evu/scripts/summarize_rmsnorm_counters.py rmsnorm_nvfp4_fused_evu_test.log
 ```
 
-The fused-only test checks FP4 and scale bytes exactly using untimed CPU
+The default fused-only schedule (`block64_pack16`) computes four row inverses
+together and uses BLOCK_AMAX and BLOCK_PACK for both halves of each
+128-element register. Build with `EVU_RMS_FUSED_BLOCK=0` for the previous
+`overlap` schedule on the same RTL. The test checks FP4 and scale bytes exactly using untimed CPU
 arithmetic; its reduction oracle assumes DLEN=512. Timing starts after preparation
 and draining, includes input loads and final output stores, and ends after EVU
-and scalar-memory fences. Initialization, configuration and checking are outside
+and scalar-memory fences. Kernel VL changes are timed; initialization and checking are outside
 timing. There is no empty-case subtraction. Compare the same image, options,
 sample index and timing boundaries between hardware revisions. FENCE-delta
 counters isolate an interval only when the corresponding hardware snapshots
@@ -320,46 +333,6 @@ The [CVT extension specification](docs/cvt-extension/README.md) describes the
 YunSuan conversion provider and twelve additional directions alongside the six
 legacy commands. See its implementation and validation status before use.
 
-## RMSNorm row and AMAX diagnostics
-
-All four modes are in `rmsnorm_nvfp4_tile_diag_evu_test.c`. From the XSAI
-root, set the mode and build with your usual guest toolchain. On open06:
-
-```sh
-mode=L
-cc="clang --target=riscv64 -Xclang -target-feature -Xclang +zvamesfexp2 -Xclang -target-feature -Xclang +zvamesfexp2bf16"
-NAME=rmsnorm_nvfp4_tile_diag_evu_test make -C software/evu ARCH=riscv64-xs CROSS_COMPILE= CC="$cc" AS="$cc" \
-  LD=ld.lld AR=llvm-ar OBJCOPY=llvm-objcopy OBJDUMP="llvm-objdump --mattr=+zvamesfexp2" \
-  READELF=llvm-readelf MARCH=rv64gcv \
-  mainargs="$mode" BINARY="$PWD/software/evu/build/rms_diag_$mode"
-./build/emu --diff ../NEMU_evu/build/riscv64-nemu-interpreter-so -C 100000000 \
-  -i "software/evu/build/rms_diag_$mode.bin" 2>&1 | tee "$mode.log"
-```
-
-Change `mode` and repeat the two commands for the next experiment. AM puts
-`mainargs` in the guest image at link time; it is not an EMU argument.
-Separate binary and log names preserve each result. Check `[RN-DIAG] mode=...`
-in the log. No Verilog or emulator build is needed. For accept/complete
-timestamps, append `-- +evu_cmd_trace=1` to the EMU arguments before `2>&1`.
-
-| Mode | Timed workload | Outside the timer |
-|---|---|---|
-| L | Only the first 16 row loads and their original VL transitions | No row readback or scalar reference |
-| R | Original square, reduce and collect sequence for those same 16 rows | Preload the rows and drain before timing; no scalar reference |
-| B | Full earlyscale2 baseline within this diagnostic | Read flags and fingerprint the two output buffers |
-| Q | Same full tile; replace the last quartet's maxima with four BLOCK_AMAX, including both extra VL changes per group | Compare fingerprints and exact EVU flags with B |
-
-With command trace, compare L's first-to-last LOAD **accept** span with B's `load_span`, and
-R's first-square-accept to last-sum-complete span with B's `square_to_sum`.
-The guest's `drained_cycles` also includes the ending fence and is not the
-same interval. Compare L/R to group zero of B; L and R are not additive.
-These guests never recompute RMSNorm or quantization on the CPU. For Q use the current B control,
-not a historical absolute cycle number from a differently linked image.
-`desc_from_row0` and `last_store_from_row0` are relative to the first input
-row's acceptance; the last store is the later completion of both output lines.
-Negative `Q-B` means a faster tile. Reanalyze saved logs without rerunning:
-
-```bash
-python3 software/evu/scripts/summarize_rmsnorm_tile_diag.py . --no-trace
-# For traced logs, omit --no-trace.
-```
+Archived L/R/B/Q diagnostic logs can still be analyzed with
+`python3 software/evu/scripts/summarize_rmsnorm_tile_diag.py LOG_DIR`
+(add `--no-trace` for logs without command traces).

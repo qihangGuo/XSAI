@@ -573,6 +573,7 @@ class XSTile()(implicit p: Parameters) extends LazyModule
         XSPerfReference("evu_int_second_overlap_issues", perf.execution.intSecondOverlapIssues, XSPerfLevel.NORMAL)
         XSPerfReference("evu_reduction_full_with_release", perf.execution.reductionReleaseFull, XSPerfLevel.NORMAL)
         XSPerfReference("evu_reduction_owner_reuse", perf.execution.reductionOwnerReuse, XSPerfLevel.NORMAL)
+        XSPerfReference("evu_reduction_direct_loads", perf.execution.reductionDirectLoads, XSPerfLevel.NORMAL)
         XSPerfReference("evu_completion_head_write_wait", perf.execution.completionHeadWriteWait, XSPerfLevel.NORMAL)
         XSPerfReference("evu_completion_head_tracker_wait", perf.execution.completionHeadTrackerWait, XSPerfLevel.NORMAL)
         XSPerfReference("evu_completion_head_transport_wait", perf.execution.completionHeadTransportWait, XSPerfLevel.NORMAL)

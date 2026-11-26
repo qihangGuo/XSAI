@@ -374,6 +374,7 @@ case class VectorParams(
   vrfBanking: Int = 8,
   debugVrf: Boolean = false,
   diagnosticCounters: Boolean = false,
+  externalConversionOperands: Boolean = false,
   reductionContexts: Int = 1,
   fmaOrdinaryContexts: Int = 1,
   parallelFp32Div: Boolean = false,

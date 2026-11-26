@@ -46,6 +46,8 @@ class IssueQueueStatusBundle(numEnq: Int, numEntries: Int) extends Bundle {
 class IssueQueueDeqRespBundle(implicit p:Parameters, params: IssueBlockParams) extends EntryDeqRespBundle
 
 class IssueQueueIO()(implicit p: Parameters, params: IssueBlockParams) extends XSBundle {
+  val evuConfigOwner = Option.when(p(ExternalVectorKey).enable && params.getFuCfgs.exists(_.fuType == FuType.evu))(
+    Input(Valid(new RobPtr)))
   // Inputs
   val flush = Flipped(ValidIO(new Redirect))
   val enq = Vec(params.numEnq, Flipped(DecoupledIO(new DynInst)))
@@ -120,6 +122,7 @@ class IssueQueueImp(override val wrapper: IssueQueue)(implicit p: Parameters, va
 
   // Modules
   val entries = Module(new Entries)
+  entries.io.evuConfigOwner.foreach(_ := io.evuConfigOwner.get)
   val fuBusyTableWrite = params.exuBlockParams.map { case x => Option.when(x.latencyValMax > 0)(Module(new FuBusyTableWrite(x.fuLatencyMap))) }
   val fuBusyTableRead = params.exuBlockParams.map { case x => Option.when(x.latencyValMax > 0)(Module(new FuBusyTableRead(x.fuLatencyMap))) }
   val intWbBusyTableWrite = params.exuBlockParams.map { case x => Option.when(x.intLatencyCertain)(Module(new FuBusyTableWrite(x.intFuLatencyMap))) }

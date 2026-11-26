@@ -395,6 +395,7 @@ class EvuExecutionPerf extends Bundle {
   val intSecondOverlapIssues = UInt(64.W)
   val reductionReleaseFull = UInt(64.W)
   val reductionOwnerReuse = UInt(64.W)
+  val reductionDirectLoads = UInt(64.W)
   val completionHeadWriteWait = UInt(64.W)
   val completionHeadTrackerWait = UInt(64.W)
   val completionHeadTransportWait = UInt(64.W)

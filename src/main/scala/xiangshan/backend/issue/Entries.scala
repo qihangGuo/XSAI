@@ -422,7 +422,9 @@ class Entries(implicit p: Parameters, params: IssueBlockParams) extends XSModule
     }
     validVec(entryIdx)          := out.valid
     issuedVec(entryIdx)         := out.issued
-    canIssueVec(entryIdx)       := out.canIssue
+    val waitsForConfig = io.evuConfigOwner.map(owner =>
+      xiangshan.backend.rob.EvuConfigIssueBarrier.holds(owner, out.robIdx, out.fuType === FuType.evu.U)).getOrElse(false.B)
+    canIssueVec(entryIdx)       := out.canIssue && !waitsForConfig
     fuTypeVec(entryIdx)         := out.fuType
     robIdxVec(entryIdx)         := out.robIdx
     dataSourceVec(entryIdx)     := out.dataSources
@@ -520,6 +522,8 @@ class Entries(implicit p: Parameters, params: IssueBlockParams) extends XSModule
 }
 
 class EntriesIO(implicit p: Parameters, params: IssueBlockParams) extends XSBundle {
+  val evuConfigOwner = Option.when(p(xiangshan.ExternalVectorKey).enable && params.getFuCfgs.exists(_.fuType == FuType.evu))(
+    Input(Valid(new RobPtr)))
   val flush               = Flipped(ValidIO(new Redirect))
   //enq
   val enq                 = Vec(params.numEnq, Flipped(ValidIO(new EntryBundle)))

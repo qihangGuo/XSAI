@@ -30,6 +30,9 @@ class ScalarPreflightProbe(implicit p: Parameters) extends Module {
     }))
     val vl = Input(UInt(8.W))
     val permitted = Input(Bool())
+    val physicalStore = Input(Bool())
+    val configReady = Input(Bool())
+    val barrier = Input(new EvuPreflightReasons)
     val head = Input(new RobPtr)
     val flush = Flipped(Valid(new RobPtr))
     val range = new EvuRangeIO(ep)
@@ -59,13 +62,13 @@ class ScalarPreflightProbe(implicit p: Parameters) extends Module {
   csr.config.vtype := 0x10.U
   csr.config.vl := io.vl
   csr.permitted := io.permitted
-  csr.preflightConfigReady := true.B
+  csr.preflightConfigReady := io.configReady
   val redirect = WireDefault(0.U.asTypeOf(Valid(new Redirect)))
   redirect.valid := io.flush.valid
   redirect.bits.robIdx := io.flush.bits
   redirect.bits.level := 1.U
   EvuScalarPreflight.connect(source, sink, io.range, csr, io.reserve, io.head, redirect,
-    0.U.asTypeOf(new EvuPreflightReasons), reset.asBool)
+    io.barrier, reset.asBool, io.physicalStore)
   sink.ready := io.out.ready
   io.out.valid := sink.valid
   io.out.bits.tag := sink.bits.robIdx
@@ -84,6 +87,8 @@ class EvuScalarPreflightSpec extends AnyFlatSpec with ChiselScalatestTester {
     }
     test(new ScalarPreflightProbe).withAnnotations(Seq(TreadleBackendAnnotation)) { d =>
       val i = d.io
+      i.barrier.elements.values.foreach(_.asInstanceOf[Bool].poke(false.B))
+      i.configReady.poke(true.B); i.physicalStore.poke(false.B)
       i.reserve.valid.poke(false.B); i.in.valid.poke(false.B); i.flush.valid.poke(false.B)
       i.in.bits.matrix.poke(false.B); i.permitted.poke(true.B); i.vl.poke(64.U)
       i.out.ready.poke(true.B); i.range.req.ready.poke(true.B); i.range.resp.valid.poke(false.B)
@@ -138,6 +143,56 @@ class EvuScalarPreflightSpec extends AnyFlatSpec with ChiselScalatestTester {
       i.range.resp.ready.expect(false.B); i.out.valid.expect(false.B); d.clock.step()
       i.range.resp.valid.poke(false.B); i.out.valid.expect(true.B)
       i.out.bits.tag.value.expect(5.U); i.out.bits.faults.expect((BigInt(1) << ExceptionNO.illegalInstr).U)
+    }
+  }
+
+  it should "start only full-line physical RAM stores early and hold a fault behind the original barrier" in {
+    val (base, _, _) = ArgParser.parse(Array("--config", "DefaultExternalVectorMatrixConfig",
+      "--disable-perf", "--disable-alwaysdb"))
+    implicit val p: Parameters = base.alterPartial {
+      case XSCoreParamsKey => base(XSTileKey).head.copy(RobSize = 32)
+      case ExternalVectorKey => base(ExternalVectorKey).copy(enableDifftest = false)
+    }
+    test(new ScalarPreflightProbe).withAnnotations(Seq(TreadleBackendAnnotation)) { d =>
+      val i = d.io
+      i.reserve.valid.poke(false.B); i.flush.valid.poke(false.B); i.in.valid.poke(true.B)
+      i.head.flag.poke(false.B); i.head.value.poke(3.U)
+      i.in.bits.tag.flag.poke(false.B); i.in.bits.tag.value.poke(3.U)
+      i.in.bits.matrix.poke(false.B); i.in.bits.op.poke(EvuIsa.store)
+      i.physicalStore.poke(true.B); i.permitted.poke(true.B); i.configReady.poke(true.B)
+      i.range.resp.valid.poke(false.B); i.range.req.ready.poke(true.B); i.out.ready.poke(true.B)
+      i.barrier.elements.values.foreach(_.asInstanceOf[Bool].poke(false.B))
+      i.barrier.status.poke(true.B); i.barrier.arithmeticOnly.poke(true.B)
+      for ((addr, vl) <- Seq((0x1000L, 16), (0x80000004L, 16), (0x80000fc0L, 32),
+          (0x80000040L, 15), (0x80000040L, 0))) {
+        i.in.bits.base.poke(addr.U); i.vl.poke(vl.U)
+        i.range.req.valid.expect(false.B); i.in.ready.expect(false.B)
+      }
+      i.in.bits.base.poke(0x80000fc0L.U); i.vl.poke(16.U)
+      i.in.bits.op.poke(EvuIsa.storeE0); i.range.req.valid.expect(false.B); i.in.bits.op.poke(EvuIsa.store)
+      for (block <- Seq(i.barrier.control, i.barrier.otherCompletion, i.barrier.unpublishedControl)) {
+        block.poke(true.B); i.range.req.valid.expect(false.B); block.poke(false.B)
+      }
+      for (allow <- Seq(i.barrier.arithmeticOnly, i.configReady, i.physicalStore)) {
+        allow.poke(false.B); i.range.req.valid.expect(false.B); allow.poke(true.B)
+      }
+      i.range.req.valid.expect(true.B); i.range.req.bits.write.expect(true.B)
+      i.range.req.bits.fullLineWrite.expect(true.B); i.range.req.bits.length.expect(64.U)
+      i.in.ready.expect(false.B); i.out.valid.expect(false.B); d.clock.step()
+      i.range.resp.valid.poke(true.B); i.range.resp.bits.write.poke(true.B)
+      i.range.resp.bits.fault.poke(EvuAddressFault.Access)
+      i.range.resp.ready.expect(false.B); i.out.valid.expect(false.B); d.clock.step(2)
+      i.barrier.status.poke(false.B); i.range.resp.ready.expect(true.B); i.out.valid.expect(true.B)
+      i.out.bits.faults.expect((BigInt(1) << ExceptionNO.storeAccessFault).U)
+      d.clock.step(); i.range.resp.valid.poke(false.B)
+      i.barrier.status.poke(true.B); i.range.req.valid.expect(true.B); d.clock.step()
+      i.range.resp.bits.fault.poke(EvuAddressFault.None); i.range.resp.valid.poke(true.B)
+      i.out.valid.expect(true.B); i.out.bits.faults.expect(0.U)
+      i.out.bits.cmd.config.vl.expect(16.U); i.out.bits.cmd.base.expect(0x80000fc0L.U)
+      i.flush.bits.flag.poke(false.B); i.flush.bits.value.poke(3.U); i.flush.valid.poke(true.B)
+      i.range.cancel.expect(true.B); i.out.valid.expect(false.B); i.range.resp.ready.expect(false.B)
+      d.clock.step(); i.flush.valid.poke(false.B); i.in.valid.poke(false.B)
+      i.range.resp.ready.expect(false.B); i.out.valid.expect(false.B)
     }
   }
 }

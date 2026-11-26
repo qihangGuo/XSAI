@@ -47,7 +47,7 @@ EVU_SOFTMAX_REDUCE_VL ?= 128
 # their original schedule unless the caller explicitly requests otherwise.
 EVU_SOFTMAX_PIPELINE ?= $(if $(filter 256-0-128,$(EVU_SOFTMAX_COLS)-$(EVU_SOFTMAX_STATE_BATCH)-$(EVU_SOFTMAX_REDUCE_VL)),1,0)
 EVU_SOFTMAX_STATE_LOAD_BATCH ?= 0
-EVU_SOFTMAX_DRAIN_DIAG ?= 1
+EVU_SOFTMAX_DRAIN_DIAG ?= 0
 CFLAGS += -DEVU_SOFTMAX_ROWS=$(EVU_SOFTMAX_ROWS) -DEVU_SOFTMAX_COLS=$(EVU_SOFTMAX_COLS) -DEVU_SOFTMAX_STRIDE=$(EVU_SOFTMAX_STRIDE)
 CFLAGS += -DEVU_SOFTMAX_SCALE=$(EVU_SOFTMAX_SCALE) -DEVU_SOFTMAX_FIRST=$(EVU_SOFTMAX_FIRST) -DEVU_SOFTMAX_WARMUP=$(EVU_SOFTMAX_WARMUP)
 CFLAGS += -DEVU_SOFTMAX_CHECK=$(EVU_SOFTMAX_CHECK)
@@ -57,7 +57,7 @@ CFLAGS += -DEVU_SOFTMAX_STATE_LOAD_BATCH=$(EVU_SOFTMAX_STATE_LOAD_BATCH)
 CFLAGS += -fno-fast-math
 OS_VARIANT := r$(EVU_SOFTMAX_ROWS)-c$(EVU_SOFTMAX_COLS)-s$(EVU_SOFTMAX_STRIDE)-scale$(EVU_SOFTMAX_SCALE)-first$(EVU_SOFTMAX_FIRST)-w$(EVU_SOFTMAX_WARMUP)-check$(EVU_SOFTMAX_CHECK)-state$(EVU_SOFTMAX_STATE_BATCH)-red$(EVU_SOFTMAX_REDUCE_VL)-diag$(EVU_SOFTMAX_DRAIN_DIAG)-pipe$(EVU_SOFTMAX_PIPELINE)-loads4$(EVU_SOFTMAX_STATE_LOAD_BATCH)
 DST_DIR := $(CURDIR)/build/obj/$(NAME)/$(OS_VARIANT)
-ifneq ($(EVU_SOFTMAX_ROWS)-$(EVU_SOFTMAX_COLS)-$(EVU_SOFTMAX_STRIDE)-$(EVU_SOFTMAX_SCALE)-$(EVU_SOFTMAX_FIRST)-$(EVU_SOFTMAX_WARMUP)-$(EVU_SOFTMAX_CHECK)-$(EVU_SOFTMAX_STATE_BATCH)-$(EVU_SOFTMAX_REDUCE_VL)-$(EVU_SOFTMAX_DRAIN_DIAG)-$(EVU_SOFTMAX_PIPELINE)-$(EVU_SOFTMAX_STATE_LOAD_BATCH),32-256-256-1.0f--1-1-0-0-128-1-1-0)
+ifneq ($(EVU_SOFTMAX_ROWS)-$(EVU_SOFTMAX_COLS)-$(EVU_SOFTMAX_STRIDE)-$(EVU_SOFTMAX_SCALE)-$(EVU_SOFTMAX_FIRST)-$(EVU_SOFTMAX_WARMUP)-$(EVU_SOFTMAX_CHECK)-$(EVU_SOFTMAX_STATE_BATCH)-$(EVU_SOFTMAX_REDUCE_VL)-$(EVU_SOFTMAX_DRAIN_DIAG)-$(EVU_SOFTMAX_PIPELINE)-$(EVU_SOFTMAX_STATE_LOAD_BATCH),32-256-256-1.0f--1-1-0-0-128-0-1-0)
 BINARY := $(CURDIR)/build/$(NAME)-$(OS_VARIANT)-$(ARCH)
 endif
 endif
@@ -84,11 +84,13 @@ ifeq ($(NAME),rmsnorm_nvfp4_fused_evu_test)
 EVU_RMS_QUANT_DIRECT_FIRST ?= 1
 EVU_RMS_QUANT_DIRECT_MAXIMA ?= 1
 EVU_RMS_QUANT_SCALAR_FIRST ?= 1
+EVU_RMS_FUSED_BLOCK ?= $(if $(filter 1-1-1-1-1,$(EVU_RMS_QUANT_BANKED)-$(EVU_RMS_QUANT_RENAME)-$(EVU_RMS_QUANT_DIRECT_FIRST)-$(EVU_RMS_QUANT_DIRECT_MAXIMA)-$(EVU_RMS_QUANT_SCALAR_FIRST)),1,0)
+CFLAGS += -DEVU_RMS_FUSED_BLOCK=$(EVU_RMS_FUSED_BLOCK)
 CFLAGS += -DEVU_RMS_QUANT_DIRECT_FIRST=$(EVU_RMS_QUANT_DIRECT_FIRST)
 CFLAGS += -DEVU_RMS_QUANT_DIRECT_MAXIMA=$(EVU_RMS_QUANT_DIRECT_MAXIMA)
 CFLAGS += -DEVU_RMS_QUANT_SCALAR_FIRST=$(EVU_RMS_QUANT_SCALAR_FIRST)
-RN_VARIANT := $(RN_VARIANT)-first$(EVU_RMS_QUANT_DIRECT_FIRST)-max$(EVU_RMS_QUANT_DIRECT_MAXIMA)-scalar$(EVU_RMS_QUANT_SCALAR_FIRST)
-ifneq ($(EVU_RMS_QUANT_DIRECT_FIRST)-$(EVU_RMS_QUANT_DIRECT_MAXIMA)-$(EVU_RMS_QUANT_SCALAR_FIRST),1-1-1)
+RN_VARIANT := $(RN_VARIANT)-first$(EVU_RMS_QUANT_DIRECT_FIRST)-max$(EVU_RMS_QUANT_DIRECT_MAXIMA)-scalar$(EVU_RMS_QUANT_SCALAR_FIRST)-block$(EVU_RMS_FUSED_BLOCK)
+ifneq ($(EVU_RMS_QUANT_DIRECT_FIRST)-$(EVU_RMS_QUANT_DIRECT_MAXIMA)-$(EVU_RMS_QUANT_SCALAR_FIRST)-$(EVU_RMS_FUSED_BLOCK),1-1-1-1)
 BINARY := $(CURDIR)/build/$(NAME)-$(RN_VARIANT)-$(ARCH)
 endif
 endif
@@ -119,16 +121,12 @@ BINARY := $(CURDIR)/build/$(NAME)-$(RN_TILE_VARIANT)-$(ARCH)
 endif
 endif
 
-ifneq ($(filter $(NAME),vector_memory_path_evu_test vector_add_evu_test exp2_evu_test online_softmax_evu_test csr_context_evu_test virtual_memory_evu_test rmsnorm_nvfp4_evu_test rmsnorm_nvfp4_fused_evu_test rmsnorm_nvfp4_tile128x64_evu_test rmsnorm_nvfp4_tile128x64_perf_evu_test rvv_math_evu_test low_precision_evu_test),)
+ifneq ($(filter $(NAME),vector_memory_path_evu_test vector_add_evu_test online_softmax_evu_test csr_context_evu_test virtual_memory_evu_test rmsnorm_nvfp4_evu_test rmsnorm_nvfp4_fused_evu_test rmsnorm_nvfp4_tile128x64_evu_test rmsnorm_nvfp4_tile128x64_perf_evu_test rvv_math_evu_test low_precision_evu_test),)
 CFLAGS += -fno-tree-vectorize -fno-tree-slp-vectorize
 endif
 
 ifneq ($(filter $(NAME),vector_memory_path_evu_test online_softmax_evu_test rmsnorm_nvfp4_evu_test rmsnorm_nvfp4_fused_evu_test rmsnorm_nvfp4_tile128x64_evu_test rmsnorm_nvfp4_tile128x64_perf_evu_test),)
 CFLAGS += -ffp-contract=off
-endif
-
-ifeq ($(NAME),rmsnorm_nvfp4_tile_diag_evu_test)
-CFLAGS += -fno-fast-math -ffp-contract=off -fno-tree-vectorize -fno-tree-slp-vectorize
 endif
 
 include $(AM_HOME)/Makefile.app

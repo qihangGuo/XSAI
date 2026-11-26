@@ -96,22 +96,6 @@
 #define PERF_PACK_ONLY_PAIR(next_source, block, index, a, b, slot, desc) \
   PERF_PACK_PAIR(a, b, slot, desc)
 
-#ifdef EVU_RMS_TILE_DIAGNOSTIC
-/* The B control interleaves discrete tail maxima with the previous batch's PACKs. */
-#define PERF_STEADY_PAIR(next_source, block, index, a, b, slot, desc) do { \
-  RN_BATCH_EXTRACT_FIRST(2, block, next_source); \
-  XV_SLIDEDOWN(3, 16 * ((block) + 1), next_source, 2); \
-  XV_FABS(2, RN_BATCH_FIRST_REG(2, block, next_source), 2); \
-  PERF_PACK_A(a, slot, desc); \
-  XV_FABS(3, 3, 2); \
-  XV_FREDUCE_MAX(RN_BATCH_MAX_DEST(index, 2), RN_QUANT_ZERO, 2, 2); \
-  PERF_PACK_B(b, slot, desc); \
-  XV_FREDUCE_MAX(3, RN_QUANT_ZERO, 3, 2); \
-  RN_BATCH_MAX_INSERT(index, 2); \
-  XV_SLIDEUP(RN_QUANT_MAXIMA, (index) + 1, 3, 2); \
-} while (0)
-#endif
-
 #define PERF_PACK_TWO_SLOTS(a, b, slot, desc) do { \
   PERF_PACK_PAIR(a, b, slot, desc); \
   PERF_PACK_PAIR(a, b, (slot) + 1, desc); \
@@ -204,26 +188,15 @@ static void perf_quantize_rows(unsigned tile) {
 
   RN_BATCH_SCALE_ENCODE(4 * tile + 1, 0, 21, 0);
   PERF_PACK_DESCRIPTOR(0, 21);
-#ifdef EVU_RMS_TILE_DIAGNOSTIC
-  if (diag_block4)
-#endif
-  {
-    /* v23 is free again. Each AMAX writes four block maxima to its own quarter. */
-    (void)xv_setvli(COLS, 0x10);
-    XV_BLOCK_AMAX(RN_QUANT_MAXIMA, 0, 12);
-    XV_BLOCK_AMAX(RN_QUANT_MAXIMA, 1, 13);
-    XV_BLOCK_AMAX(RN_QUANT_MAXIMA, 2, 14);
-    XV_BLOCK_AMAX(RN_QUANT_MAXIMA, 3, 15);
-    (void)xv_setvli(16, 0x10);
-    PERF_OVERLAP(4 * tile + 2, RN_QUANT_INVERSE, 21, PERF_BATCH2_MAXIMA, 0,
-      4, 5, 6, 7, PERF_PACK_ONLY_PAIR, 0, 0, 0, 0, 0);
-  }
-#ifdef EVU_RMS_TILE_DIAGNOSTIC
-  else {
-    PERF_OVERLAP(4 * tile + 2, RN_QUANT_INVERSE, 21, PERF_BATCH2_MAXIMA, 0,
-      4, 5, 6, 7, PERF_STEADY_PAIR, 12, 13, 14, 15, 0);
-  }
-#endif
+  /* v23 is free again. Each AMAX writes four block maxima to its own quarter. */
+  (void)xv_setvli(COLS, 0x10);
+  XV_BLOCK_AMAX(RN_QUANT_MAXIMA, 0, 12);
+  XV_BLOCK_AMAX(RN_QUANT_MAXIMA, 1, 13);
+  XV_BLOCK_AMAX(RN_QUANT_MAXIMA, 2, 14);
+  XV_BLOCK_AMAX(RN_QUANT_MAXIMA, 3, 15);
+  (void)xv_setvli(16, 0x10);
+  PERF_OVERLAP(4 * tile + 2, RN_QUANT_INVERSE, 21, PERF_BATCH2_MAXIMA, 0,
+    4, 5, 6, 7, PERF_PACK_ONLY_PAIR, 0, 0, 0, 0, 0);
   PERF_OVERLAP(4 * tile + 3, 0, 1, RN_QUANT_MAXIMA, RN_QUANT_INVERSE,
     8, 9, 10, 11, PERF_PACK_ONLY_PAIR, 0, 0, 0, 0, 1);
   PERF_PACK_ROWS(4 * tile + 3, 12, 13, 14, 15, 0);
@@ -268,13 +241,11 @@ static void initialize_inputs(unsigned rows) {
   }
 }
 
-#ifndef EVU_RMS_TILE_DIAGNOSTIC
 __attribute__((used, noinline)) static int rmsnorm_nvfp4_tile_perf_main(void) {
   __asm__ volatile ("csrw frm, x0" ::: "memory");
-  const uint64_t capability = XV_CSR_READ(XV_EVCAP);
-  if (XV_CSR_READ(XV_EVLENB) != 512 || (capability & 255) != 2 ||
-      !(capability & XV_CAP_RVV_MATH) || !(capability & XV_CAP_LOW_PRECISION) ||
-      !(capability & XV_CAP_GATHER_IMM) || !(capability & XV_CAP_BLOCK_QUANT) ||
+  const uint64_t required = XV_CAP_RETURNED_VL | XV_CAP_RVV_MATH | XV_CAP_LOW_PRECISION |
+                            XV_CAP_GATHER_IMM | XV_CAP_BLOCK_QUANT;
+  if (xv_init(512, required) ||
       !(alpha >= 0x1p-100f && alpha <= 0x1p100f) ||
       !(epsilon >= 0x1p-100f && epsilon <= 0x1p100f)) return 1;
   if (xv_setvli(COLS, 0x10) != COLS || xv_setvli(16, 0x10) != 16) return 1;
@@ -296,4 +267,3 @@ __attribute__((used, noinline)) static int rmsnorm_nvfp4_tile_perf_main(void) {
 __attribute__((naked)) int main(void) {
   __asm__ volatile ("li t0, 0x2200\ncsrs mstatus, t0\nli t0, 9\ncsrw 0xbc8, t0\ntail rmsnorm_nvfp4_tile_perf_main\n");
 }
-#endif

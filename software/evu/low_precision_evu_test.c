@@ -32,11 +32,6 @@ static int check_extensions(void) {
     {0x40000000, 0x3c, 1, 0}, {0x38, 0x40000000, 4, 0},
     {0xbc, 0xc0000000, 4, 0}, {0xf9, 0xbf800000, 4, 0}
   };
-  const uint64_t caps = XV_CAP_CVT_RAW_EXTENSION | XV_CAP_CVT_MX_EXTENSION | XV_CAP_CVT_BF16;
-  if ((XV_CSR_READ(XV_EVCAP) & caps) != caps) {
-    printf("[LOWP] FAIL missing CVT extension capabilities\n");
-    return 1;
-  }
   for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
     source[0] = cases[i].src;
     factor = 128; // UE8M0 = 2
@@ -78,8 +73,10 @@ static int check_extensions(void) {
 }
 
 __attribute__((used, noinline)) static int low_precision_main(void) {
-  if (!(XV_CSR_READ(XV_EVCAP) & XV_CAP_LOW_PRECISION) || XV_CSR_READ(XV_EVLENB) != REG_BYTES) {
-    printf("[LOWP] FAIL missing low precision capability\n");
+  const uint64_t required = XV_CAP_LOW_PRECISION | XV_CAP_CVT_RAW_EXTENSION |
+                            XV_CAP_CVT_MX_EXTENSION | XV_CAP_CVT_BF16;
+  if (xv_init(REG_BYTES, required)) {
+    printf("[LOWP] FAIL unsupported EVU configuration for low-precision conversions\n");
     return 1;
   }
   const unsigned lengths[] = {0, 1, 2, 15, 16, 17, 63, 64, 65, 127, 128};

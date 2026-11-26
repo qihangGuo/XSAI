@@ -51,6 +51,8 @@ class Scheduler(val params: SchdBlockParams)(implicit p: Parameters) extends Laz
 }
 
 class SchedulerIO()(implicit params: SchdBlockParams, p: Parameters) extends XSBundle {
+  val evuConfigOwner = Option.when(params.schdType == IntScheduler() && p(ExternalVectorKey).enable)(
+    Input(Valid(new xiangshan.backend.rob.RobPtr)))
   // params alias
   private val LoadQueueSize = VirtualLoadQueueSize
   val fromDispatchUopNum = params.issueBlockParams.filter(x => x.StdCnt == 0).map(_.numEnq).sum
@@ -170,6 +172,7 @@ abstract class SchedulerImpBase(wrapper: Scheduler)(implicit params: SchdBlockPa
 
   // Modules
   val issueQueues: Seq[IssueQueueImp] = wrapper.issueQueue.map(_.module)
+  issueQueues.foreach(_.io.evuConfigOwner.foreach(_ := io.evuConfigOwner.get))
 
   io.IQValidNumVec := issueQueues.filter(_.params.StdCnt == 0).map(_.io.validCntDeqVec).flatten
   val wakeupFromIntWBVec = Wire(params.genIntWBWakeUpSinkValidBundle)
