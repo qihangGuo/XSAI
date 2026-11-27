@@ -5,7 +5,7 @@ import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import xiangshan.evu.insns.FEXP2_V
 import yunsuan.VfexpType
-import yunsuan.vector.{VfExp2, VfExp2Pipe}
+import yunsuan.vector.{VfExp2Pipe, VfExp2_EVU}
 
 case object VFExp2Factory extends FunctionalUnitFactory {
   def insns = FEXP2_V.restrictSEW(1, 2).map(_.pipelined(VfExp2Pipe.latency))
@@ -15,7 +15,7 @@ case object VFExp2Factory extends FunctionalUnitFactory {
 class VFExp2FU(implicit p: Parameters) extends PipelinedFunctionalUnit(VfExp2Pipe.latency) {
   require(dLen % 64 == 0)
 
-  val units = Seq.fill(dLen / 64)(Module(new VfExp2(64)))
+  val units = Seq.fill(dLen / 64)(Module(new VfExp2_EVU(64)))
   for ((unit, i) <- units.zipWithIndex) {
     unit.io.fire := io.iss.valid
     unit.io.src := io.iss.op.rvs2_data(64 * (i + 1) - 1, 64 * i)
