@@ -66,7 +66,7 @@ class EvuCommandTableSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
       for (i <- 0 until 32) {
         dut.io.completion.valid.expect(true.B)
         dut.io.completion.bits.jobId.expect(i.U)
-        dut.io.completion.bits.pc.expect((0x80000000L + i * 4L).U)
+        dut.io.completion.bits.pc.get.expect((0x80000000L + i * 4L).U)
         dut.io.completion.bits.vd.expect(i.U)
         dut.io.completion.bits.fflags.expect(i.U)
         dut.io.completion.ready.poke(true.B)
@@ -84,7 +84,7 @@ class EvuCommandTableSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
       for (i <- 0 until 32) { result(dut, i) }
       dut.io.completion.ready.poke(true.B)
       for (i <- 32 until 64) {
-        dut.io.completion.bits.pc.expect((0x80000000L + (i - 32) * 4L).U)
+        dut.io.completion.bits.pc.get.expect((0x80000000L + (i - 32) * 4L).U)
         allocate(dut, i)
         dut.io.count.expect(32.U)
         dut.io.live(i % 32).expect(true.B)
@@ -96,7 +96,7 @@ class EvuCommandTableSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
       // No consumer can see a new row until its own outcome has been recorded.
       for (i <- 32 until 64) {
         dut.io.completion.valid.expect(true.B)
-        dut.io.completion.bits.pc.expect((0x80000000L + i * 4L).U)
+        dut.io.completion.bits.pc.get.expect((0x80000000L + i * 4L).U)
         dut.clock.step()
       }
       dut.io.busy.expect(false.B)
@@ -157,8 +157,13 @@ class EvuCommandTableSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
   }
 
   it should "flush pending rows and discard an old-epoch response after numbering restarts" in {
-    test(new EvuCommandTable(ep)).withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+    for (debug <- Seq(false, true)) {
+    test(new EvuCommandTable(ep.copy(enableDifftest = debug), cpuOwnedPc = true))
+      .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
       initialize(dut)
+      dut.io.completion.bits.pc shouldBe None
+      dut.pcs.isDefined shouldBe debug
+      dut.io.traceId.foreach(_.poke(0.U))
       allocate(dut, 0)
       result(dut, 0)
       dut.io.flush.poke(true.B)
@@ -171,13 +176,15 @@ class EvuCommandTableSpec extends AnyFlatSpec with ChiselScalatestTester with Ma
       dut.io.allocate.valid.poke(false.B)
       dut.io.completion.ready.poke(false.B)
       dut.io.busy.expect(false.B)
-      allocate(dut, 0, epoch = 1)
+      allocate(dut, ep.commandDepth, epoch = 1)
+      dut.io.tracePc.foreach(_.expect((0x80000000L + ep.commandDepth * 4L).U))
       result(dut, 0, epoch = 0)
       dut.io.completed(0).expect(false.B)
       dut.io.completion.valid.expect(false.B)
       result(dut, 0, epoch = 1)
       dut.io.completion.valid.expect(true.B)
       dut.io.completion.bits.epoch.expect(1.U)
+    }
     }
   }
 

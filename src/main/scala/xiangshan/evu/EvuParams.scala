@@ -1,6 +1,7 @@
 package xiangshan.evu
 
 import chisel3._
+import chisel3.experimental.dataview._
 import chisel3.util.log2Ceil
 
 /** Parameters for the first external long-vector integration slice. */
@@ -119,8 +120,7 @@ class EvuCommand(p: EvuParams) extends Bundle {
   val pageMap = new EvuPageMap(p)
 }
 
-class EvuCompletion(p: EvuParams) extends Bundle {
-  val pc = UInt(64.W)
+class EvuExecutionResult(p: EvuParams) extends Bundle {
   val tval = UInt(64.W)
   val tvalValid = Bool()
   val opcode    = UInt(8.W)
@@ -134,4 +134,15 @@ class EvuCompletion(p: EvuParams) extends Bundle {
   val epoch     = UInt(2.W)
   // Stable architectural cause snapshot consumed at ordered completion.
   val cause     = UInt(4.W)
+}
+
+/** Standalone clients have no AMU command from which to recover the PC. */
+class EvuClientResult(p: EvuParams, cpuOwnedPc: Boolean) extends EvuExecutionResult(p) {
+  val pc = Option.when(!cpuOwnedPc)(UInt(64.W))
+}
+
+/** Complete local status, including the program identity. */
+class EvuCompletion(p: EvuParams) extends EvuExecutionResult(p) {
+  val pc = UInt(64.W)
+  def resultFields: EvuExecutionResult = this.viewAsSupertype(new EvuExecutionResult(p))
 }

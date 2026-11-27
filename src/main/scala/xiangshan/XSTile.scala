@@ -34,7 +34,7 @@ import xiangshan.backend.trace.TraceCoreInterface
 import xiangshan.backend.fu.matrix._
 import xiangshan.backend.fu.matrix.Bundles._
 import cute.{CutePerfAsyncCrossing, CutePerfToCoreIO, XSCute}
-import xiangshan.evu.{EvuCompletion, EvuCoreCommand, EvuDispatchRequest, EvuTop}
+import xiangshan.evu.{EvuCoreCommand, EvuDispatchRequest, EvuExecutionResult, EvuTop}
 
 object MatAcc extends Enumeration {
   type MatAcc = Value
@@ -71,7 +71,7 @@ class XSTile()(implicit p: Parameters) extends LazyModule
   private val useAcceleratorCDC = cuteOpt.nonEmpty && acceleratorCDC.enable
   require(!useAcceleratorCDC || cuteOpt.forall(cute => !cute.cuteParams.EnableMatrixPrefetch),
     "Matrix prefetch notifications require a common core/accelerator clock")
-  val evuOpt = Option.when(p(ExternalVectorKey).enable)(LazyModule(new EvuTop(p(ExternalVectorKey))))
+  val evuOpt = Option.when(p(ExternalVectorKey).enable)(LazyModule(new EvuTop(p(ExternalVectorKey), cpuOwnedPc = true)))
 
   require(!p(ExternalVectorKey).enable || HasMatrixExtension,
     "EVU requires the AMU retirement interface provided by the matrix extension")
@@ -590,6 +590,9 @@ class XSTile()(implicit p: Parameters) extends LazyModule
         XSPerfReference("evu_pack_slot_issues", perf.execution.packSlotIssues, XSPerfLevel.NORMAL)
         val desc = perf.execution.packDesc
         XSPerfReference("evu_dispatch_second_issues", perf.execution.dispatchSecondIssues, XSPerfLevel.NORMAL)
+        for ((name, i) <- xiangshan.evu.common.EvuSumLookahead.names.zipWithIndex) {
+          XSPerfReference(s"evu_sum_lookahead_$name", perf.execution.sumLookahead(i), XSPerfLevel.NORMAL)
+        }
         XSPerfReference("evu_pack_desc_reuse_hits", desc.reuseHits, XSPerfLevel.NORMAL)
         XSPerfReference("evu_pack_desc_issues", desc.issues, XSPerfLevel.NORMAL)
         XSPerfReference("evu_pack_desc_captures", desc.captures, XSPerfLevel.NORMAL)
@@ -681,7 +684,7 @@ class XSTile()(implicit p: Parameters) extends LazyModule
       core.module.io.evuCompletion.foreach { completion =>
         if (useAcceleratorCDC) {
           val evuCompletionCrossing = Module(new AsyncQueue(
-            new EvuCompletion(p(ExternalVectorKey)),
+            new EvuExecutionResult(p(ExternalVectorKey)),
             acceleratorCDC.completion
           ))
           evuCompletionCrossing.io.enq_clock := acceleratorClock

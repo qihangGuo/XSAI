@@ -12,7 +12,7 @@ import xiangshan.{ExternalVectorKey, XSCoreParamsKey, XSTileKey}
 import xiangshan.backend.BackendParams
 import xiangshan.backend.fu.matrix.Bundles.AmuCtrlIO
 import xiangshan.backend.rob.AmuCtrlBuffer
-import xiangshan.evu.{EvuCompletion, EvuCoreCommand, EvuIsa, EvuPageMap}
+import xiangshan.evu.{EvuCompletion, EvuCoreCommand, EvuExecutionResult, EvuIsa, EvuPageMap}
 
 class EvuAmuCompletionHarness(implicit p: Parameters) extends Module {
   private implicit val backend: BackendParams = p(XSCoreParamsKey).backendParams
@@ -44,7 +44,7 @@ class EvuAmuCompletionHarness(implicit p: Parameters) extends Module {
       val matrix = Bool()
       val matrixData = UInt(150.W)
     }))
-    val completion = Flipped(Decoupled(new EvuCompletion(ep)))
+    val completion = Flipped(Decoupled(new EvuExecutionResult(ep)))
     val status = Output(Valid(new EvuCompletion(ep)))
     val redirect = Input(Bool())
     val busy = Output(Bool())
@@ -129,6 +129,14 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
       i.unresolved.expect(true.B)
       i.publication.bits.poke(1.U); d.clock.step(); i.publication.valid.poke(false.B)
       i.unresolved.expect(false.B); i.preflightBusy.expect(true.B)
+      // A second SETVLI with the same payload must not inherit the first publication.
+      i.index.poke(2.U); i.enqueue.poke(true.B); d.clock.step(); i.enqueue.poke(false.B)
+      i.writeback.poke(true.B); d.clock.step(); i.writeback.poke(false.B)
+      i.unresolved.expect(true.B); i.commit.poke(true.B); d.clock.step(); i.commit.poke(false.B)
+      i.publication.valid.poke(true.B); i.publication.bits.poke(1.U); d.clock.step()
+      i.unresolved.expect(true.B)
+      i.publication.bits.poke(2.U); d.clock.step(); i.publication.valid.poke(false.B)
+      i.unresolved.expect(true.B) // Both controls are still live, not just the new owner.
     }
   }
 
@@ -398,11 +406,11 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
         val fencePc = BigInt("8000113a", 16)
         val arithmeticInstr = BigInt("6855a68b", 16)
         val fenceInstr = BigInt("3400000b", 16)
-        def completion(pc: BigInt, opcode: Int, flags: Int, fault: Boolean = false): Unit = {
+        val faultAddress = BigInt("ffffffff81234008", 16)
+        def completion(opcode: Int, flags: Int, fault: Boolean = false): Unit = {
           val c = dut.io.completion.bits
-          c.pc.poke(pc.U)
-          c.tval.poke(0.U)
-          c.tvalValid.poke(false.B)
+          c.tval.poke((if (fault) faultAddress else BigInt(0)).U)
+          c.tvalValid.poke(fault.B)
           c.opcode.poke(opcode.U)
           c.vd.poke(0.U)
           c.exception.poke(fault.B)
@@ -424,7 +432,7 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
           dut.io.issueReady.poke(false.B)
           dut.io.redirect.poke(false.B)
           dut.io.completion.valid.poke(false.B)
-          completion(arithmeticPc, 0x34, 1)
+          completion(0x34, 1)
           dut.reset.poke(true.B)
           dut.clock.step(2)
           dut.reset.poke(false.B)
@@ -452,6 +460,8 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
           dut.io.status.bits.opcode.expect(opcode.U)
           dut.io.status.bits.fflags.expect(flags.U)
           dut.io.status.bits.exception.expect(fault.B)
+          dut.io.status.bits.tvalValid.expect(fault.B)
+          if (fault) dut.io.status.bits.tval.expect(faultAddress.U)
           dut.io.status.bits.cause.expect((if (fault) 6 else 0).U)
         }
         for ((scalarGap, fault) <- Seq((false, false), (true, false), (false, true))) {
@@ -459,7 +469,7 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
           prepare(0, arithmeticPc, arithmeticInstr)
           if (scalarGap) prepare(1, 0, 0, needAmu = false)
           prepare(if (scalarGap) 2 else 1, fencePc, fenceInstr)
-          completion(arithmeticPc, 0x34, 1, fault)
+          completion(0x34, 1, fault)
           // An offered completion cannot bypass command acceptance.
           dut.io.completion.valid.poke(true.B)
           dut.io.completion.ready.expect(false.B)
@@ -479,7 +489,7 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
           dut.clock.step() // Arithmetic completes before its AMU entry is dequeued.
           expectStatus(arithmeticPc, 0x34, 1, fault)
           // Keep valid asserted: FENCE is ready immediately behind arithmetic.
-          completion(fencePc, 0x1a, 0)
+          completion(0x1a, 0)
           if (!lookahead) {
             dut.io.completion.ready.expect(false.B)
             dut.clock.step()
@@ -528,7 +538,7 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
           dut.io.preflightBusy.expect((!Seq(1, 0x10, 0x11).contains(f7)).B)
           dut.io.issueReady.poke(true.B)
           dut.clock.step()
-          completion(arithmeticPc, 1, 0)
+          completion(1, 0)
           dut.io.completion.valid.poke(true.B)
           dut.io.completion.ready.expect(true.B)
           dut.clock.step()
@@ -598,7 +608,6 @@ class EvuAmuCompletionSpec extends AnyFlatSpec with ChiselScalatestTester with M
             dut.io.status.valid.expect(false.B)
           }
           val c = dut.io.completion.bits
-          c.pc.poke((0x80006000L + number * 4).U)
           c.opcode.poke(0x32.U)
           c.jobId.poke((position % 16).U)
           c.fflags.poke((position % 32).U)

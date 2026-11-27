@@ -121,7 +121,7 @@ object EvuIsa {
     f7 === fsqrtE0 || f7 === frsqrt7E0 || f7 === frec7E0
   def isScalarSource(f7: UInt): Bool = f7 >= faddScalar && f7 <= fmaxScalar
   def isScalarForm(f7: UInt): Bool = isElementZero(f7) || isScalarSource(f7)
-  def isLoad(f7: UInt): Bool = f7 === load || f7 === loadE0
+  def isLoad(f7: UInt): Bool = loadForms.map(f7 === _).reduce(_ || _)
   def isStore(f7: UInt): Bool = f7 === store || f7 === storeE0
   def isSlide(op: UInt): Bool = op === slideUp || op === slideDown
   def canonical(f7: UInt): UInt = MuxLookup(f7, f7)(Seq(
@@ -222,6 +222,7 @@ object EvuIsa {
   val freduceMin = 0x43.U(7.W)
   val freduceMax = 0x44.U(7.W)
   val load  = 0x10.U(7.W)
+  val loadForms = Seq(load, loadE0)
   val store = 0x11.U(7.W)
   // Control operations do not access the EVU VRF. They provide explicit
   // program-visible completion points for a future scalar ROB bridge.

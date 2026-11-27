@@ -52,10 +52,12 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
   val factory: FunctionalUnitFactory = if (maximum) FPCmpFactory else SIMDFPFMAFactory(4, true)
   val insns = VXSequencerParams("fp_fma", Seq(factory)).insns
   val fu = Module(new ExecutionUnit(Seq(factory), "shared_reduction_test"))
-  val execute = Seq.fill(2)(Module(new ExecuteSequencer(insns, fu.maxPipeDepth, 1, reductionOnly = true)))
   val directSum = !maximum && dLen == 512
+  val execute = Seq.fill(2)(Module(new ExecuteSequencer(insns, fu.maxPipeDepth, 1,
+    reductionOnly = true, directSumLoad = directSum)))
   val accumulators = (0 until 2).map(i => Module(new SpecialSequencer(insns, i, 2, true, directSum)))
-  val arb = Module(new SharedExecutionArbiter(2, fu.maxPipeDepth, 1, prioritizeCritical = true))
+  val arb = Module(new SharedExecutionArbiter(2, fu.maxPipeDepth, 1,
+    prioritizeCritical = true, directSumLoad = directSum))
   val selected = Wire(Decoupled(chiselTypeOf(arb.io.out.bits)))
   val allowIssue = if (controlled) io.issueReady else true.B
   selected.valid := arb.io.out.valid && allowIssue
@@ -65,6 +67,8 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
     fu.io.iss <> selected
     false.B
   }
+  arb.directLoadFire.foreach(_ := firstLoad)
+  execute.foreach(_.directLoadFire.foreach(_ := firstLoad))
   fu.io.iter_write.ready := true.B
   fu.io.scalar_write.ready := true.B
   fu.io.shared_fp_req.ready := true.B
@@ -178,7 +182,11 @@ class EvuSharedReductionHarness(maximum: Boolean = false, operandInputs: Boolean
     acc.io.acc_fu_resp.valid := fu.io.acc_write.valid && fu.io.accWriteVat === acc.io.vat
     acc.io.acc_fu_resp.bits := fu.io.acc_write.bits
     acc.io.acc_fu_resp_slot := fu.io.acc_write_slot
-    seq.io.pipe_write_req.available := arb.io.available(i) && (if (controlled) io.writeReady else true.B)
+    seq.io.pipe_write_req.available := (if (controlled) io.writeReady else true.B)
+    when(seq.io.iss.fire) {
+      assert(seq.io.pipe_write_req.fire === seq.io.iss.bits.tail)
+      assert(seq.io.pipe_write_req.request === seq.io.iss.bits.tail)
+    }
     io.ownerBusy(i) := acc.io.busy
     val candidate = arb.io.in(i)
     candidate.valid := seq.io.iss.valid
@@ -378,6 +386,66 @@ class EvuInterleavedReductionSpec extends AnyFlatSpec with ChiselScalatestTester
     }
   }
 
+  it should "direct-load slot zero only on its first full normal group with an actual positive-zero seed" in {
+    implicit val p: Parameters = EvuVectorParameters(base, 4096, 512, 512,
+      VectorParams.lgvParams.copy(reductionContexts = 2, interleaveReductions = true))
+    test(LazyModule(new EvuSharedReductionShell(operandInputs = true, controlled = true)).module)
+      .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+        val unit = BigInt(0x3f800000L)
+        val ones = (0 until 16).map(i => unit << (32*i)).sum
+        for ((seed, length, unmasked, lowLane, loads, expected, flags) <- Seq(
+            (0L, 16, true, unit, 1, 16f, 0),
+            (0x80000000L, 16, true, unit, 0, 16f, 0),
+            (0x3f800000L, 16, true, unit, 0, 17f, 0),
+            (0L, 16, true, BigInt(0), 0, 15f, 0),
+            (0L, 16, true, BigInt(0x7f800001L), 0, Float.NaN, 16),
+            (0L, 16, false, unit, 0, 16f, 0),
+            (0L, 15, true, unit, 0, 15f, 0),
+            (0L, 80, true, unit, 4, 80f, 0))) {
+          dut.io.command.foreach(_.valid.poke(false.B))
+          dut.reset.poke(true.B); dut.clock.step(2); dut.reset.poke(false.B)
+          val cmd = dut.io.command(0)
+          def clear(x: Data): Unit = x match {
+            case b: Bool => b.poke(false.B)
+            case u: UInt => u.poke(0.U)
+            case s: SInt => s.poke(0.S)
+            case v: Vec[_] => v.foreach(clear)
+            case b: Bundle => b.elements.values.foreach(clear)
+          }
+          clear(cmd.bits)
+          dut.io.olderReads(0).poke(0.U); dut.io.olderWrites(0).poke(0.U)
+          dut.io.issueReady.poke(true.B); dut.io.seedReady(0).poke(false.B)
+          dut.io.writeReady.poke(false.B)
+          cmd.bits.bits.poke(((OPFFunct6.fredusum.litValue << 26) | (BigInt(if (unmasked) 1 else 0) << 25) |
+            (1 << 20) | (2 << 15) | (1 << 12) | (3 << 7) | 0x57).U)
+          cmd.bits.vconfig.vl.poke(length.U); cmd.bits.vconfig.vtype.vsew.poke(2.U)
+          cmd.bits.vat.poke(1.U); cmd.bits.reduction.poke(true.B); cmd.bits.wvd.poke(true.B)
+          cmd.bits.renv1.poke(true.B); cmd.bits.renv2.poke(true.B); cmd.bits.renvm.poke((!unmasked).B)
+          dut.io.seed(0).poke(seed.U); dut.io.source(0).poke((ones - unit + lowLane).U)
+          dut.io.mask(0).poke(((BigInt(1) << length) - 1).U); dut.io.sourceReady(0).poke(false.B)
+          cmd.valid.poke(true.B); cmd.ready.expect(true.B); dut.clock.step(); cmd.valid.poke(false.B)
+          dut.clock.step(2); dut.io.firstLoads(0).expect(0.U); dut.io.sourceReady(0).poke(true.B)
+          dut.io.seedReady(0).poke(true.B)
+          // Every internal return (including merge/fold) advances with the VRF bank denied.
+          var waitForTail = 0
+          while (dut.io.folds(0).peek().litValue < 3 && waitForTail < 120) {
+            dut.clock.step(); waitForTail += 1
+          }
+          dut.clock.step(6)
+          dut.io.folds(0).expect(3.U); dut.io.completed(0).expect(false.B)
+          dut.io.firstLoads(0).expect(loads.U)
+          dut.io.writeReady.poke(true.B)
+          var cycles = 0
+          while (!dut.io.completed(0).peek().litToBoolean && cycles < 150) { dut.clock.step(); cycles += 1 }
+          dut.io.completed(0).expect(true.B); dut.io.firstLoads(0).expect(loads.U)
+          val groups = (length + 15) / 16
+          dut.io.issues(0).expect((groups + groups.min(4) - 1 + 4 - loads).U)
+          dut.io.flags.expect(flags.U)
+          dut.io.result(0).expect((java.lang.Float.floatToIntBits(expected).toLong & 0xffffffffL).U)
+        }
+      }
+  }
+
   it should "reduce short FP32 sums and maxima without merging unused accumulator slots" in {
     for (maximum <- Seq(false, true); tree <- Seq(false, true)) {
       implicit val parameters: Parameters = EvuVectorParameters(base, 4096, 512, 512,
@@ -428,7 +496,7 @@ class EvuInterleavedReductionSpec extends AnyFlatSpec with ChiselScalatestTester
               dut.io.merges(context).expect((math.min(4, (length + 15) / 16) - 1).U)
               dut.io.folds(context).expect((if (maximum && tree) 1 else 4).U)
               val loaded = dut.io.firstLoads(context).peek().litValue.toInt
-              loaded should be <= (if (maximum) 0 else (length / 16 - 1).max(0).min(3))
+              loaded should be <= (if (maximum) 0 else (length / 16).min(4))
               if (!maximum && length == 64 && context == 1)
                 dut.io.firstLoads.map(_.peek().litValue).sum should be > BigInt(0)
               if (!maximum) dut.io.issues(context).expect(((length + 15) / 16 +

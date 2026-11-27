@@ -258,8 +258,12 @@ This independent image leaves the checked test unchanged but uses an optimized
 sixteen-row schedule. Each group starts with two row loads, then issues two
 squares and their sums before loading the next pair;
 row sums are inserted eight at a time into one sixteen-element EG so square root and reciprocal
-use all sixteen FP32 lanes instead of issuing one E0 operation per row. Gamma
-is reloaded once per sixteen rows because quantization reuses its register.
+use all sixteen FP32 lanes instead of issuing one E0 operation per row. The
+first group loads all 64 gamma weights into v27. PACK overwrites only its first
+64 bytes, so each of the seven following groups reloads 16 weights at VL=16
+after the preceding group's final store, before the existing switch to VL=64.
+With VTA=0 the other 48 weights survive. This reads 704 rather than 2,048
+logical gamma bytes without adding a load, VL change or fence.
 The four quantization batches overlap amax, scale and packing, recycling input
 registers only after their values have been consumed. FP32 arithmetic order
 within each row, scale formulas, output layout and 72 aligned stores are
@@ -276,7 +280,10 @@ RMSNorm, scale or FP4 results, allocate reference arrays, or compare output
 bytes. A lookup table reduces input initialization from 8,192 scalar divisions
 to 509 while preserving the input bits. Timing still includes all kernel
 loads, computation, stores and final acknowledgement drain. The default run
-prints only one application line: `[RN-PERF] ... cycles=...`. Hardware
+prints only one application line: `[RN-PERF] ... cycles=... flags=0x...`.
+The `_gamma16_load89early` schedule keeps the short gamma reload and loads
+rows 8 and 9 at VL=64 just before collecting the first eight sums at VL=16.
+Their squares still execute after the switch back to VL=64. Hardware
 status/invalid-operation/divide-by-zero errors still fail the guest, and the
 server's NEMU difftest remains enabled by the command above. The application
 does not claim numerical PASS. The Python schedule model checks every normalized
@@ -297,14 +304,29 @@ LOAD opportunities under the old status rule, not additional stall cycles.
 `evu_load_check_bypass` counts requests that actually handshook despite the
 old control/status barrier. Neither counts saved tile cycles.
 
-Ordinary LOADs reserve one of two CPU slots at dispatch and capture their
+LOAD and LOAD_E0 reserve one of two CPU slots at dispatch and capture their
 base, range and configuration on the scalar port. A younger LOAD may fill
 first, but only the scalar ROB head can use the shared address checker.
 Younger CPU memory operations cannot occupy the store queue ahead of this
-check. STORE and element-zero memory keep their original dispatch barriers.
-Only a stable load configuration may bypass an exclusively arithmetic status
-drain or its matching, already published immediate SETVLI control.
+check. LOAD_E0 checks four bytes, or zero when the effective VL is zero.
+STORE and STORE_E0 keep their original dispatch barriers.
+LOAD and eligible ordinary STORE prechecks may cross a matching published
+immediate SETVLI, with no status drain or an exclusively arithmetic drain.
+STORE additionally requires a nonempty aligned full-line range within one
+page of known cacheable physical RAM. Fault reporting still waits for the
+original barrier. `evu_store_published_offer_cycles` counts newly eligible
+request-valid cycles (including checker backpressure); `evu_store_published_starts`
+counts their handshakes. Neither measures saved cycles.
 The external command format and the in-order, post-retirement send are unchanged.
+
+`evu_sum_lookahead_owner_only` counts cycles when an ordinary unmasked FP32/m1
+FREDUSUM at the dispatch head lacks an accumulator owner but its queues have
+space. The `empty`, `reduction`, `memory`, `ordinary`, and `other` counters
+under the same prefix partition those cycles by the actual second entry.
+`eligible_cycles` requires an ordinary independent second entry and a ready
+destination queue; `eligible_commands` counts each such entry once during its
+residence, even if readiness toggles. These are simulation observations, not
+additional dispatches.
 
 `[EVU-LOAD-SLOT] event=capture` records the ordinary LOAD leaving the scalar
 port. Compare `evu_load_capture_before_head` to `evu_load_slot_capture`;

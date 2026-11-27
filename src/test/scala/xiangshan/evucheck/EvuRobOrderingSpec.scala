@@ -169,13 +169,16 @@ class EvuRobOrderingSpec extends AnyFlatSpec with ChiselScalatestTester with Mat
     }
   }
 
-  it should "decouple only ordinary LOAD at decode and keep the other memory and control barriers" in {
+  it should "decouple both LOAD lengths at decode and keep store and control barriers" in {
     val entries = EvuDecoder.decodeArray.map { case (pattern, decode) =>
       (pattern.value >> 25).toInt -> decode.asInstanceOf[XSDecode]
     }.toMap
-    entries(0x10).noSpec shouldBe false
-    entries(0x10).blockBack shouldBe false
-    for (f7 <- Seq(0x11, 0x52, 0x53, 0x1a, 0x45, 0x46)) {
+    for (f7 <- Seq(0x10, 0x52)) {
+      entries(f7).src1.value shouldBe SrcType.reg.litValue
+      entries(f7).noSpec shouldBe false
+      entries(f7).blockBack shouldBe false
+    }
+    for (f7 <- Seq(0x11, 0x53, 0x1a, 0x45, 0x46)) {
       entries(f7).noSpec shouldBe true
       entries(f7).blockBack shouldBe true
     }

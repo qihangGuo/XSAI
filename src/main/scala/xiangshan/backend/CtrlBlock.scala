@@ -31,7 +31,7 @@ import xiangshan.backend.decode.{DecodeStage, FusionDecoder}
 import xiangshan.backend.dispatch.{CoreDispatchTopDownIO}
 import xiangshan.backend.dispatch.NewDispatch
 import xiangshan.backend.fu.matrix.Bundles.AmuCtrlIO
-import xiangshan.evu.EvuCompletion
+import xiangshan.evu.{EvuCompletion, EvuExecutionResult}
 import xiangshan.backend.fu.vector.Bundles.{VType, Vl}
 import xiangshan.backend.fu.wrapper.CSRToDecode
 import xiangshan.backend.rename.{Rename, RenameTableWrapper, SnapshotGenerator}
@@ -895,7 +895,7 @@ class CtrlBlockIO()(implicit p: Parameters, params: BackendParams) extends XSBun
   }
 
   val toAmu = OptionWrapper(HasMatrixExtension, Vec(CommitWidth, Decoupled(new AmuCtrlIO)))
-  val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuCompletion(p(ExternalVectorKey)))))
+  val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuExecutionResult(p(ExternalVectorKey)))))
 
   val frontend = Flipped(new FrontendToCtrlIO())
   val fromCSR = new Bundle{

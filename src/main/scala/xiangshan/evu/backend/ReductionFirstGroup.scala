@@ -16,13 +16,14 @@ object ReductionFirstGroup {
   def route(input: DecoupledIO[ExecuteMicroOpWithData], fu: DecoupledIO[ExecuteMicroOpWithData],
       owners: Seq[SpecialSequencer]): Bool = {
     val op = input.bits
-    val firstVisit = op.acc_slot =/= 0.U && op.eidx === Cat(op.acc_slot, 0.U(4.W))
+    val firstVisit = op.eidx === Cat(op.acc_slot, 0.U(4.W))
+    // The other lanes start at +0; lane 0 of slot 0 holds the actual VRF seed.
+    val zeroInit = op.acc_slot =/= 0.U || op.rvs1_data(31, 0) === 0.U
     val owner = owners.map(s => s.io.busy && s.io.vat === op.vat && !s.io.acc_fu_resp.valid)
-    val direct = op.acc && op.opff6 === OPFFunct6.fredusum && !op.acc_fold && !op.acc_merge &&
+    val direct = op.acc && !op.tail && op.opff6 === OPFFunct6.fredusum && !op.acc_fold && !op.acc_merge &&
       op.vm && op.sew === 2.U && op.rvs2_eew === 2.U && op.vd_eew === 2.U &&
-      op.eidx_mask.andR && firstVisit && allNormal(op.rvs2_data) && owner.reduce(_ || _)
-    // Preserve the selected sequencer's normal handshake and leave the existing
-    // writeback reservations conservative. No FU input or flag event on a load.
+      op.eidx_mask.andR && firstVisit && zeroInit && allNormal(op.rvs2_data) && owner.reduce(_ || _)
+    // Decide once, after selection. A load advances the sequencer but produces no FU return.
     input.ready := fu.ready
     fu.bits := op
     fu.valid := input.valid && !direct

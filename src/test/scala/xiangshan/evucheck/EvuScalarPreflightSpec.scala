@@ -101,11 +101,11 @@ class EvuScalarPreflightSpec extends AnyFlatSpec with ChiselScalatestTester {
         i.in.bits.tag.flag.poke(false.B); i.in.bits.tag.value.poke(tag.U); i.in.bits.op.poke(op.U)
         i.in.bits.base.poke(addr.U); i.in.valid.poke(true.B)
       }
-      def capture(tag: Int, addr: Int): Unit = {
-        present(tag, 0x10, addr); i.in.ready.expect(true.B); i.out.valid.expect(false.B)
+      def capture(tag: Int, addr: Int, op: Int = 0x10): Unit = {
+        present(tag, op, addr); i.in.ready.expect(true.B); i.out.valid.expect(false.B)
         d.clock.step(); i.in.valid.poke(false.B)
       }
-      reserve(2); reserve(3); capture(3, 0x2000); capture(2, 0x1fc0)
+      reserve(2); reserve(3); capture(3, 0x2000, 0x52); capture(2, 0x1fc0)
       i.range.req.valid.expect(false.B); i.head.value.poke(2.U)
       i.range.req.valid.expect(true.B); i.range.req.bits.base.expect(0x1fc0.U)
       i.range.req.bits.length.expect(256.U); d.clock.step()
@@ -143,6 +143,22 @@ class EvuScalarPreflightSpec extends AnyFlatSpec with ChiselScalatestTester {
       i.range.resp.ready.expect(false.B); i.out.valid.expect(false.B); d.clock.step()
       i.range.resp.valid.poke(false.B); i.out.valid.expect(true.B)
       i.out.bits.tag.value.expect(5.U); i.out.bits.faults.expect((BigInt(1) << ExceptionNO.illegalInstr).U)
+      d.clock.step(); i.permitted.poke(true.B); i.vl.poke(16.U)
+      // Two scalar constants can arrive out of order, without monopolizing
+      // the scalar port or starting a check before their matching ROB head.
+      reserve(6); reserve(7); capture(7, 0x6004, 0x52); capture(6, 0x6000, 0x52)
+      present(8, 0x32, 0); i.in.ready.expect(true.B); i.out.bits.tag.value.expect(8.U)
+      i.out.valid.expect(true.B); i.range.req.valid.expect(false.B); d.clock.step(); i.in.valid.poke(false.B)
+      for ((tag, addr, bytes) <- Seq((6, 0x6000, 4), (7, 0x6004, 4), (9, 0x7000, 0))) {
+        if (tag == 9) { i.vl.poke(0.U); reserve(tag); capture(tag, addr, 0x52) }
+        i.range.req.valid.expect(false.B); i.head.value.poke(tag.U)
+        i.range.req.valid.expect(true.B); i.range.req.bits.read.expect(true.B)
+        i.range.req.bits.base.expect(addr.U); i.range.req.bits.length.expect(bytes.U); d.clock.step()
+        i.range.resp.valid.poke(true.B); i.range.resp.ready.expect(true.B)
+        i.out.valid.expect(true.B); i.out.bits.tag.value.expect(tag.U)
+        i.out.bits.cmd.base.expect(addr.U); i.out.bits.cmd.config.vl.expect((if (bytes == 0) 0 else 16).U)
+        d.clock.step(); i.range.resp.valid.poke(false.B)
+      }
     }
   }
 
@@ -170,23 +186,33 @@ class EvuScalarPreflightSpec extends AnyFlatSpec with ChiselScalatestTester {
       }
       i.in.bits.base.poke(0x80000fc0L.U); i.vl.poke(16.U)
       i.in.bits.op.poke(EvuIsa.storeE0); i.range.req.valid.expect(false.B); i.in.bits.op.poke(EvuIsa.store)
-      for (block <- Seq(i.barrier.control, i.barrier.otherCompletion, i.barrier.unpublishedControl)) {
-        block.poke(true.B); i.range.req.valid.expect(false.B); block.poke(false.B)
+      i.range.req.valid.expect(true.B) // Original arithmetic-status-only bypass.
+      i.barrier.control.poke(true.B) // Only a published immediate configuration is live.
+      for (status <- Seq(false, true)) {
+        i.barrier.status.poke(status.B); i.barrier.arithmeticOnly.poke(status.B)
+        i.range.req.valid.expect(true.B)
+        for (block <- Seq(i.barrier.otherCompletion, i.barrier.unpublishedControl)) {
+          block.poke(true.B); i.range.req.valid.expect(false.B); block.poke(false.B)
+        }
       }
       for (allow <- Seq(i.barrier.arithmeticOnly, i.configReady, i.physicalStore)) {
         allow.poke(false.B); i.range.req.valid.expect(false.B); allow.poke(true.B)
       }
-      i.range.req.valid.expect(true.B); i.range.req.bits.write.expect(true.B)
+      i.barrier.status.poke(false.B); i.barrier.arithmeticOnly.poke(false.B)
+      i.range.req.ready.poke(false.B); i.range.req.valid.expect(true.B); d.clock.step(2)
+      i.range.req.ready.poke(true.B); i.range.req.valid.expect(true.B); i.range.req.bits.write.expect(true.B)
       i.range.req.bits.fullLineWrite.expect(true.B); i.range.req.bits.length.expect(64.U)
       i.in.ready.expect(false.B); i.out.valid.expect(false.B); d.clock.step()
       i.range.resp.valid.poke(true.B); i.range.resp.bits.write.poke(true.B)
       i.range.resp.bits.fault.poke(EvuAddressFault.Access)
       i.range.resp.ready.expect(false.B); i.out.valid.expect(false.B); d.clock.step(2)
-      i.barrier.status.poke(false.B); i.range.resp.ready.expect(true.B); i.out.valid.expect(true.B)
+      i.barrier.control.poke(false.B); i.range.resp.ready.expect(true.B); i.out.valid.expect(true.B)
       i.out.bits.faults.expect((BigInt(1) << ExceptionNO.storeAccessFault).U)
       d.clock.step(); i.range.resp.valid.poke(false.B)
-      i.barrier.status.poke(true.B); i.range.req.valid.expect(true.B); d.clock.step()
+      i.barrier.control.poke(true.B); i.barrier.status.poke(true.B); i.barrier.arithmeticOnly.poke(true.B)
+      i.range.req.valid.expect(true.B); d.clock.step()
       i.range.resp.bits.fault.poke(EvuAddressFault.None); i.range.resp.valid.poke(true.B)
+      i.vl.poke(64.U) // The successful response still uses the request-time VL.
       i.out.valid.expect(true.B); i.out.bits.faults.expect(0.U)
       i.out.bits.cmd.config.vl.expect(16.U); i.out.bits.cmd.base.expect(0x80000fc0L.U)
       i.flush.bits.flag.poke(false.B); i.flush.bits.value.poke(3.U); i.flush.valid.poke(true.B)

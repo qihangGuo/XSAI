@@ -15,8 +15,7 @@ object EvuFuMain {
 
   def targets(vp: VectorParams): Seq[(String, FunctionalUnitFactory)] = {
     val factories = vp.issStructure.generate(vp).flatMap(_.seqs).flatMap(_.fus)
-    val selected = factories.filterNot(_ == VFExp2Factory)
-    val named = selected.map { f =>
+    val named = factories.map { f =>
       val name = f match {
         case IntegerPipeFactory              => "IntegerPipe"
         case ShiftPipeFactory                => "ShiftPipe"
@@ -27,6 +26,7 @@ object EvuFuMain {
         case IntegerMultiplyFactory(_, true) => "SegmentedMultiplyPipe"
         case SplitFMAFactory(_, true)        => "FPFMAPipe"
         case FPCmpFactory                    => "FPCompPipe"
+        case VFExp2Factory                   => "VFExp2FU"
         case FPConvFactory                   => "FPConvPipe"
         case SIMDFPDivSqrtFactory             => "FPDivSqrt"
         case FPXX8Factory                    => "FPXX8Pipe"
@@ -36,8 +36,8 @@ object EvuFuMain {
       }
       name -> f
     }
-    require(named.size == 14 && named.map(_._1).distinct.size == 14,
-      "Expected fourteen production FUs, excluding VFExp2 only")
+    require(named.size == 15 && named.map(_._1).distinct.size == 15,
+      "Expected fifteen production FUs, including VFExp2")
     named
   }
 

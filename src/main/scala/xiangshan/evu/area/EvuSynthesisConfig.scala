@@ -6,7 +6,7 @@ import xiangshan.evu.common.{VectorIssueStructure, VectorParams}
 
 /** Shared export configuration matching EvuTop's unified-command backend. */
 object EvuSynthesisConfig {
-  val revision = "production_pack_bf16_v1"
+  val revision = "production_div2_amax_v2"
 
   def vectorParams(ep: EvuParams): VectorParams = VectorParams.lgvParams.copy(
     dLen = ep.dlenBits,
@@ -24,6 +24,7 @@ object EvuSynthesisConfig {
     vrfBanking = ep.vrfBanks,
     debugVrf = false,
     diagnosticCounters = false,
+    externalConversionOperands = true,
     enableChaining = true,
     enableOOO = true,
     pipelinedVatClear = true,
@@ -51,6 +52,8 @@ object EvuSynthesisConfig {
     "segmented_imul" -> vp.useSegmentedIMul, "segmented_fma" -> vp.useSegmentedFPFMA,
     "parallel_fp32_div" -> vp.parallelFp32Div, "fp32_minmax_tree" -> vp.fp32MinMaxTree,
     "single_group_minmax" -> vp.singleGroupMinMax, "slide_prefetch" -> vp.slidePrefetch,
+    "external_conversion_operands" -> vp.externalConversionOperands,
+    "fp32_div_two_bits_per_cycle" -> vp.parallelFp32Div,
     "extended_result_forwarding" -> vp.extendedResultForwarding,
     "short_result_forwarding" -> vp.shortResultForwarding,
     "difftest" -> false, "debug_vrf" -> false, "diagnostic_counters" -> false,

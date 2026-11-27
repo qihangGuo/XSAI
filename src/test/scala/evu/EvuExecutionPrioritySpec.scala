@@ -26,6 +26,32 @@ class EvuExecutionPrioritySpec extends AnyFlatSpec with ChiselScalatestTester {
 
   behavior of "EVU bounded critical-result priority"
 
+  it should "leave the next mixed-latency return slot free only after an accumulator load" in {
+    implicit val p: Parameters = parameters
+    test(new SharedExecutionArbiter(2, 5, 1, directSumLoad = true))
+      .withAnnotations(Seq(TreadleBackendAnnotation)) { dut =>
+        for (in <- dut.io.in) { clear(in.bits); in.valid.poke(false.B) }
+        dut.io.out.ready.poke(true.B)
+        for (load <- Seq(true, false)) {
+          dut.io.in(0).bits.acc.poke(true.B)
+          dut.io.in(0).bits.pipe_depth.poke(4.U)
+          dut.io.in(0).valid.poke(true.B)
+          dut.io.in(0).ready.expect(true.B)
+          dut.directLoadFire.get.poke(load.B)
+          dut.clock.step()
+          dut.directLoadFire.get.poke(false.B)
+          dut.io.in(0).valid.poke(false.B)
+          dut.io.in(1).bits.pipe_depth.poke(3.U)
+          dut.io.in(1).valid.poke(true.B)
+          dut.io.available(1).expect(load.B)
+          dut.io.in(1).ready.expect(load.B)
+          dut.clock.step()
+          dut.io.in(1).valid.poke(false.B)
+          dut.clock.step(5)
+        }
+      }
+  }
+
   it should "prioritize E0 and reduction finishing work without consuming budget under backpressure" in {
     implicit val p: Parameters = parameters
     test(new SharedExecutionArbiter(3, 4, 1, prioritizeCritical = true))

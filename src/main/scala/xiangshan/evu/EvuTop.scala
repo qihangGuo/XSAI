@@ -8,11 +8,11 @@ import freechips.rocketchip.tile.TileVisibilityNodeKey
 import freechips.rocketchip.tilelink._
 import org.chipsalliance.cde.config.Parameters
 
-class EvuTopIO(p: EvuParams) extends Bundle {
+class EvuTopIO(p: EvuParams, cpuOwnedPc: Boolean) extends Bundle {
   val drain = Flipped(new EvuDrainIO)
   val command    = Flipped(Decoupled(new EvuCommand(p)))
   val dispatch   = Flipped(Decoupled(new EvuDispatchRequest(p)))
-  val completion = Decoupled(new EvuCompletion(p))
+  val completion = Decoupled(new EvuClientResult(p, cpuOwnedPc))
   val flush      = Input(Bool())
   val busy       = Output(Bool())
   val jobStatus  = Output(Vec(p.commandDepth, UInt(3.W)))
@@ -87,7 +87,7 @@ object EvuJobState {
 }
 
 /** External vector client. Its node is attached to the tile's private HBL2 xbar. */
-class EvuTop(val evuParams: EvuParams)(implicit p: Parameters) extends LazyModule {
+class EvuTop(val evuParams: EvuParams, val cpuOwnedPc: Boolean = false)(implicit p: Parameters) extends LazyModule {
   val node = TLClientNode(Seq(TLMasterPortParameters.v1(
     Seq(TLMasterParameters.v1("XSAIExternalVector", IdRange(0, evuParams.maxMemOutstanding))),
     requestFields = Seq(MatrixField(2))
@@ -105,7 +105,7 @@ class EvuTop(val evuParams: EvuParams)(implicit p: Parameters) extends LazyModul
 
 class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(outer) {
   private val ep              = outer.evuParams
-  val io                      = IO(new EvuTopIO(ep))
+  val io                      = IO(new EvuTopIO(ep, outer.cpuOwnedPc))
   private val memoryBusy = Wire(Bool())
   private val control         = Module(new EvuControlSequencer(ep))
   private val vectorParameters = p.alterMap(Map(
@@ -114,7 +114,7 @@ class EvuTopImp(outer: EvuTop)(implicit p: Parameters) extends LazyModuleImp(out
   private val vectorBackend   = Module(new EvuVectorBackend(ep, unifiedCommands = true)(vectorParameters))
   private val dispatchAdapter = Module(new EvuDispatchAdapter(ep))
   private val commandArbiter  = Module(new Arbiter(new EvuCommand(ep), 2))
-  private val commandTable = Module(new EvuCommandTable(ep))
+  private val commandTable = Module(new EvuCommandTable(ep, outer.cpuOwnedPc))
   private val jobValid = commandTable.io.live
   private val nextJobId = commandTable.io.nextId
   private val currentEpoch     = RegInit(0.U(2.W))

@@ -1,13 +1,17 @@
 package xiangshan.evu
 
 import chisel3._
+import chisel3.experimental.dataview._
 import chisel3.util._
 
-class EvuCommandIdentity extends Bundle {
-  val pc = UInt(64.W)
+class EvuCommandMetadata extends Bundle {
   val opcode = UInt(8.W)
   val vd = UInt(5.W)
   val epoch = UInt(2.W)
+}
+
+class EvuCommandIdentity extends EvuCommandMetadata {
+  val pc = UInt(64.W)
 }
 
 class EvuCommandOutcome extends Bundle {
@@ -41,19 +45,19 @@ class EvuCommandResult(p: EvuParams) extends Bundle {
 }
 
 class EvuCommandRecord extends Bundle {
-  val identity = new EvuCommandIdentity
+  val identity = new EvuCommandMetadata
   val outcome = new EvuCommandOutcome
 }
 
 /** One ordered command window; its row number is also the execution age tag. */
-class EvuCommandTable(p: EvuParams) extends Module {
+class EvuCommandTable(p: EvuParams, cpuOwnedPc: Boolean = false) extends Module {
   private val depth = p.commandDepth
   private val idBits = log2Ceil(depth)
   val io = IO(new Bundle {
     val allocate = Flipped(Decoupled(new EvuCommandIdentity))
     val nextId = Output(UInt(idBits.W))
     val result = Flipped(Decoupled(new EvuCommandResult(p)))
-    val completion = Decoupled(new EvuCompletion(p))
+    val completion = Decoupled(new EvuClientResult(p, cpuOwnedPc))
     val scheduleRelease = Input(UInt(depth.W))
     val scheduleHead = Output(UInt(idBits.W))
     val flush = Input(Bool())
@@ -68,6 +72,8 @@ class EvuCommandTable(p: EvuParams) extends Module {
   })
 
   val records = Reg(Vec(depth, new EvuCommandRecord))
+  // Only the standalone completion or a simulation trace needs a PC indexed by job.
+  val pcs = Option.when(!cpuOwnedPc || p.enableDifftest)(Reg(Vec(depth, UInt(64.W))))
   val live = RegInit(VecInit.fill(depth)(false.B))
   val completed = RegInit(VecInit.fill(depth)(false.B))
   val scheduleActive = RegInit(VecInit.fill(depth)(false.B))
@@ -82,7 +88,7 @@ class EvuCommandTable(p: EvuParams) extends Module {
   io.nextId := tail
   io.completion.valid := count =/= 0.U && completed(head) && !io.flush
   val record = records(head)
-  io.completion.bits.pc := record.identity.pc
+  io.completion.bits.pc.foreach(_ := pcs.get(head))
   io.completion.bits.opcode := record.identity.opcode
   io.completion.bits.vd := record.identity.vd
   io.completion.bits.epoch := record.identity.epoch
@@ -118,7 +124,8 @@ class EvuCommandTable(p: EvuParams) extends Module {
   }
   // Allocation wins when the oldest full-window row is retired and reused together.
   when(io.allocate.fire) {
-    records(tail).identity := io.allocate.bits
+    records(tail).identity := io.allocate.bits.viewAsSupertype(new EvuCommandMetadata)
+    pcs.foreach(_(tail) := io.allocate.bits.pc)
     live(tail) := true.B
     completed(tail) := false.B
     scheduleActive(tail) := true.B
@@ -141,7 +148,7 @@ class EvuCommandTable(p: EvuParams) extends Module {
   io.head := head
   io.count := count
   io.busy := count =/= 0.U
-  io.tracePc.foreach(_ := records(io.traceId.get).identity.pc)
+  io.tracePc.foreach(_ := pcs.get(io.traceId.get))
 
   when(io.flush) {
     live.foreach(_ := false.B)

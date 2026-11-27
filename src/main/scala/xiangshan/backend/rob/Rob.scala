@@ -41,7 +41,7 @@ import xiangshan.frontend.FtqPtr
 import xiangshan.mem.{LqPtr, LsqEnqIO, SqPtr, MlsqPtr}
 import xiangshan.backend.ctrlblock.{DebugLSIO, DebugLsInfo, LsTopdownInfo}
 import xiangshan.backend.fu.matrix.Bundles.AmuCtrlIO
-import xiangshan.evu.EvuCompletion
+import xiangshan.evu.{EvuCompletion, EvuExecutionResult}
 import xiangshan.backend.fu.vector.Bundles.VType
 import xiangshan.backend.rename.SnapshotGenerator
 import yunsuan.VfaluType
@@ -144,7 +144,7 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
 
     // to AMU
     val amuCtrl = OptionWrapper(HasMatrixExtension, Vec(CommitWidth, DecoupledIO(new AmuCtrlIO)))
-    val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuCompletion(p(ExternalVectorKey)))))
+    val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuExecutionResult(p(ExternalVectorKey)))))
     val evuBusy = Output(Bool())
     val evuPreflightBusy = Output(Bool())
     val evuPreflightReasons = Output(new xiangshan.evu.EvuPreflightReasons)
@@ -1309,7 +1309,7 @@ class RobImp(override val wrapper: Rob)(implicit p: Parameters, params: BackendP
       // TODO: support non-MMIO load-store instructions to trigger interrupts
       val allow_interrupts = !CommitType.isLoadStore(io.enq.req(i).bits.commitType) &&
                              !(p(ExternalVectorKey).enable.B && io.enq.req(i).bits.fuType === FuType.evu.U &&
-                               (io.enq.req(i).bits.instr(31, 25) === xiangshan.evu.EvuIsa.load ||
+                               (xiangshan.evu.EvuIsa.isLoad(io.enq.req(i).bits.instr(31, 25)) ||
                                 io.enq.req(i).bits.instr(31, 25) === xiangshan.evu.EvuIsa.setvli)) &&
                              !FuType.isFence(io.enq.req(i).bits.fuType) &&
                              !FuType.isCsr(io.enq.req(i).bits.fuType) &&

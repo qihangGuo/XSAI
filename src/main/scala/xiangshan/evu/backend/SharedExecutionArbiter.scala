@@ -8,7 +8,7 @@ import xiangshan.evu.common._
 
 /** Logical sequencers share a FU result channel, including mixed latencies. */
 class SharedExecutionArbiter(contexts: Int, maxDepth: Int, nFUs: Int,
-    prioritizeCritical: Boolean = false)(implicit p: Parameters)
+    prioritizeCritical: Boolean = false, directSumLoad: Boolean = false)(implicit p: Parameters)
     extends CoreModule {
   require(contexts > 0 && maxDepth > 0)
   private val depthBits = log2Ceil(maxDepth) max 1
@@ -20,7 +20,8 @@ class SharedExecutionArbiter(contexts: Int, maxDepth: Int, nFUs: Int,
     val priorityIssue = Output(Bool())
   })
   val occupied = RegInit(0.U(maxDepth.W))
-  val allocation = Mux(io.out.fire && !io.out.bits.iterative,
+  val directLoadFire = Option.when(directSumLoad)(IO(Input(Bool())))
+  val allocation = Mux(io.out.fire && !io.out.bits.iterative && !directLoadFire.getOrElse(false.B),
     UIntToOH(io.out.bits.pipe_depth, maxDepth), 0.U(maxDepth.W))
   occupied := (occupied | allocation) >> 1
   for (i <- 0 until contexts) {

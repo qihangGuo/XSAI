@@ -83,10 +83,12 @@ class EvuDrainIO extends Bundle {
 
 /** The general barrier stays intact; only a checked load may use the narrower one. */
 object EvuPreflightReasons {
+  def mayCheckAcrossBarrier(reasons: EvuPreflightReasons, stable: Bool): Bool =
+    stable && !reasons.unpublishedControl && !reasons.otherCompletion &&
+      (!reasons.status || reasons.arithmeticOnly)
+
   def blocksLoad(reasons: EvuPreflightReasons, stable: Bool): Bool =
-    (reasons.control || reasons.status) &&
-      !(stable && !reasons.unpublishedControl && !reasons.otherCompletion &&
-        (!reasons.status || reasons.arithmeticOnly))
+    (reasons.control || reasons.status) && !mayCheckAcrossBarrier(reasons, stable)
   def arithmeticOnly(status: UInt, completed: Bool, arithmetic: Bool): Bool = {
     val other = RegInit(0.U(status.getWidth.W))
     val newOther = completed && !arithmetic

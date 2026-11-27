@@ -43,7 +43,7 @@ import xiangshan.backend.datapath._
 import xiangshan.backend.dispatch.CoreDispatchTopDownIO
 import xiangshan.backend.exu.ExuBlock
 import xiangshan.backend.fu.matrix.Bundles.AmuCtrlIO
-import xiangshan.evu.{EvuAddressFault, EvuCompletion, EvuIsa, EvuRangeIO, EvuRangeResult}
+import xiangshan.evu.{EvuAddressFault, EvuExecutionResult, EvuIsa, EvuRangeIO, EvuRangeResult}
 import xiangshan.backend.fu.vector.Bundles.{VConfig, VType}
 import xiangshan.backend.fu.{FenceIO, FenceToSbuffer, FuConfig, FuType, PerfCounterIO}
 import xiangshan.backend.fu.NewCSR.PFEvent
@@ -1356,7 +1356,7 @@ class BackendIO(implicit p: Parameters, params: BackendParams) extends XSBundle 
   val toTop = new BackendToTopBundle
   val toAmu = OptionWrapper(HasMatrixExtension, Vec(CommitWidth, DecoupledIO(new AmuCtrlIO)))
   val evuDrain = OptionWrapper(p(ExternalVectorKey).enable, new xiangshan.evu.EvuDrainIO)
-  val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuCompletion(p(ExternalVectorKey)))))
+  val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuExecutionResult(p(ExternalVectorKey)))))
   val evuFlush = OptionWrapper(p(ExternalVectorKey).enable, Output(Bool()))
   val evuRange = OptionWrapper(p(ExternalVectorKey).enable, new EvuRangeIO(p(ExternalVectorKey)))
 

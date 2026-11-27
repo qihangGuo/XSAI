@@ -95,6 +95,9 @@ object EvuExuMain {
           case _: IterativeFunctionalUnit => 0
         })
         cfg("iterative_fu_names") = ujson.Arr.from(unit.iter_fus.map(_._1.desiredName))
+        cfg("amax_sideband_ports") = ujson.Arr.from(
+          if (unit.pipeAmaxQuarters.nonEmpty) (0 until unit.maxPipeDepth).flatMap(i =>
+            Seq(s"pipeAmaxQuarters_${i}_valid", s"pipeAmaxQuarters_${i}_bits")) else Nil)
         cfg("pack_sideband_ports") = ujson.Arr.from(
           (if (unit.packOut.nonEmpty) Seq("packOut_valid", "packOut_bits", "packBack") ++
             (0 until unit.maxPipeDepth).flatMap(i => Seq(s"pipePackSlots_${i}_valid", s"pipePackSlots_${i}_bits")) else Nil) ++
@@ -115,6 +118,7 @@ object EvuExuMain {
       cfg("fu_names") = ujson.Arr("FPFMAPipe", "FPLowPrecisionFU")
       cfg("fu_pipeline_depths") = ujson.Arr(6, 2)
       cfg("iterative_fu_names") = ujson.Arr()
+      cfg("amax_sideband_ports") = ujson.Arr()
       cfg("execution_units") = ujson.Arr("ExecutionUnitfp_fma", "ExecutionUnitfp_mxfp")
       cfg("pack_connection") = "fma.packOut -> mx.packIn; mx.packedOut -> fma.packBack"
       cfg("pack_sideband_ports") = ujson.Arr.from((0 until 6).flatMap(i =>

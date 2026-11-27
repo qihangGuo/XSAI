@@ -784,7 +784,7 @@ class NewDispatch(implicit p: Parameters) extends XSModule with HasPerfEvents wi
   val isAMO    = VecInit(fromRename.map(req => FuType.isAMO(req.bits.fuType)))
   val isBlockBackward  = VecInit(fromRename.map(x => x.valid && x.bits.blockBackward))
   private val loadCandidate = fromRename.map(x => x.valid && x.bits.fuType === FuType.evu.U &&
-    x.bits.instr(31, 25) === xiangshan.evu.EvuIsa.load && p(ExternalVectorKey).enable.B)
+    xiangshan.evu.EvuIsa.isLoad(x.bits.instr(31, 25)) && p(ExternalVectorKey).enable.B)
   private val configBarrier = Module(new xiangshan.backend.rob.EvuConfigIssueBarrier(RobSize))
   configBarrier.io.published := io.evuConfigPublished
   configBarrier.io.redirect.valid := io.redirect.valid

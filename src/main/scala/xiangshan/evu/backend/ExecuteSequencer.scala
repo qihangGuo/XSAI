@@ -59,7 +59,7 @@ class ExecuteSequencerIO(maxDepth: Int, nFUs: Int, forwarding: Boolean = false)(
 class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs: Int,
     ordinaryOnly: Boolean = false, val reductionOnly: Boolean = false,
     resultForwarding: Boolean = false, val restrictedInteger: Boolean = false,
-    val unusedOperands: Set[Int] = Set.empty)(implicit p: Parameters)
+    val unusedOperands: Set[Int] = Set.empty, directSumLoad: Boolean = false)(implicit p: Parameters)
     extends Sequencer[ExecuteMicroOp]()(p) {
   val supported_insns = if (restrictedInteger) IntegerContextRules.instructions(allInsns) else allInsns
   def usesPerm = supported_insns.count(_.props.contains(UsesGatherUnit.Y)) > 0
@@ -76,6 +76,7 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   }
 
   val io = IO(new ExecuteSequencerIO(maxPipeDepth, nFUs, resultForwarding))
+  val directLoadFire = Option.when(directSumLoad)(IO(Input(Bool())))
 
   val valid = RegInit(false.B)
   val rvs1Captured = RegInit(false.B)
@@ -504,7 +505,7 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
 
   val exu_scheduler = Module(new PipeScheduler(1, maxPipeDepth))
   exu_scheduler.io.reqs(0).request := valid && pipelined
-  exu_scheduler.io.reqs(0).fire := io.iss.fire
+  exu_scheduler.io.reqs(0).fire := io.iss.fire && !directLoadFire.getOrElse(false.B)
   exu_scheduler.io.reqs(0).depth := effective_pipe_stages
 
   val destIndex = Mux(lowPrecision && EvuLowPrecision.packed(inst.funct6, inst.rs1), eidx >> 1, eidx)
@@ -522,6 +523,9 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
     !(read_eidx_buffer && !io.vgu.gather_eidx.valid) &&
     !(renacc && !io.acc_valid)
   io.operandsReady := operandsReady
+  // Internal accumulator returns share the FU result channel, not a VRF bank.
+  val needsVrfSlot = pipelined && (!io.iss.bits.acc || tail)
+  val vrfBlocked = needsVrfSlot && !io.pipe_write_req.available
   val missingOperands = (renv1 && !(rvs1Captured || io.rvs1.req.fire)) ||
     (renv2 && !(rvs2Captured || io.rvs2.req.fire)) ||
     (renvd && !(rvdCaptured || io.rvd.req.fire)) ||
@@ -539,17 +543,17 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
       .elsewhen(missingFeedback) { io.waitReason.feedback := true.B }
       .elsewhen(missingOperands) { io.waitReason.operands := true.B }
       .elsewhen(missingPermutation) { io.waitReason.permutation := true.B }
-      .elsewhen(pipelined && (!io.pipe_write_req.available || !exu_scheduler.io.reqs(0).available)) {
+      .elsewhen(vrfBlocked || (pipelined && !exu_scheduler.io.reqs(0).available)) {
         io.waitReason.writeback := true.B
       }.elsewhen(!io.iss.ready) { io.waitReason.execution := true.B }
   }
   // A stalled consumer must not win a speculative bank reservation over the
   // reduction producing its operands, especially when both share one FU.
-  io.pipe_write_req.request := operandsReady && pipelined && exu_scheduler.io.reqs(0).available
+  io.pipe_write_req.request := operandsReady && needsVrfSlot && exu_scheduler.io.reqs(0).available
   io.pipe_write_req.bank_sel := (if (vrfBankBits == 0) 1.U else UIntToOH(vrfBank(wvd_eg), vParams.vrfBanking))
   io.pipe_write_req.pipe_depth := effective_pipe_stages
   io.pipe_write_req.oldest := oldest
-  io.pipe_write_req.fire := io.iss.fire
+  io.pipe_write_req.fire := io.iss.fire && needsVrfSlot
 
   when (compress) { // The destination is not known at this poit
     io.pipe_write_req.bank_sel := ~(0.U(vParams.vrfBanking.W))
@@ -559,7 +563,7 @@ class ExecuteSequencer(allInsns: Seq[VectorInstruction], maxPipeDepth: Int, nFUs
   io.vgu.slide_req.bits.tail := (if (usesPerm) slide_tail else 0.U)
 
   val iss_valid = (operandsReady &&
-    !(pipelined && !io.pipe_write_req.available) &&
+    !vrfBlocked &&
     !(pipelined && !exu_scheduler.io.reqs(0).available)
   )
   io.vgu.slide_req.valid := iss_valid && read_slide_buffer && io.iss.ready && usesPerm.B

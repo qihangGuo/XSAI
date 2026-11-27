@@ -348,6 +348,10 @@ object EvuDispatchPerf {
     "fp_div", "fp_conv", "fp_xx8", "fp_mxfp")
 }
 
+object EvuSumLookahead {
+  val names = Seq("owner_only", "empty", "reduction", "memory", "ordinary", "other", "eligible_cycles", "eligible_commands")
+}
+
 class EvuFuPerf extends Bundle {
   val issue = UInt(64.W)
   val busy = UInt(64.W) // An active sequencer or execution pipeline; excludes queue-only work.
@@ -402,6 +406,7 @@ class EvuExecutionPerf extends Bundle {
   val dispatchBlocked = UInt(64.W)
   val dispatchQueueWait = Vec(EvuDispatchPerf.names.size, UInt(64.W))
   val dispatchSecondIssues = UInt(64.W)
+  val sumLookahead = Vec(EvuSumLookahead.names.size, UInt(64.W))
   val vectorForwards = UInt(64.W)
   val loadForwardOperands = UInt(64.W)
   val vectorForwardNewer = UInt(64.W)

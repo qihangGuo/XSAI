@@ -38,7 +38,7 @@ import xiangshan.mem._
 import xiangshan.cache.mmu._
 import xiangshan.cache.mmu.TlbRequestIO
 import cute.CutePerfToCoreIO
-import xiangshan.evu.EvuCompletion
+import xiangshan.evu.EvuExecutionResult
 import scala.collection.mutable.ListBuffer
 
 abstract class XSModule(implicit val p: Parameters) extends Module
@@ -122,7 +122,7 @@ class XSCoreImp(outer: XSCoreBase) extends LazyModuleImp(outer)
     val dft_reset = Option.when(hasDFT)(Input(new DFTResetSignals()))
     val amuCtrl = Option.when(HasMatrixExtension)(Decoupled(new AmuCtrlIO))
     val evuDrain = OptionWrapper(p(ExternalVectorKey).enable, new xiangshan.evu.EvuDrainIO)
-    val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuCompletion(p(ExternalVectorKey)))))
+    val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuExecutionResult(p(ExternalVectorKey)))))
     val evuFlush = OptionWrapper(p(ExternalVectorKey).enable, Output(Bool()))
     val amuRelease = Option.when(HasMatrixExtension)(Flipped(Decoupled(new AmuReleaseIO2XS)))
     val cutePerf = Option.when(HasMatrixExtension)(Input(new CutePerfToCoreIO))

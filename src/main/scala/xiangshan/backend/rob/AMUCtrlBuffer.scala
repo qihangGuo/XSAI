@@ -13,7 +13,7 @@ import xiangshan.backend.BackendParams
 import xiangshan.backend.Bundles.DynInst
 import xiangshan.backend.fu.FuType
 import xiangshan.backend.fu.matrix.Bundles._
-import xiangshan.evu.{EvuAmuCommandData, EvuCompletion, EvuCoreCommand, EvuIsa, EvuPageMap, EvuPageMapPool}
+import xiangshan.evu.{EvuAmuCommandData, EvuCompletion, EvuCoreCommand, EvuExecutionResult, EvuIsa, EvuPageMap, EvuPageMapPool}
 
 class AmuCtrlBufferIO()(implicit val p: Parameters, val params: BackendParams) extends Bundle with HasXSParameter {
   // rob enq
@@ -62,7 +62,7 @@ class AmuCtrlBufferIO()(implicit val p: Parameters, val params: BackendParams) e
 
   // To Amu
   val toAMU = Vec(CommitWidth, DecoupledIO(new AmuCtrlIO))
-  val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuCompletion(p(ExternalVectorKey)))))
+  val evuCompletion = OptionWrapper(p(ExternalVectorKey).enable, Flipped(Decoupled(new EvuExecutionResult(p(ExternalVectorKey)))))
   // One-cycle, in-order status pulse for the CSR/ROB side. EVU commands are
   // dispatched after the scalar instruction has retired, so their flags
   // cannot use the ordinary EXU writeback slot.
@@ -496,7 +496,8 @@ class AmuCtrlBuffer()(implicit override val p: Parameters, val params: BackendPa
       entry.evuFflags := completion.bits.fflags
       entry.evuVxsat := completion.bits.vxsat
       entry.evuCause := completion.bits.cause
-      evuStatusReg := completion.bits
+      evuStatusReg.resultFields := completion.bits
+      evuStatusReg.pc := entry.amuCtrl.evuData.pc
       evuStatusPulse := true.B
       for (i <- 0 until CommitWidth) {
         assert(!(i.U < deqCount && completionPtr === deqPtr + i.U),

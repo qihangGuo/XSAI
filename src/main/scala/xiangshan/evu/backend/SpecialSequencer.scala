@@ -237,7 +237,8 @@ class SpecialSequencer(exu_insns: Seq[VectorInstruction], context: Int = 0, cont
   val writeData = io.acc_load.map(v => Mux(load, v.bits, io.acc_fu_resp.bits.data)).getOrElse(io.acc_fu_resp.bits.data)
   val writeSlot = Mux(load, io.acc_slot, io.acc_fu_resp_slot)
   when(load) {
-    assert(!io.acc_fu_resp.valid && io.acc_data.fire && io.acc_slot =/= 0.U && !acc_busy(io.acc_slot))
+    assert(!io.acc_fu_resp.valid && io.acc_data.fire && !acc_busy(io.acc_slot))
+    assert(io.acc_slot =/= 0.U || acc_regs(0).asUInt(31, 0) === 0.U)
   }
   for (slot <- 0 until 4) {
     when ((io.acc_fu_resp.valid || load) && writeSlot === slot.U) {

@@ -103,6 +103,8 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
           ordinaryOnly = layout.dedicated && layout.reductionOwner(c).isEmpty,
           reductionOnly = layout.reductionOwner(c).nonEmpty,
           resultForwarding = forwardingNames.contains(s.name),
+          directSumLoad = directSumLoad && s.name == "fp_fma" &&
+            !(layout.dedicated && layout.reductionOwner(c).isEmpty),
           restrictedInteger = s.name == "int" && c > 0,
           unusedOperands = if (!vParams.externalConversionOperands) Set.empty[Int] else s.name match {
             case "fp_bf16" | "fp_xx8" => Set(0, 2, 3)
@@ -255,6 +257,15 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
   // Connect issue queues to sequencers
 
   val issq_stall = Wire(Vec(issGroups.size, Bool()))
+  val withoutOwnerStall = dispatchChoice.io.sumProbe.map(_ => Wire(Vec(issGroups.size, Bool())))
+  dispatchChoice.io.sumProbe.foreach { probe =>
+    probe.onlyOwnerMissing := vParams.enableOOO.B && vdq.io.deq.valid && !vdq.takeSecond &&
+      reductionBlocked && !withoutOwnerStall.get.orR
+    probe.dequeue := vdq.io.deq.fire
+    for ((name, index) <- EvuSumLookahead.names.zipWithIndex) {
+      io.executionPerf.sumLookahead(index) := diagnosticCount(s"diag_sum_$name", probe.events(index))
+    }
+  }
   vdq.io.deq.ready := !issq_stall.orR && !reductionBlocked
   when(vdq.takeSecond) {
     assert(vdq.io.deq.fire && !dispatchReduction && !dispatchInst.vmu &&
@@ -392,6 +403,9 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       }
     }
 
+    val supported = group.seqs.map(_.accepts(dispatchInst))
+    // With no owner, contextAllowed masks both halves of a reduction. Observe actual queue space separately.
+    withoutOwnerStall.foreach(_(i) := supported.orR && !group.issq.io.enq.ready)
     val accepts = group.seqs.zipWithIndex.map { case (seq, c) =>
       val contextAllowed = if (!interleave) true.B else if (group.issq == vpissq) {
         !dispatchNeedsAccumulator || reductionChoice(c)
@@ -400,7 +414,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
           dispatchDirectMinMax || reductionChoice(reductionOwnerBySequencer(s).get)
         case _ => true.B
       }
-      seq.accepts(dispatchInst) && contextAllowed
+      supported(c) && contextAllowed
     }
     issq_stall(i) := !group.issq.io.enq.ready && accepts.orR
 
@@ -747,10 +761,13 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       slideLookaheadEligible := prefetch.io.slide
     }
     val criticalPriority = Set("fp_fma", "fp_cmp").contains(factory.name)
-    val arb = Module(new SharedExecutionArbiter(seqs.size, maxPipeDepth, xu.nFUs, criticalPriority))
+    val routesDirectLoads = factory.name == "fp_fma" && directSumLoad
+    val arb = Module(new SharedExecutionArbiter(seqs.size, maxPipeDepth, xu.nFUs, criticalPriority, routesDirectLoads))
     for ((seq, c) <- seqs.zipWithIndex) { arb.io.in(c) <> executeCandidates(flat_vxs.indexOf(seq)) }
-    if (factory.name == "fp_fma" && directSumLoad) {
+    if (routesDirectLoads) {
       directSumFire := ReductionFirstGroup.route(arb.io.out, xu.io.iss, reductionSeqs)
+      arb.directLoadFire.get := directSumFire
+      seqs.foreach(_.directLoadFire.foreach(_ := directSumFire))
     } else {
       xu.io.iss <> arb.io.out
     }
@@ -839,7 +856,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
         queue.io.deq.valid && !queue.io.deq.ready && !xu.io.iss.fire)
       counters.resultSlotWait := diagnosticCount(s"${factory.name}_resultSlotWait",
         seqs.zipWithIndex.map { case (seq, c) =>
-          seq.io.pipe_write_req.request && !arb.io.available(c)
+          seq.io.iss.valid && !arb.io.available(c)
         }.reduce(_ || _))
       counters.priorityIssues := diagnosticCount(s"${factory.name}_priorityIssues", arb.io.priorityIssue)
       if (vParams.diagnosticCounters) {
@@ -961,8 +978,7 @@ class VectorBackend(implicit p: Parameters) extends CoreModule()(p) with HasVect
       vrf.io.vxs(idx).pipe_write_req.pipe_depth := seq.io.pipe_write_req.pipe_depth
       vrf.io.vxs(idx).pipe_write_req.oldest := seq.io.pipe_write_req.oldest
       vrf.io.vxs(idx).pipe_write_req.fire := seq.io.pipe_write_req.fire
-      seq.io.pipe_write_req.available := vrf.io.vxs(idx).pipe_write_req.available &&
-        arb.io.available(c)
+      seq.io.pipe_write_req.available := vrf.io.vxs(idx).pipe_write_req.available
     }
   }
 

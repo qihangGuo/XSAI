@@ -115,9 +115,10 @@ class Tile128x64PerfTest(unittest.TestCase):
         self.assertEqual(driver.count('execute_perf_tile();'), 1)
         self.assertEqual(source.count('printf('), 1)
         self.assertIn('[RN-PERF] rows=128 cols=64', driver)
-        self.assertIn('schedule=pack_interleaved_amax16_early4_load2_sum2_collect8_norm8_vl81_earlyscale2 ', driver)
+        self.assertIn('schedule=pack_interleaved_amax16_early4_load2_sum2_collect8_norm8_vl81_earlyscale2_gamma16_load89early ', driver)
         self.assertIn('XV_CAP_BLOCK_QUANT', driver)
         self.assertIn('cycles=%lu', driver)
+        self.assertIn('flags=0x%x', driver)
         self.assertNotIn('instructions=', driver)
         self.assertNotIn('PASS', driver)
         timed = driver[driver.index('const uint64_t start = read_cycle();'):driver.index('const uint64_t end = read_cycle();')]
@@ -133,12 +134,23 @@ class Tile128x64PerfTest(unittest.TestCase):
         self.assertIn('input_values[(row * 113u + col * 37u) % 509u]', initialize)
 
     def test_vector_rsqrt_and_overlapped_quantization_preserve_every_output_byte(self):
-        functions = ('execute_perf_tile', 'perf_load_gamma', 'perf_sum_rows',
+        functions = ('execute_perf_tile', 'perf_reload_gamma', 'perf_sum_rows',
                      'perf_normalize_rows', 'perf_quantize_rows')
         trace = checked.traces(source_path=SOURCE, functions=functions)
         self.assertEqual(trace['execute_perf_tile'][0], ('xv_setvli', '16', '0x10'))
-        self.assertEqual(trace['perf_load_gamma'][0], ('xv_setvli', 'COLS', '0x10'))
+        set_full_vl = ('xv_setvli', 'COLS', '0x10')
+        load_gamma = ('XV_LOAD', '27', '&gamma[0]', '2')
+        self.assertEqual(trace['execute_perf_tile'][-2:], [set_full_vl, load_gamma])
+        self.assertEqual(trace['perf_reload_gamma'], [load_gamma, set_full_vl])
+        loop = fused.function_body(SOURCE.read_text(), 'execute_perf_tile')
+        self.assertRegex(loop, r'perf_quantize_rows\(tile\);\s*if \(tile \+ 1 == ROWS / 16\) break;\s*perf_reload_gamma\(\);')
         self.assertEqual(trace['perf_sum_rows'][0][0], 'XV_LOAD')
+        row_ops = trace['perf_sum_rows']
+        loads = [op for op in row_ops if op[0] == 'XV_LOAD']
+        self.assertEqual([integer(op[1]) for op in loads], list(range(16)))
+        collect = row_ops.index(('xv_setvli', '16', '0x10'))
+        self.assertEqual(row_ops[collect - 3][0], 'XV_FREDUCE_SUM')
+        self.assertEqual(row_ops[collect - 2:collect], loads[8:10])
         reduced, switches = 0, []
         for op in trace['perf_sum_rows']:
             if op[0] == 'XV_FREDUCE_SUM':
@@ -173,6 +185,7 @@ class Tile128x64PerfTest(unittest.TestCase):
             if op[0] == 'XV_STORE' and '&packed.data' in op[2]:
                 at_store.append((maxima, packs))
         self.assertEqual(at_store, [(12, 16)]*2 + [(16, 32)]*2 + [(16, 48)]*2 + [(16, 64)]*2)
+        self.assertEqual(quant[-1][:2], ('XV_STORE', '27'))
         generator = random.Random(1286402)
         random_values = [fp32(generator.uniform(-3, 3)) for _ in range(8192)]
         for row in (0, 3, 4, 15, 16, 63, 64, 127):
@@ -207,18 +220,21 @@ class Tile128x64PerfTest(unittest.TestCase):
                     normalized.extend(fp32(fp32(value * inverse) * weight) for value, weight in zip(current, gamma))
                 machine = PerfTileMachine(inputs, gamma, alpha, epsilon)
                 events = []
+                gamma_lengths = []
 
                 def run(sequence, tile=0):
                     for instruction in sequence:
                         resolved = tuple(re.sub(r'\b(COLS|tile)\b',
                                                 lambda match: str(64 if match[0] == 'COLS' else tile), value)
                                          for value in instruction)
+                        if resolved == load_gamma:
+                            gamma_lengths.append(machine.vl)
                         machine.execute(*resolved)
                         events.append(resolved)
 
                 run(trace['execute_perf_tile'])
                 for tile in range(8):
-                    run(trace['perf_load_gamma'], tile)
+                    self.assertEqual(list(machine.words(27)[:64]), list(map(bits, gamma)))
                     run(trace['perf_sum_rows'], tile)
                     self.assertEqual(list(machine.words(23)[:16]), sum_words[16 * tile:16 * (tile + 1)])
                     run(trace['perf_normalize_rows'], tile)
@@ -228,6 +244,10 @@ class Tile128x64PerfTest(unittest.TestCase):
                                          list(map(bits, normalized[first:first + 64])))
                     self.assertEqual(machine.vl, 64)
                     run(trace['perf_quantize_rows'], tile)
+                    self.assertEqual(machine.vl, 16)
+                    if tile != 7:
+                        run(trace['perf_reload_gamma'], tile)
+                self.assertEqual(gamma_lengths, [64] + [16] * 7)
                 expected = scalar_quantize(normalized, alpha)
                 self.assertEqual(machine.output['packed'], expected[0])
                 self.assertEqual(machine.output['scales'], expected[1])

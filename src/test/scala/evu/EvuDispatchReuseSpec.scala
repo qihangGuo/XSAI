@@ -11,7 +11,7 @@ import org.scalatest.flatspec.AnyFlatSpec
 import xiangshan.evu.{EvuParams, adapter}
 import xiangshan.evu.area.{EvuAreaMain, EvuSynthesisConfig}
 import xiangshan.evu.backend.{PackDescriptorLine, SecondDispatch}
-import xiangshan.evu.common.{DispatchQueue, VectorIssueInst, VXIssuePathParams}
+import xiangshan.evu.common.{DispatchQueue, EvuSumLookahead, VectorIssueInst, VXIssuePathParams}
 
 class SecondDispatchTestShell(val paths: Seq[VXIssuePathParams])(implicit p: Parameters) extends LazyModule {
   val client = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1("dispatch-test")))))
@@ -58,7 +58,7 @@ class EvuDispatchReuseSpec extends AnyFlatSpec with ChiselScalatestTester {
 
   it should "only cross blocked independent ordinary instructions on different issue paths" in {
     val ep = EvuParams(enable = true)
-    val vp = EvuSynthesisConfig.vectorParams(ep)
+    val vp = EvuSynthesisConfig.vectorParams(ep).copy(diagnosticCounters = true)
     implicit val p: Parameters = adapter.EvuVectorParameters(EvuAreaMain.parameters,
       ep.vlenBits, ep.dlenBits, ep.mlenBits, vp)
     val paths = vp.issStructure.generate(vp)
@@ -80,6 +80,8 @@ class EvuDispatchReuseSpec extends AnyFlatSpec with ChiselScalatestTester {
       }
       val a = dut.io.head
       val b = dut.io.second.bits
+      val probe = dut.io.sumProbe.get
+      probe.onlyOwnerMissing.poke(false.B); probe.dequeue.poke(false.B)
       dut.io.second.valid.poke(true.B)
       dut.io.ready.foreach(_.poke(false.B))
       dut.io.ready(cmp).poke(true.B)
@@ -106,6 +108,26 @@ class EvuDispatchReuseSpec extends AnyFlatSpec with ChiselScalatestTester {
       dut.io.take.expect(false.B)
       inst(b, 0x3f, 0, 1, 0, 2)
       dut.io.take.expect(false.B)
+
+      // A shadow observation never dequeues the second entry, even on the same FMA path.
+      def event(name: String, on: Boolean): Unit = probe.events(EvuSumLookahead.names.indexOf(name)).expect(on.B)
+      inst(a, 1, 1, 4, 12, 6) // FREDUSUM v4, v6, v12
+      inst(b, 0, 1, 1, 3, 2) // FADD
+      dut.io.ready(fma).poke(true.B); event("owner_only", false)
+      probe.onlyOwnerMissing.poke(true.B); dut.io.second.valid.poke(false.B); event("empty", true)
+      dut.io.second.valid.poke(true.B); event("ordinary", true); event("eligible_cycles", true)
+      event("eligible_commands", true); dut.io.take.expect(false.B); dut.clock.step()
+      dut.io.ready(fma).poke(false.B); event("eligible_cycles", false); dut.clock.step()
+      dut.io.ready(fma).poke(true.B); event("eligible_cycles", true); event("eligible_commands", false)
+      probe.onlyOwnerMissing.poke(false.B); probe.dequeue.poke(true.B); dut.clock.step()
+      probe.onlyOwnerMissing.poke(true.B); probe.dequeue.poke(false.B); event("eligible_commands", true)
+      for ((d, s1, s2) <- Seq((4, 3, 2), (12, 3, 2), (6, 3, 2), (1, 4, 2), (1, 3, 4))) {
+        inst(b, 0, 1, d, s1, s2); event("ordinary", true); event("eligible_cycles", false)
+      }
+      inst(b, 1, 1, 1, 0, 2); event("reduction", true); event("ordinary", false)
+      inst(b, 1, 1, 1, 0, 2, opcode = 7); event("memory", true); event("reduction", false)
+      inst(b, 0, 7, 1, 0, 2); event("other", true); event("eligible_cycles", false)
+      inst(a, 1, 1, 4, 12, 6, vm = 0); event("owner_only", false)
     }
   }
 

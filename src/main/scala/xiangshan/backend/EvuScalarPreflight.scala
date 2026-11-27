@@ -18,7 +18,7 @@ object EvuScalarPreflight {
     val incoming = source.bits.amuCtrl.get.data.asTypeOf(new EvuCoreCommand(ep))
     val incomingOp = incoming.instr(31, 25)
     val isEvu = source.bits.amuCtrl.get.evu
-    val bufferLoad = isEvu && incomingOp === EvuIsa.load
+    val bufferLoad = isEvu && EvuIsa.isLoad(incomingOp)
     val incomingSew = Mux(csr.configured, csr.config.vtype(5, 3), incoming.instr(14, 12))
     val incomingLength = Mux(EvuIsa.isElementZero(incomingOp),
       Mux(csr.configured && csr.config.vl === 0.U, 0.U, 4.U),
@@ -97,9 +97,8 @@ object EvuScalarPreflight {
     } yield payload.base(63, 12) >= start.U && payload.base(63, 12) < end.U
     val onePage = effectiveLength <= 4096.U &&
       (payload.base(11, 0) +& effectiveLength(12, 0)) <= 4096.U
-    val earlyStore = fullLine && physicalStore && csr.configured && stable && effectiveLength.orR &&
-      safePages.foldLeft(false.B)(_ || _) && onePage && !barrier.control &&
-      barrier.status && barrier.arithmeticOnly && !barrier.otherCompletion && !barrier.unpublishedControl
+    val earlyStore = generalBarrier && fullLine && physicalStore && csr.configured && effectiveLength.orR &&
+      safePages.foldLeft(false.B)(_ || _) && onePage && EvuPreflightReasons.mayCheckAcrossBarrier(barrier, stable)
     val preflightBlocked = Mux(load, EvuPreflightReasons.blocksLoad(barrier, stable), generalBarrier && !earlyStore)
     check.req.valid := memory && !checking && !preflightBlocked && !redirect.valid
     val stalled = memory && !checking && preflightBlocked && !redirect.valid
@@ -109,6 +108,9 @@ object EvuScalarPreflight {
     XSPerfAccumulate("evu_load_both_reserved", slots.io.full)
     XSPerfAccumulate("evu_load_check_bypass", check.req.fire && load && generalBarrier)
     XSPerfAccumulate("evu_store_check_bypass", check.req.fire && earlyStore)
+    // The previous STORE rule rejected every live control. Offers may repeat under checker backpressure.
+    XSPerfAccumulate("evu_store_published_offer_cycles", check.req.valid && earlyStore && barrier.control)
+    XSPerfAccumulate("evu_store_published_starts", check.req.fire && earlyStore && barrier.control)
     for ((name, selected) <- Seq("load" -> load, "store" -> store)) {
       val active = stalled && selected
       XSPerfAccumulate(s"evu_preflight_${name}_control_only", active && barrier.control && !barrier.status)

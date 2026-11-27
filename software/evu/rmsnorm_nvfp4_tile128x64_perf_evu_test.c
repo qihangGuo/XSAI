@@ -8,17 +8,19 @@
 #error "The optimized tile schedule requires the bank-aware register layout"
 #endif
 
-/* Start the first two VL=64 reductions before loading the next pair. */
 #define PERF_ROW_LOAD(tile, row) XV_LOAD(row, &inputs[(16 * (tile) + (row)) * COLS], 2)
-#define PERF_SUM_FOUR(tile, r0, r1, r2, r3, s0, s1, s2, s3) do { \
+#define PERF_LOAD_PAIR(tile, r0, r1) do { \
   PERF_ROW_LOAD(tile, r0); \
   PERF_ROW_LOAD(tile, r1); \
+} while (0)
+
+/* The first pair is already loaded at VL=64. */
+#define PERF_SUM_FOUR(tile, r0, r1, r2, r3, s0, s1, s2, s3) do { \
   XV_FMUL(16, r0, r0, 2); \
   XV_FMUL(18, r1, r1, 2); \
   XV_FREDUCE_SUM(RN_BATCH_MAX_DEST(r0, s0), RN_QUANT_ZERO, 16, 2); \
   XV_FREDUCE_SUM(s1, RN_QUANT_ZERO, 18, 2); \
-  PERF_ROW_LOAD(tile, r2); \
-  PERF_ROW_LOAD(tile, r3); \
+  PERF_LOAD_PAIR(tile, r2, r3); \
   XV_FMUL(19, r2, r2, 2); \
   XV_FMUL(20, r3, r3, 2); \
   XV_FREDUCE_SUM(s2, RN_QUANT_ZERO, 19, 2); \
@@ -36,7 +38,11 @@
  * can still reduce directly into v23.E0 with the direct-maxima layout. */
 #define PERF_SUM_EIGHT(tile, r0, r1, r2, r3, r4, r5, r6, r7) do { \
   PERF_SUM_FOUR(tile, r0, r1, r2, r3, 22, 21, 30, 24); \
+  PERF_LOAD_PAIR(tile, r4, r5); \
   PERF_SUM_FOUR(tile, r4, r5, r6, r7, 16, 18, 19, 20); \
+} while (0)
+
+#define PERF_COLLECT_EIGHT(r0, r4) do { \
   (void)xv_setvli(16, 0x10); \
   PERF_COLLECT_FOUR(r0, 22, 21, 30, 24); \
   PERF_COLLECT_FOUR(r4, 16, 18, 19, 20); \
@@ -124,16 +130,15 @@
   PERF_STORE_LINES((batch) - 1); \
 } while (0)
 
-static void perf_load_gamma(void) {
-  (void)xv_setvli(COLS, 0x10);
-  XV_LOAD(27, &gamma[0], 2);
-}
-
 static void perf_sum_rows(unsigned tile) {
-  /* The gamma load already selected VL=64 for the first eight rows. */
+  PERF_LOAD_PAIR(tile, 0, 1);
   PERF_SUM_EIGHT(tile, 0, 1, 2, 3, 4, 5, 6, 7);
+  /* v8/v9 are free during collection; load both full rows before VL becomes 16. */
+  PERF_LOAD_PAIR(tile, 8, 9);
+  PERF_COLLECT_EIGHT(0, 4);
   (void)xv_setvli(COLS, 0x10);
   PERF_SUM_EIGHT(tile, 8, 9, 10, 11, 12, 13, 14, 15);
+  PERF_COLLECT_EIGHT(8, 12);
   XV_LOAD_E0(19, &constants[1]);
   XV_LOAD_E0(18, &constants[2]);
   XV_FMUL_SCALAR(20, 19, RN_QUANT_MAXIMA);
@@ -202,14 +207,23 @@ static void perf_quantize_rows(unsigned tile) {
   PERF_PACK_ROWS(4 * tile + 3, 12, 13, 14, 15, 0);
 }
 
+static void perf_reload_gamma(void) {
+  /* PACK overwrote bytes 0..63 of v27. At VL=16, VTA=0 keeps gamma[16..63]. */
+  XV_LOAD(27, &gamma[0], 2);
+  (void)xv_setvli(COLS, 0x10);
+}
+
 static void execute_perf_tile(void) {
   __asm__ volatile ("fence rw, rw" ::: "memory");
   RN_QUANT_INITIALIZE();
-  for (unsigned tile = 0; tile < ROWS / 16; ++tile) {
-    perf_load_gamma();
+  (void)xv_setvli(COLS, 0x10);
+  XV_LOAD(27, &gamma[0], 2);
+  for (unsigned tile = 0; ; ++tile) {
     perf_sum_rows(tile);
     perf_normalize_rows();
     perf_quantize_rows(tile);
+    if (tile + 1 == ROWS / 16) break;
+    perf_reload_gamma();
   }
 }
 
@@ -256,10 +270,11 @@ __attribute__((used, noinline)) static int rmsnorm_nvfp4_tile_perf_main(void) {
     execute_perf_tile();
     synchronize();
     const uint64_t end = read_cycle();
-    if (end <= start || (XV_CSR_READ(XV_EVSTATUS) & 2) ||
-        (XV_CSR_READ(XV_EFFLAGS) & 0x18)) return 1;
-    printf("[RN-PERF] rows=128 cols=64 stage=fused_nvfp4 schedule=pack_interleaved_amax16_early4_load2_sum2_collect8_norm8_vl81_earlyscale2 sample=%u cycles=%lu\n",
-      sample, (unsigned long)(end - start));
+    if (end <= start || (XV_CSR_READ(XV_EVSTATUS) & 2)) return 1;
+    const unsigned flags = (unsigned)XV_CSR_READ(XV_EFFLAGS);
+    if (flags & 0x18) return 1;
+    printf("[RN-PERF] rows=128 cols=64 stage=fused_nvfp4 schedule=pack_interleaved_amax16_early4_load2_sum2_collect8_norm8_vl81_earlyscale2_gamma16_load89early sample=%u cycles=%lu flags=0x%x\n",
+      sample, (unsigned long)(end - start), flags);
   }
   return 0;
 }
